@@ -208,9 +208,35 @@ def test_image_generation_settings_are_editable_and_persisted_per_model():
     assert 'x-model.number="modelSettings.image_steps"' in html
     assert 'x-model.number="modelSettings.image_seed"' in html
     assert 'x-model.number="modelSettings.image_guidance"' in html
+    assert "'is-on': modelSettings.image_use_context" in html
+    assert "modelSettings.image_use_context = !modelSettings.image_use_context" in html
+    assert 'x-model.number="modelSettings.image_context_turns"' in html
     assert "resolveImageGenerationSettings()" in html
     assert "const imageSettings = this.resolveImageGenerationSettings()" in generate
     assert "captureGenerationContext(" in generate
+
+
+def test_image_generation_text_context_is_opt_in_and_user_only():
+    html = _template()
+    helper = _section(
+        html,
+        "            buildImageGenerationPrompt(messages, userIndex, fallbackPrompt)",
+        "            thinkingModeValue()",
+    )
+    generate = _section(
+        html,
+        "    async generateImageResponse(imageContext)",
+        "async streamResponse(streamContext = null, depth = 0)",
+    )
+
+    assert "image_use_context: false" in html
+    assert "image_context_turns: 3" in html
+    assert "message?.role !== 'user'" in helper
+    assert "prompts.slice(-contextSettings.turns)" in helper
+    assert "if (!contextSettings.enabled) return fallback" in helper
+    assert "const requestPrompt = this.buildImageGenerationPrompt(" in generate
+    assert "prompt: requestPrompt" in generate
+    assert "image_use_context: imageContextSettings.enabled" in generate
 
 
 def test_chat_images_are_persisted_in_indexeddb_and_hydrated_after_reload():

@@ -2056,6 +2056,34 @@
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
                             style="color: var(--text-primary);">
                     </div>
+                    <div class="pt-3 border-t border-line space-y-2">
+                        <div class="svg-allow-row">
+                            <div class="svg-allow-label">
+                                <i data-lucide="messages-square" class="w-4 h-4 shrink-0"
+                                    style="color: var(--text-tertiary);"></i>
+                                <span class="text-xs font-medium truncate"
+                                    style="color: var(--text-primary);">Text context</span>
+                            </div>
+                            <button type="button" role="switch" class="svg-allow-switch"
+                                :class="{ 'is-on': modelSettings.image_use_context }"
+                                :aria-checked="modelSettings.image_use_context ? 'true' : 'false'"
+                                aria-label="Text context"
+                                @click="modelSettings.image_use_context = !modelSettings.image_use_context; onModelSettingsChange()">
+                                <span class="svg-allow-switch-knob" aria-hidden="true"></span>
+                            </button>
+                        </div>
+                        <div x-show="modelSettings.image_use_context" x-collapse class="space-y-1 pt-1">
+                            <label class="text-[10px] font-bold uppercase tracking-wider"
+                                style="color: var(--text-secondary);">Context turns</label>
+                            <input type="number" x-model.number="modelSettings.image_context_turns"
+                                @input="onModelSettingsChange()" min="2" max="20" step="1"
+                                class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
+                                style="color: var(--text-primary);">
+                            <p class="text-[10px]" style="color: var(--text-tertiary);">
+                                Combines recent user prompts only; previous images are not sent.
+                            </p>
+                        </div>
+                    </div>
                     <p class="text-[10px]" style="color: var(--text-tertiary);">
                         Steps 2–50 · Seed 0–4294967295 · Guidance 0–20
                     </p>
@@ -2591,6 +2619,8 @@
                 image_steps: 4,
                 image_seed: 0,
                 image_guidance: 1.0,
+                image_use_context: false,
+                image_context_turns: 3,
             },
 
             defaultModelSettings() {
@@ -2609,6 +2639,8 @@
                     image_steps: 4,
                     image_seed: 0,
                     image_guidance: 1.0,
+                    image_use_context: false,
+                    image_context_turns: 3,
                 };
             },
 
@@ -2634,6 +2666,40 @@
                     seed: clampInteger(this.modelSettings.image_seed, 0, 0, 4294967295),
                     guidance: clampNumber(this.modelSettings.image_guidance, 1.0, 0, 20),
                 };
+            },
+
+            resolveImageContextSettings() {
+                const rawTurns = Number(this.modelSettings.image_context_turns);
+                const turns = Number.isFinite(rawTurns)
+                    ? Math.min(20, Math.max(2, Math.floor(rawTurns))) : 3;
+                return {
+                    enabled: this.modelSettings.image_use_context === true,
+                    turns,
+                };
+            },
+
+            buildImageGenerationPrompt(messages, userIndex, fallbackPrompt) {
+                const fallback = String(fallbackPrompt || '').trim();
+                const contextSettings = this.resolveImageContextSettings();
+                if (!contextSettings.enabled) return fallback;
+
+                const endIndex = Number.isInteger(userIndex) && userIndex >= 0
+                    ? Math.min(userIndex, messages.length - 1)
+                    : messages.length - 1;
+                const prompts = [];
+                for (let index = 0; index <= endIndex; index++) {
+                    const message = messages[index];
+                    if (message?.role !== 'user') continue;
+                    const text = this.getTextContent(message.content).trim();
+                    if (text) prompts.push(text);
+                }
+                const selected = prompts.slice(-contextSettings.turns);
+                if (selected.length <= 1) return fallback;
+
+                return selected.map((text, index) => {
+                    const isCurrent = index === selected.length - 1;
+                    return `${isCurrent ? 'Current request' : `Earlier request ${index + 1}`}:\n${text}`;
+                }).join('\n\n');
             },
 
             thinkingModeValue() {
@@ -3151,6 +3217,7 @@
                     'temperature', 'max_tokens', 'top_p', 'top_k', 'min_p',
                     'repetition_penalty', 'presence_penalty', 'image_size',
                     'image_steps', 'image_seed', 'image_guidance',
+                    'image_use_context', 'image_context_turns',
                 ];
                 for (const key of scalarKeys) {
                     if (generation[key] != null) s[key] = generation[key];
@@ -5447,6 +5514,10 @@
         const requestModel = this.resolveGatewayModelId(context.model);
         const assistantId = this.newMessageId();
         const imageSettings = this.resolveImageGenerationSettings();
+        const imageContextSettings = this.resolveImageContextSettings();
+        const requestPrompt = this.buildImageGenerationPrompt(
+            chatSession.messages, context._variantUserIndex, context.prompt
+        );
 
         this.resetStreamSession(stream);
         stream.isStreaming = true;
@@ -5469,7 +5540,7 @@
                 },
                 body: JSON.stringify({
                     model: requestModel,
-                    prompt: context.prompt,
+                    prompt: requestPrompt,
                     ...imageSettings,
                     response_format: 'b64_json',
                 }),
@@ -5497,7 +5568,14 @@
                 content: imageParts,
                 model: requestModel,
                 meta: this.captureGenerationContext(
-                    requestModel, '', null, imageSettings
+                    requestModel, '', null, {
+                        image_size: imageSettings.size,
+                        image_steps: imageSettings.steps,
+                        image_seed: imageSettings.seed,
+                        image_guidance: imageSettings.guidance,
+                        image_use_context: imageContextSettings.enabled,
+                        image_context_turns: imageContextSettings.turns,
+                    }
                 ),
                 _perfVisible: false,
             };
