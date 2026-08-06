@@ -131,6 +131,27 @@ class TestEnginePoolInit:
         assert entry_b is not None
         assert entry_b.is_pinned is False
 
+    def test_mflux_configuration_is_valid_during_preload_check(self, tmp_path):
+        """mflux models use configuration.json instead of config.json."""
+        model_dir = tmp_path / "flux2-klein-4b-4bit"
+        model_dir.mkdir()
+        (model_dir / "configuration.json").write_text(
+            '{"task":"text-to-image"}'
+        )
+        entry = EngineEntry(
+            model_id=model_dir.name,
+            model_path=str(model_dir),
+            model_type="image_generation",
+            engine_type="image_generation",
+            estimated_size=1,
+        )
+        pool = _make_pool()
+        pool._entries[entry.model_id] = entry
+
+        pool._raise_if_model_path_missing_locked(entry.model_id, entry)
+
+        assert pool.get_entry(entry.model_id) is entry
+
 
 class TestExposedProfileModelResolution:
     """Tests for exposed profile model IDs that share a physical engine."""

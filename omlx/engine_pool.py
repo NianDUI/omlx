@@ -30,6 +30,7 @@ import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
+from .engine.image_generation import ImageGenerationEngine
 from .engine.reranker import RerankerEngine
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
@@ -60,7 +61,14 @@ class EngineEntry:
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
     model_type: Literal[
-        "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"
+        "llm",
+        "vlm",
+        "embedding",
+        "reranker",
+        "audio_stt",
+        "audio_tts",
+        "audio_sts",
+        "image_generation",
     ]  # Model type
     engine_type: Literal[
         "batched",
@@ -71,6 +79,7 @@ class EngineEntry:
         "audio_stt",
         "audio_tts",
         "audio_sts",
+        "image_generation",
     ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
@@ -97,6 +106,7 @@ class EngineEntry:
         | STTEngine
         | STSEngine
         | TTSEngine
+        | ImageGenerationEngine
         | None
     ) = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
@@ -510,6 +520,7 @@ class EnginePool:
         "audio_stt": "audio_stt",
         "audio_tts": "audio_tts",
         "audio_sts": "audio_sts",
+        "image_generation": "image_generation",
     }
 
     @staticmethod
@@ -560,7 +571,10 @@ class EnginePool:
     ) -> None:
         """Drop stale unloaded entries whose backing model directory vanished."""
         model_path = Path(entry.model_path)
-        if model_path.exists() and (model_path / "config.json").exists():
+        if model_path.exists() and (
+            (model_path / "config.json").exists()
+            or (model_path / "configuration.json").exists()
+        ):
             return
 
         if entry.engine is None:
@@ -785,6 +799,7 @@ class EnginePool:
         | STTEngine
         | STSEngine
         | TTSEngine
+        | ImageGenerationEngine
     ):
         """
         Get or load engine for the specified model.
@@ -1801,6 +1816,8 @@ class EnginePool:
                         model_name=entry.model_path,
                         config_model_type=entry.config_model_type,
                     )
+                elif entry.engine_type == "image_generation":
+                    engine = ImageGenerationEngine(model_name=entry.model_path)
                 else:
                     engine = BatchedEngine(
                         model_name=entry.model_path,

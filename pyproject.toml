@@ -125,6 +125,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+optiq = [
+    # Split VLM runtimes such as Mage-VL: mlx-lm language model plus a bf16
+    # vision sidecar. Keep this optional for source/Homebrew installations.
+    "mlx-optiq>=0.4.7,<0.5",
+]
+image = [
+    # Lightweight runtime deps used by mflux's FLUX.2 inference path. mflux
+    # itself must be installed --no-deps because 0.18 caps mlx below the
+    # oMLX runtime's validated MLX 0.32 pin.
+    "piexif>=1.1.3,<2",
+    "platformdirs>=4,<5",
+    "toml>=0.10.2,<1",
+]
 grammar = [
     # Grammar-constrained decoding for structured output (requires torch ~2GB)
     # Keep this native pair aligned with omlx/_torch_stub.py and the DMG
@@ -169,6 +182,13 @@ paroquant = [
 bundle = [
     "mcp>=1.5.0",
     "modelscope>=1.10.0",
+    # Bundled app support for OptiQ split VLMs (for example Mage-VL).
+    "mlx-optiq>=0.4.7,<0.5",
+    # mflux is installed --no-deps by packaging/build.py because its declared
+    # mlx<0.32 cap conflicts with oMLX's validated MLX 0.32 runtime.
+    "piexif>=1.1.3,<2",
+    "platformdirs>=4,<5",
+    "toml>=0.10.2,<1",
     # mlx-audio[tts,stt,sts] transitives:
     "scipy>=1.11.0",
     "librosa>=0.10.0",

@@ -25,8 +25,26 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+ModelType = Literal[
+    "llm",
+    "vlm",
+    "embedding",
+    "reranker",
+    "audio_stt",
+    "audio_tts",
+    "audio_sts",
+    "image_generation",
+]
+EngineType = Literal[
+    "batched",
+    "vlm",
+    "embedding",
+    "reranker",
+    "audio_stt",
+    "audio_tts",
+    "audio_sts",
+    "image_generation",
+]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -588,6 +606,16 @@ def detect_model_type(model_path: Path) -> ModelType:
     Returns:
         Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", or "audio_sts"
     """
+    mflux_config_path = model_path / "configuration.json"
+    if mflux_config_path.exists():
+        try:
+            with open(mflux_config_path) as f:
+                mflux_config = json.load(f)
+            if mflux_config.get("task") == "text-to-image":
+                return "image_generation"
+        except (json.JSONDecodeError, IOError):
+            pass
+
     config_path = model_path / "config.json"
     if not config_path.exists():
         return "llm"
@@ -1064,8 +1092,11 @@ def _is_adapter_dir(path: Path) -> bool:
 
 
 def _is_model_dir(path: Path) -> bool:
-    """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists() and not _is_adapter_dir(path)
+    """Check if a directory contains a supported model configuration."""
+    return (
+        (path / "config.json").exists()
+        or (path / "configuration.json").exists()
+    ) and not _is_adapter_dir(path)
 
 
 def model_directory_access_error(path: Path) -> str | None:
@@ -1314,6 +1345,8 @@ def _register_model(
             engine_type = "audio_tts"
         elif model_type == "audio_sts":
             engine_type = "audio_sts"
+        elif model_type == "image_generation":
+            engine_type = "image_generation"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)

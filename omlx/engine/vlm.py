@@ -1299,6 +1299,7 @@ class VLMBatchedEngine(BaseEngine):
         self._grammar_compiler_init_attempted = False
         self._vision_cache = None
         self._vision_cache_enabled = True
+        self._optiq_vision_frontend = None
         # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
@@ -1521,6 +1522,14 @@ class VLMBatchedEngine(BaseEngine):
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
             ):
+                from ..integrations.optiq_vlm import (
+                    load_optiq_vlm,
+                    needs_optiq_vlm_bridge,
+                )
+
+                if needs_optiq_vlm_bridge(self._model_name):
+                    return load_optiq_vlm(self._model_name)
+
                 custom_loaded = maybe_load_custom_quantization(
                     self._model_name,
                     is_vlm=True,
@@ -1546,6 +1555,9 @@ class VLMBatchedEngine(BaseEngine):
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(
             get_mlx_executor(), _load_vlm_sync
+        )
+        self._optiq_vision_frontend = getattr(
+            self._vlm_model, "vision_frontend", None
         )
 
         if self.model_type == "unlimited-ocr":
@@ -1645,6 +1657,12 @@ class VLMBatchedEngine(BaseEngine):
             )
         else:
             self._vision_cache = None
+            self._vision_cache_enabled = False
+
+        if self._optiq_vision_frontend is not None:
+            # OptiQ's frontend owns preprocessing + vision encoding as one
+            # operation.  oMLX's mlx-vlm feature-cache hooks cannot safely
+            # split that operation yet; prefix/KV caching remains enabled.
             self._vision_cache_enabled = False
 
         # Extract tokenizer from processor with deep-copy for thread safety.
@@ -1947,6 +1965,7 @@ class VLMBatchedEngine(BaseEngine):
                 "_grammar_compiler",
                 "_vlm_mtp_drafter",
                 "_diffusion_family",
+                "_optiq_vision_frontend",
             ),
             false_attrs=("_grammar_compiler_init_attempted",),
         )
@@ -2458,6 +2477,108 @@ class VLMBatchedEngine(BaseEngine):
             if extra_model_inputs.get(key) is not None
         }
 
+    def _prepare_optiq_vision_inputs(
+        self,
+        messages: list[dict[str, Any]],
+        images: list[Any],
+        *,
+        audio: list | None,
+        tools: list[dict] | None,
+        is_partial: bool | None,
+    ) -> Tuple[
+        List[int],
+        Optional[mx.array],
+        Optional[Dict[str, Any]],
+        Optional[str],
+        int,
+        List[Tuple[int, str]],
+    ]:
+        """Prepare a split OptiQ VLM through its registered VisionFrontend."""
+        if audio:
+            raise InvalidRequestError(
+                f"OptiQ model {self.model_type} does not support audio input.",
+                field="messages",
+            )
+
+        frontend = self._optiq_vision_frontend
+        tokenizer = self._processor
+
+        # oMLX accepts both Chat Completions ``image_url`` parts and Responses
+        # API ``input_image`` parts. OptiQ frontends currently recognize only
+        # ``image``/``image_url``. Replace every already-decoded image part with
+        # its PIL object so both API spellings take the same frontend path and
+        # avoid decoding the data URI a second time.
+        normalized_messages: list[dict[str, Any]] = []
+        image_index = 0
+        for message in messages:
+            normalized = dict(message)
+            content = message.get("content")
+            if isinstance(content, list):
+                normalized_content = []
+                for part in content:
+                    part_type = (
+                        part.get("type")
+                        if isinstance(part, dict)
+                        else getattr(part, "type", None)
+                    )
+                    if part_type in ("image", "image_url", "input_image"):
+                        if image_index >= len(images):
+                            raise ValueError(
+                                "OptiQ image content count exceeds decoded images"
+                            )
+                        normalized_content.append(
+                            {"type": "image", "image": images[image_index]}
+                        )
+                        image_index += 1
+                    elif isinstance(part, dict):
+                        normalized_content.append(part)
+                    elif hasattr(part, "model_dump"):
+                        normalized_content.append(part.model_dump())
+                    else:
+                        normalized_content.append(part)
+                normalized["content"] = normalized_content
+            normalized_messages.append(normalized)
+
+        if image_index != len(images):
+            raise ValueError(
+                "Decoded OptiQ image count does not match image content parts"
+            )
+
+        # OptiQ frontends own prompt rendering so that image sentinels can be
+        # replaced with the exact number of soft tokens.  Add oMLX request
+        # options through a tokenizer proxy without depending on private
+        # frontend implementation details.
+        class _TemplateProxy:
+            def __init__(self, target):
+                self._target = target
+
+            def __getattr__(self, name):
+                return getattr(self._target, name)
+
+            def apply_chat_template(self, template_messages, **kwargs):
+                if tools:
+                    kwargs.setdefault("tools", tools)
+                if is_partial:
+                    kwargs["add_generation_prompt"] = False
+                    kwargs["continue_final_message"] = True
+                return self._target.apply_chat_template(template_messages, **kwargs)
+
+        inputs = frontend.preprocess(
+            normalized_messages,
+            tokenizer=_TemplateProxy(tokenizer),
+            enable_thinking=bool(self._enable_thinking),
+        )
+        input_ids = inputs["input_ids"]
+        token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
+
+        image_hash = compute_image_hash(images) if images else None
+        if not images:
+            return token_ids, None, None, None, 0, []
+
+        inputs_embeds, extra_kwargs = frontend.merged_embeddings(inputs)
+        mx.eval(inputs_embeds)
+        return token_ids, inputs_embeds, extra_kwargs or {}, image_hash, 0, []
+
     def _prepare_vision_inputs(
         self,
         messages: list[dict[str, Any]],
@@ -2510,6 +2631,15 @@ class VLMBatchedEngine(BaseEngine):
         from mlx_vlm.prompt_utils import apply_chat_template, get_chat_template
         from mlx_vlm.utils import load_audio as _load_audio
         from mlx_vlm.utils import prepare_inputs
+
+        if self._optiq_vision_frontend is not None:
+            return self._prepare_optiq_vision_inputs(
+                messages,
+                images,
+                audio=audio,
+                tools=tools,
+                is_partial=is_partial,
+            )
 
         num_images = len(images)
         num_audios = len(audio) if audio else 0

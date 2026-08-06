@@ -114,6 +114,18 @@ class TestIsHelperModelConfig:
 class TestDetectModelType:
     """Tests for detect_model_type function."""
 
+    def test_detects_mflux_text_to_image_configuration(self, tmp_path):
+        (tmp_path / "configuration.json").write_text(
+            json.dumps(
+                {
+                    "framework": "pytorch",
+                    "task": "text-to-image",
+                    "allow_remote": True,
+                }
+            )
+        )
+        assert detect_model_type(tmp_path) == "image_generation"
+
     def test_detect_llm_model(self, tmp_path):
         """Test detection of LLM model."""
         config = {

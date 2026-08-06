@@ -707,6 +707,12 @@ def build_venvstacks():
     # so it can't go through venvstacks' uv resolver.
     _install_mlx_audio(EXPORT_DIR)
 
+    # Install mflux --no-deps. mflux 0.18's metadata caps mlx at <0.32,
+    # while its FLUX.2 inference path is validated against the bundle's MLX
+    # 0.32 runtime. Patch its PyTorch-only fallback loaders to import torch
+    # lazily so local mflux-format checkpoints do not require shipping torch.
+    _install_mflux(EXPORT_DIR)
+
     # Install paroquant --no-deps. The official [mlx] extra requires
     # torchvision which the mlx load path doesn't actually use; verified
     # end-to-end on 0.1.14. All real deps (mlx, mlx-lm, mlx-vlm, numpy,
@@ -769,6 +775,84 @@ def _install_mlx_audio(export_dir: Path):
 
     shutil.rmtree(audio_wheels)
     print("  ✓ mlx-audio installed")
+
+
+_MFLUX_VERSION = "0.18.0"
+
+
+def _install_mflux(export_dir: Path):
+    """Install mflux without its conflicting MLX/torch dependencies."""
+    print("\n  Building mflux wheel...")
+    mflux_wheels = SCRIPT_DIR / "_mflux_wheels"
+    if mflux_wheels.exists():
+        shutil.rmtree(mflux_wheels)
+    mflux_wheels.mkdir()
+
+    run_cmd([
+        sys.executable,
+        "-m",
+        "pip",
+        "wheel",
+        "--no-deps",
+        "--wheel-dir",
+        str(mflux_wheels),
+        f"mflux=={_MFLUX_VERSION}",
+    ])
+
+    fw_site = (
+        export_dir
+        / "framework-mlx-base"
+        / "lib"
+        / "python3.11"
+        / "site-packages"
+    )
+    if not fw_site.exists():
+        print(f"  ✗ site-packages not found: {fw_site}")
+        return
+
+    import zipfile
+
+    for whl in mflux_wheels.glob("*.whl"):
+        print(f"    Installing {whl.name} (--no-deps)")
+        with zipfile.ZipFile(whl) as zf:
+            zf.extractall(fw_site)
+
+    loader = (
+        fw_site
+        / "mflux"
+        / "models"
+        / "common"
+        / "weights"
+        / "loading"
+        / "weight_loader.py"
+    )
+    if not loader.exists():
+        raise RuntimeError(f"mflux weight loader not found: {loader}")
+    source = loader.read_text()
+    source = source.replace("import torch\n", "")
+    source = source.replace(
+        "from safetensors.torch import load_file as torch_load_file\n", ""
+    )
+    source = source.replace(
+        "    def _load_torch_checkpoint(file_path: Path) -> dict[str, mx.array]:\n",
+        "    def _load_torch_checkpoint(file_path: Path) -> dict[str, mx.array]:\n"
+        "        import torch\n",
+    )
+    for signature in (
+        "    def _load_torch_convert(path: Path, weight_files: list[str] | None = None) -> dict[str, mx.array]:\n",
+        "    def _load_torch_bfloat16(path: Path) -> dict[str, mx.array]:\n",
+        "    def _load_fp8_safetensors(path: Path) -> dict[str, mx.array]:\n",
+    ):
+        source = source.replace(
+            signature,
+            signature
+            + "        import torch\n"
+            + "        from safetensors.torch import load_file as torch_load_file\n",
+        )
+    loader.write_text(source)
+
+    shutil.rmtree(mflux_wheels)
+    print("  ✓ mflux installed (PyTorch fallback loaders made lazy)")
 
 
 # paroquant version — keep in sync with pyproject.toml [paroquant] extra

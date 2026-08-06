@@ -1495,9 +1495,33 @@
                                         x-html="renderMarkdown(msg._thinking)"></div>
                                 </div>
                             </template>
-                            <div class="message-body markdown-content" data-math-pending="true"
-                                :data-math-version="typeof msg.content === 'string' ? String(msg.content.length) : '0'"
-                                x-html="renderMarkdown(msg.content)"></div>
+                            <div class="message-body">
+                                <template x-if="getImageUrls(msg.content).length > 0">
+                                    <div class="flex flex-wrap gap-2 mb-2">
+                                        <template x-for="imgUrl in getImageUrls(msg.content)"
+                                            :key="imgUrl.substring(0, 50)">
+                                            <img :src="imgUrl" @click="openImageModal(imgUrl)"
+                                                class="max-w-full rounded-lg cursor-pointer">
+                                        </template>
+                                    </div>
+                                </template>
+                                <template x-if="hasStrippedImages(msg.content)">
+                                    <div class="flex flex-wrap gap-2 mb-2">
+                                        <template x-for="(_, i) in getStrippedImageCount(msg.content)" :key="i">
+                                            <div
+                                                class="w-20 h-20 bg-surface-muted border border-dashed border-line-strong rounded-lg flex flex-col items-center justify-center text-fg-muted text-[10px] gap-0.5">
+                                                <i data-lucide="image" class="w-5 h-5"></i>
+                                                <span x-text="window.t('chat.image_not_available')"></span>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </template>
+                                <template x-if="getTextContent(msg.content)">
+                                    <div class="markdown-content" data-math-pending="true"
+                                        :data-math-version="String(getTextContent(msg.content).length)"
+                                        x-html="renderMarkdown(getTextContent(msg.content))"></div>
+                                </template>
+                            </div>
                         </div>
                     </div>
                 </template>
@@ -1985,8 +2009,61 @@
                     </div>
                 </div>
 
-                <!-- Temperature & Max Tokens -->
-                <div class="grid grid-cols-2 gap-3">
+                <!-- Image generation parameters -->
+                <div x-show="isImageGenerationModel(currentModel)"
+                    class="p-3 bg-surface-muted rounded-xl border border-line space-y-3">
+                    <div class="flex items-center gap-1.5">
+                        <i data-lucide="image" class="w-3.5 h-3.5" style="color: var(--text-secondary);"></i>
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">Image Generation</label>
+                    </div>
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">Size</label>
+                        <select x-model="modelSettings.image_size" @change="onModelSettingsChange()"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
+                            style="color: var(--text-primary);">
+                            <option value="512x512">512 × 512</option>
+                            <option value="768x768">768 × 768</option>
+                            <option value="1024x1024">1024 × 1024</option>
+                            <option value="768x1024">768 × 1024</option>
+                            <option value="1024x768">1024 × 768</option>
+                        </select>
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div class="space-y-1">
+                            <label class="text-[10px] font-bold uppercase tracking-wider"
+                                style="color: var(--text-secondary);">Steps</label>
+                            <input type="number" x-model.number="modelSettings.image_steps"
+                                @input="onModelSettingsChange()" min="2" max="50" step="1"
+                                class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
+                                style="color: var(--text-primary);">
+                        </div>
+                        <div class="space-y-1">
+                            <label class="text-[10px] font-bold uppercase tracking-wider"
+                                style="color: var(--text-secondary);">Seed</label>
+                            <input type="number" x-model.number="modelSettings.image_seed"
+                                @input="onModelSettingsChange()" min="0" max="4294967295" step="1"
+                                class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
+                                style="color: var(--text-primary);">
+                        </div>
+                    </div>
+                    <div class="space-y-1">
+                        <label class="text-[10px] font-bold uppercase tracking-wider"
+                            style="color: var(--text-secondary);">Guidance</label>
+                        <input type="number" x-model.number="modelSettings.image_guidance"
+                            @input="onModelSettingsChange()" min="0" max="20" step="0.1"
+                            class="w-full px-3 py-2 text-xs border border-line rounded-xl bg-surface"
+                            style="color: var(--text-primary);">
+                    </div>
+                    <p class="text-[10px]" style="color: var(--text-tertiary);">
+                        Steps 2–50 · Seed 0–4294967295 · Guidance 0–20
+                    </p>
+                </div>
+
+                <div x-show="!isImageGenerationModel(currentModel)" class="space-y-3">
+                    <!-- Temperature & Max Tokens -->
+                    <div class="grid grid-cols-2 gap-3">
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">{{ t('modal.model_settings.temperature') }}</label>
@@ -2003,10 +2080,10 @@
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
                     </div>
-                </div>
+                    </div>
 
-                <!-- Sampling Advanced parameters: Top P, Top K, Min P -->
-                <div class="grid grid-cols-3 gap-2">
+                    <!-- Sampling Advanced parameters: Top P, Top K, Min P -->
+                    <div class="grid grid-cols-3 gap-2">
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">{{ t('modal.model_settings.top_p') }}</label>
@@ -2031,10 +2108,10 @@
                             class="w-full px-2 py-2 text-xs border border-line rounded-xl text-center focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
                     </div>
-                </div>
+                    </div>
 
-                <!-- Repetition Penalty & Presence Penalty -->
-                <div class="grid grid-cols-2 gap-3">
+                    <!-- Repetition Penalty & Presence Penalty -->
+                    <div class="grid grid-cols-2 gap-3">
                     <div class="space-y-1">
                         <label class="text-[10px] font-bold uppercase tracking-wider"
                             style="color: var(--text-secondary);">{{ t('modal.model_settings.repetition_penalty_short') }}</label>
@@ -2051,10 +2128,10 @@
                             class="w-full px-3 py-2 text-xs border border-line rounded-xl focus:outline-none focus:border-line-strong bg-surface-muted"
                             style="color: var(--text-primary);">
                     </div>
-                </div>
+                    </div>
 
-                <!-- Thinking: Auto / On (Unlimit) / On (Limit) / Off -->
-                <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-2">
+                    <!-- Thinking: Auto / On (Unlimit) / On (Limit) / Off -->
+                    <div class="p-3 bg-surface-muted rounded-xl border border-line space-y-2">
                     <label class="text-[10px] font-bold uppercase tracking-wider block"
                         style="color: var(--text-secondary);">{{ t('chat.thinking_label') }}</label>
                     <select :value="thinkingModeValue()" @change="setThinkingMode($event.target.value)"
@@ -2081,6 +2158,7 @@
                     <p class="text-[10px]" style="color: var(--text-tertiary);">
                         {{ t('chat.model_settings_advanced_hint') }}
                     </p>
+                    </div>
                 </div>
 
             </div>
@@ -2348,6 +2426,8 @@
     const CHAT_UNTITLED_I18N_KEY = 'chat.untitled_title';
     const MAX_CHAT_HISTORY_SIZE = 100;
     const CHAT_HISTORY_STORAGE_KEY = 'omlx_chat_history';
+    const CHAT_MEDIA_DB_NAME = 'omlx_chat_media';
+    const CHAT_MEDIA_STORE_NAME = 'images';
     const API_KEY_STORAGE_KEY = 'omlx_chat_api_key';
     const THEME_STORAGE_KEY = 'omlx-chat-theme';
     const ALLOW_SVG_STORAGE_KEY = 'omlx-chat-allow-svg';
@@ -2371,6 +2451,7 @@
             // API Key
             apiKeySet: false,
             apiKeyInput: '',
+            _chatMediaDbPromise: null,
 
             // UI State
             // Touch/coarse-pointer devices (phones, tablets) — NOT just narrow windows.
@@ -2442,7 +2523,7 @@
             },
 
             // VLM Detection State
-            modelTypeMap: {},            // { modelId: "llm"|"vlm"|"embedding"|"reranker" }
+            modelTypeMap: {},            // { modelId: "llm"|"vlm"|"image_generation"|... }
             aliasToGateway: {},          // { aliasName: gatewayId } maps alias to directory name
 
             // Session Prompt
@@ -2506,6 +2587,10 @@
                 enable_thinking: null,
                 thinking_budget_enabled: false,
                 thinking_budget_tokens: null,
+                image_size: '1024x1024',
+                image_steps: 4,
+                image_seed: 0,
+                image_guidance: 1.0,
             },
 
             defaultModelSettings() {
@@ -2520,6 +2605,34 @@
                     enable_thinking: null,
                     thinking_budget_enabled: false,
                     thinking_budget_tokens: null,
+                    image_size: '1024x1024',
+                    image_steps: 4,
+                    image_seed: 0,
+                    image_guidance: 1.0,
+                };
+            },
+
+            resolveImageGenerationSettings() {
+                const allowedSizes = new Set([
+                    '512x512', '768x768', '1024x1024', '768x1024', '1024x768',
+                ]);
+                const size = allowedSizes.has(this.modelSettings.image_size)
+                    ? this.modelSettings.image_size : '1024x1024';
+                const clampInteger = (value, fallback, min, max) => {
+                    const number = Number(value);
+                    if (!Number.isFinite(number)) return fallback;
+                    return Math.min(max, Math.max(min, Math.floor(number)));
+                };
+                const clampNumber = (value, fallback, min, max) => {
+                    const number = Number(value);
+                    if (!Number.isFinite(number)) return fallback;
+                    return Math.min(max, Math.max(min, number));
+                };
+                return {
+                    size,
+                    steps: clampInteger(this.modelSettings.image_steps, 4, 2, 50),
+                    seed: clampInteger(this.modelSettings.image_seed, 0, 0, 4294967295),
+                    guidance: clampNumber(this.modelSettings.image_guidance, 1.0, 0, 20),
                 };
             },
 
@@ -3036,7 +3149,8 @@
                 }
                 const scalarKeys = [
                     'temperature', 'max_tokens', 'top_p', 'top_k', 'min_p',
-                    'repetition_penalty', 'presence_penalty',
+                    'repetition_penalty', 'presence_penalty', 'image_size',
+                    'image_steps', 'image_seed', 'image_guidance',
                 ];
                 for (const key of scalarKeys) {
                     if (generation[key] != null) s[key] = generation[key];
@@ -3694,6 +3808,7 @@
                 await this.loadModelCapabilities(this.currentModel);
             }
             this.loadChatHistory();
+            await this.garbageCollectChatMedia();
             this.fetchMcpTools();
         }
 
@@ -3791,8 +3906,17 @@
         return this.modelTypeMap[id] === 'vlm';
     },
 
+    isImageGenerationModel(modelId = this.currentModel) {
+        const id = this.resolveGatewayModelId(modelId);
+        return (this.modelTypeMap[id] || '').toLowerCase() === 'image_generation';
+    },
+
     hasDocumentSupport() {
-        return Boolean(this.currentModel && this.markitdownSettings.enabled);
+        return Boolean(
+            this.currentModel
+            && !this.isImageGenerationModel(this.currentModel)
+            && this.markitdownSettings.enabled
+        );
     },
 
     hasPendingUploads() {
@@ -4749,6 +4873,223 @@
         }
     },
 
+    openChatMediaDb() {
+        if (!window.indexedDB) return Promise.resolve(null);
+        if (this._chatMediaDbPromise) return this._chatMediaDbPromise;
+        this._chatMediaDbPromise = new Promise((resolve) => {
+            const request = indexedDB.open(CHAT_MEDIA_DB_NAME, 1);
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                if (!db.objectStoreNames.contains(CHAT_MEDIA_STORE_NAME)) {
+                    db.createObjectStore(CHAT_MEDIA_STORE_NAME, { keyPath: 'key' });
+                }
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => {
+                console.error('Failed to open chat media database:', request.error);
+                this._chatMediaDbPromise = null;
+                resolve(null);
+            };
+        });
+        return this._chatMediaDbPromise;
+    },
+
+    chatMediaKey(chatId, messageId, partIndex) {
+        return `${chatId}:${messageId}:${partIndex}`;
+    },
+
+    async persistChatMediaRecords(records) {
+        if (!records.length) return true;
+        const db = await this.openChatMediaDb();
+        if (!db) return false;
+        return await new Promise((resolve) => {
+            const transaction = db.transaction(CHAT_MEDIA_STORE_NAME, 'readwrite');
+            const store = transaction.objectStore(CHAT_MEDIA_STORE_NAME);
+            for (const record of records) store.put(record);
+            transaction.oncomplete = () => resolve(true);
+            transaction.onerror = () => {
+                console.error('Failed to persist chat images:', transaction.error);
+                resolve(false);
+            };
+            transaction.onabort = () => resolve(false);
+        });
+    },
+
+    collectChatMediaRecords(chatId, messages, { forceNewKeys = false } = {}) {
+        const records = [];
+        for (let messageIndex = 0; messageIndex < (messages || []).length; messageIndex++) {
+            const msg = messages[messageIndex];
+            if (!Array.isArray(msg.content)) continue;
+            const messageId = msg.id || `message_${messageIndex}`;
+            for (let partIndex = 0; partIndex < msg.content.length; partIndex++) {
+                const part = msg.content[partIndex];
+                if (part?.type !== 'image_url') continue;
+                const image = part.image_url || (part.image_url = {});
+                const mediaKey = !forceNewKeys && image.media_key
+                    ? image.media_key
+                    : this.chatMediaKey(chatId, messageId, partIndex);
+                image.media_key = mediaKey;
+                if (image.url) {
+                    records.push({ key: mediaKey, url: image.url, updatedAt: Date.now() });
+                }
+            }
+        }
+        return records;
+    },
+
+    async persistChatMediaForMessages(chatId, messages, options = {}) {
+        const records = this.collectChatMediaRecords(chatId, messages, options);
+        const persisted = await this.persistChatMediaRecords(records);
+        if (!persisted && records.length) {
+            console.warn('Chat images remain available in this session but could not be persisted.');
+        }
+        return persisted;
+    },
+
+    async readChatMedia(key) {
+        const db = await this.openChatMediaDb();
+        if (!db) return null;
+        return await new Promise((resolve) => {
+            const request = db.transaction(CHAT_MEDIA_STORE_NAME, 'readonly')
+                .objectStore(CHAT_MEDIA_STORE_NAME).get(key);
+            request.onsuccess = () => resolve(request.result?.url || null);
+            request.onerror = () => resolve(null);
+        });
+    },
+
+    async hydrateChatMedia(chatId, messages) {
+        const pending = [];
+        for (const msg of messages || []) {
+            if (!Array.isArray(msg.content)) continue;
+            for (const part of msg.content) {
+                const image = part?.type === 'image_url' ? part.image_url : null;
+                if (image && !image.url && image.media_key) {
+                    pending.push(
+                        this.readChatMedia(image.media_key).then((url) => {
+                            if (url) image.url = url;
+                        })
+                    );
+                }
+            }
+        }
+        if (!pending.length) return;
+        await Promise.all(pending);
+        const session = this.getChatSession(chatId, false);
+        if (session && this.currentChatId === chatId) {
+            this.messages = [...session.messages];
+            this.scheduleEnhanceMessages();
+        }
+    },
+
+    prepareMessagesForStorage(chatId, messages) {
+        const storedMessages = messages.map((msg, messageIndex) => {
+            if (!Array.isArray(msg.content)) return msg;
+            const messageId = msg.id || `message_${messageIndex}`;
+            return {
+                ...msg,
+                content: msg.content.map((part, partIndex) => {
+                    if (part.type === 'image_url') {
+                        const image = part.image_url || {};
+                        const mediaKey = image.media_key
+                            || this.chatMediaKey(chatId, messageId, partIndex);
+                        image.media_key = mediaKey;
+                        return {
+                            type: 'image_url',
+                            image_url: { url: '', media_key: mediaKey },
+                        };
+                    }
+                    if (part.type === 'file') {
+                        return {
+                            type: 'file',
+                            file: {
+                                filename: part.file?.filename || '',
+                                mime_type: part.file?.mime_type || '',
+                                data: '',
+                            },
+                        };
+                    }
+                    return part;
+                })
+            };
+        });
+        return storedMessages;
+    },
+
+    referencedChatMediaKeys() {
+        const keys = new Set();
+        const validChatIds = new Set(this.chatHistory.map(chat => chat.id));
+        const collect = (messages) => {
+            for (const msg of messages || []) {
+                if (!Array.isArray(msg.content)) continue;
+                for (const part of msg.content) {
+                    const key = part?.type === 'image_url' ? part.image_url?.media_key : null;
+                    if (key) keys.add(key);
+                }
+            }
+        };
+        for (const chat of this.chatHistory) collect(chat.messages);
+        for (const [chatId, session] of Object.entries(this.chatSessions)) {
+            if (
+                validChatIds.has(chatId)
+                || chatId === this.currentChatId
+                || this.isChatStreaming(chatId)
+            ) {
+                collect(session?.messages);
+            }
+        }
+        return keys;
+    },
+
+    async garbageCollectChatMedia() {
+        const db = await this.openChatMediaDb();
+        if (!db) return;
+        const referenced = this.referencedChatMediaKeys();
+        await new Promise((resolve) => {
+            const transaction = db.transaction(CHAT_MEDIA_STORE_NAME, 'readwrite');
+            const request = transaction.objectStore(CHAT_MEDIA_STORE_NAME).openCursor();
+            request.onsuccess = () => {
+                const cursor = request.result;
+                if (!cursor) return;
+                if (!referenced.has(String(cursor.key))) cursor.delete();
+                cursor.continue();
+            };
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => resolve();
+            transaction.onabort = () => resolve();
+        });
+    },
+
+    async deleteChatMedia(chatId) {
+        const db = await this.openChatMediaDb();
+        if (!db) return;
+        await new Promise((resolve) => {
+            const transaction = db.transaction(CHAT_MEDIA_STORE_NAME, 'readwrite');
+            const request = transaction.objectStore(CHAT_MEDIA_STORE_NAME).openCursor();
+            const prefix = `${chatId}:`;
+            request.onsuccess = () => {
+                const cursor = request.result;
+                if (!cursor) return;
+                if (String(cursor.key).startsWith(prefix)) cursor.delete();
+                cursor.continue();
+            };
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => resolve();
+            transaction.onabort = () => resolve();
+        });
+    },
+
+    async clearChatMedia() {
+        const db = await this.openChatMediaDb();
+        if (!db) return;
+        await new Promise((resolve) => {
+            const transaction = db.transaction(CHAT_MEDIA_STORE_NAME, 'readwrite');
+            transaction.objectStore(CHAT_MEDIA_STORE_NAME).clear();
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => resolve();
+            transaction.onabort = () => resolve();
+        });
+    },
+
     saveChatHistory() {
         const key = CHAT_HISTORY_STORAGE_KEY;
         const persist = () => localStorage.setItem(key, JSON.stringify(this.chatHistory));
@@ -4764,6 +5105,7 @@
                 try {
                     persist();
                     console.warn('Chat history trimmed to fit localStorage quota');
+                    void this.garbageCollectChatMedia();
                     return;
                 } catch (retryErr) {
                     if (retryErr?.name !== 'QuotaExceededError' && !/quota/i.test(String(retryErr?.message || ''))) {
@@ -4870,6 +5212,7 @@
             session.messages.forEach(m => this.ensureVariantMeta(m, session));
             this.currentChatId = chatId;
             this.messages = session.messages;
+            await this.hydrateChatMedia(chatId, session.messages);
             this.systemPrompt = session.systemPrompt || '';
             this.activePromptProfile = session.activeProfile
                 && this.promptProfiles.some(p => p.name === session.activeProfile)
@@ -4920,29 +5263,8 @@
         const existingIndex = this.chatHistory.findIndex(c => c.id === chatId);
         const existingChat = existingIndex >= 0 ? this.chatHistory[existingIndex] : null;
 
-        // Strip base64 image data from content arrays to avoid localStorage quota issues
-        const messagesForStorage = messagesToSave.map(msg => {
-            if (!Array.isArray(msg.content)) return msg;
-            return {
-                ...msg,
-                content: msg.content.map(part => {
-                    if (part.type === 'image_url') {
-                        return { type: 'image_url', image_url: { url: '' } };
-                    }
-                    if (part.type === 'file') {
-                        return {
-                            type: 'file',
-                            file: {
-                                filename: part.file?.filename || '',
-                                mime_type: part.file?.mime_type || '',
-                                data: '',
-                            },
-                        };
-                    }
-                    return part;
-                })
-            };
-        });
+        // Store image payloads in IndexedDB; localStorage keeps only lightweight refs.
+        const messagesForStorage = this.prepareMessagesForStorage(chatId, messagesToSave);
 
         const title = this.resolveAutoChatTitle(messagesToSave, existingChat);
 
@@ -5000,8 +5322,10 @@
 
         this.sortChatHistory();
         // Keep only last MAX_CHAT_HISTORY_SIZE chats
+        const historyWasTrimmed = this.chatHistory.length > MAX_CHAT_HISTORY_SIZE;
         this.chatHistory = this.chatHistory.slice(0, MAX_CHAT_HISTORY_SIZE);
         this.saveChatHistory();
+        if (historyWasTrimmed) void this.garbageCollectChatMedia();
     },
 
     startRenamingChat(chat) {
@@ -5036,8 +5360,10 @@
         const userText = this.inputMessage.trim();
         const images = this.uploadImages.filter(img => img.base64);
         const documents = this.uploadDocuments.filter(doc => doc.base64);
+        const isImageGeneration = this.isImageGenerationModel(this.currentModel);
 
         if (this.hasPendingUploads()) return;
+        if (isImageGeneration && !userText) return;
         if (!userText && images.length === 0 && documents.length === 0) return;
         if (!this.currentModel || this.isCurrentChatStreaming()) return;
 
@@ -5087,14 +5413,125 @@
 
         const userMsg = { id: this.newMessageId(), role: 'user', content };
         chatSession.messages.push(userMsg);
+        await this.persistChatMediaForMessages(chatId, [userMsg]);
         this.messages = chatSession.messages;
         this.forceScrollToBottom();
+        if (isImageGeneration) {
+            await this.generateImageResponse({
+                chatId,
+                model: sourceModel,
+                prompt: userText,
+                _variantUserIndex: chatSession.messages.length - 1,
+            });
+            return;
+        }
         await this.streamResponse({
             chatId,
             model: sourceModel,
             systemPrompt: sourceSystemPrompt,
             _profile: this.resolveStreamProfile(null, chatSession),
         }, 0);
+    },
+
+    async generateImageResponse(imageContext) {
+        const context = {
+            chatId: imageContext?.chatId || this.currentChatId,
+            model: imageContext?.model || this.currentModel,
+            prompt: (imageContext?.prompt || '').trim(),
+            _variantUserIndex: imageContext?._variantUserIndex ?? null,
+        };
+        if (!context.chatId || !context.model || !context.prompt) return;
+
+        const chatSession = this.getChatSession(context.chatId, true);
+        const stream = this.getStreamSession(context.chatId, true);
+        const requestModel = this.resolveGatewayModelId(context.model);
+        const assistantId = this.newMessageId();
+        const imageSettings = this.resolveImageGenerationSettings();
+
+        this.resetStreamSession(stream);
+        stream.isStreaming = true;
+        stream._statusStart = Date.now();
+        stream.targetMessageId = assistantId;
+        stream.sourceModel = requestModel;
+        stream.sourceSystemPrompt = '';
+        stream.sourceProfile = null;
+        stream.abortController = new AbortController();
+        this.setEngineStatus(context.chatId, { text: window.t('chat.status.starting') });
+        this.autoScrollEnabled = true;
+        this.forceScrollToBottom();
+
+        try {
+            const response = await fetch('/v1/images/generations', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.getApiKey()}`
+                },
+                body: JSON.stringify({
+                    model: requestModel,
+                    prompt: context.prompt,
+                    ...imageSettings,
+                    response_format: 'b64_json',
+                }),
+                signal: stream.abortController.signal,
+            });
+
+            const data = await response.json().catch(() => null);
+            if (!response.ok) {
+                throw new Error(data?.error?.message || `Error: ${response.status}`);
+            }
+
+            const imageParts = (data?.data || [])
+                .filter(item => item?.b64_json)
+                .map(item => ({
+                    type: 'image_url',
+                    image_url: { url: `data:image/png;base64,${item.b64_json}` },
+                }));
+            if (imageParts.length === 0) {
+                throw new Error('Image generation returned no images.');
+            }
+
+            const assistantMsg = {
+                id: assistantId,
+                role: 'assistant',
+                content: imageParts,
+                model: requestModel,
+                meta: this.captureGenerationContext(
+                    requestModel, '', null, imageSettings
+                ),
+                _perfVisible: false,
+            };
+            chatSession.messages.push(assistantMsg);
+            await this.persistChatMediaForMessages(context.chatId, [assistantMsg]);
+            this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
+            this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, chatSession.systemPrompt);
+            if (this.currentChatId === context.chatId) {
+                this.messages = chatSession.messages;
+                this.scheduleEnhanceMessages();
+                this.forceScrollToBottom();
+            }
+        } catch (error) {
+            if (error.name !== 'AbortError') {
+                const errorMsg = {
+                    id: assistantId,
+                    role: 'assistant',
+                    content: `Error: ${error.message}`,
+                    model: requestModel,
+                    _perfVisible: false,
+                };
+                chatSession.messages.push(errorMsg);
+                this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
+                this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, chatSession.systemPrompt);
+                if (this.currentChatId === context.chatId) {
+                    this.messages = chatSession.messages;
+                    this.scheduleEnhanceMessages();
+                    this.forceScrollToBottom();
+                }
+            }
+        } finally {
+            this.resetStreamSession(stream);
+            this.stopStatsPollingIfIdle();
+        }
     },
 
             async streamResponse(streamContext = null, depth = 0) {
@@ -5642,6 +6079,20 @@
         this.messages = session.messages;
         this.scheduleEnhanceMessages();
 
+        const targetModel = opts.model || this.currentModel;
+        if (this.isImageGenerationModel(targetModel)) {
+            const prompt = userIdx >= 0
+                ? this.getTextContent(session.messages[userIdx]?.content).trim()
+                : '';
+            await this.generateImageResponse({
+                chatId: this.currentChatId,
+                model: targetModel,
+                prompt,
+                _variantUserIndex: userIdx,
+            });
+            return;
+        }
+
         // Optional one-off overrides from the regenerate dropdown. These apply to
         // this single call only and never mutate the session's saved settings.
         let generationOverride = null;
@@ -5714,23 +6165,24 @@
         this._copyText(text);
     },
 
-    deleteMessage(index) {
+    async deleteMessage(index) {
         if (this.isCurrentChatStreaming()) return;
         const session = this.getChatSession(this.currentChatId, true);
         if (!session) return;
         const chatId = this.currentChatId;
         session.messages = this.sliceBeforeMessage(session.messages, index);
         if (session.messages.length === 0) {
-            this.deleteChat(chatId, { skipConfirm: true });
+            await this.deleteChat(chatId, { skipConfirm: true });
             return;
         }
         this.messages = session.messages;
         this.syncFooterStatsFromMessages(session.messages);
         this.saveCurrentChat(chatId);
+        await this.garbageCollectChatMedia();
         this.scheduleEnhanceMessages();
     },
 
-    deleteVariant(userIndex, variantId, event) {
+    async deleteVariant(userIndex, variantId, event) {
         if (event) {
             event.stopPropagation();
             event.preventDefault();
@@ -5763,6 +6215,7 @@
 
         this.messages = session.messages;
         this.saveCurrentChat(this.currentChatId);
+        await this.garbageCollectChatMedia();
         this.scheduleEnhanceMessages();
     },
 
@@ -5788,7 +6241,7 @@
         this.attachProfileToAssistantMessage(msg, this.resolveMessageProfile(msg));
     },
 
-    branchChat(index) {
+    async branchChat(index) {
         if (this.isCurrentChatStreaming()) return;
         const session = this.getChatSession(this.currentChatId, true);
         const originalChat = this.chatHistory.find(c => c.id === this.currentChatId);
@@ -5797,6 +6250,9 @@
         const branchId = 'chat_' + Date.now();
         const branchMessages = session.messages.slice(0, index + 1).map(msg => this.cloneData(msg));
         this.ensureMessageIds(branchMessages);
+        await this.persistChatMediaForMessages(
+            branchId, branchMessages, { forceNewKeys: true }
+        );
 
         // Use profile from the message at branch point
         const branchMsg = branchMessages[index];
@@ -5815,28 +6271,7 @@
         };
         this.chatSessions[branchId] = branchSession;
 
-        const messagesForStorage = branchMessages.map(msg => {
-            if (!Array.isArray(msg.content)) return msg;
-            return {
-                ...msg,
-                content: msg.content.map(part => {
-                    if (part.type === 'image_url') {
-                        return { type: 'image_url', image_url: { url: '' } };
-                    }
-                    if (part.type === 'file') {
-                        return {
-                            type: 'file',
-                            file: {
-                                filename: part.file?.filename || '',
-                                mime_type: part.file?.mime_type || '',
-                                data: '',
-                            },
-                        };
-                    }
-                    return part;
-                })
-            };
-        });
+        const messagesForStorage = this.prepareMessagesForStorage(branchId, branchMessages);
 
         const branchData = {
             id: branchId,
@@ -5971,11 +6406,13 @@
         }
 
         // Add edited user message
-        session.messages.push({
+        const editedUserMsg = {
             id: this.newMessageId(),
             role: 'user',
             content
-        });
+        };
+        session.messages.push(editedUserMsg);
+        await this.persistChatMediaForMessages(this.currentChatId, [editedUserMsg]);
 
         // Reset edit state before streaming (avoids leaking images if stream throws)
         this.editingIndex = null;
@@ -5999,6 +6436,7 @@
         } catch (e) {
             console.error('saveEdit stream failed:', e);
         }
+        await this.garbageCollectChatMedia();
     },
 
     // Delete chat
@@ -6008,6 +6446,7 @@
         this.getStreamSession(chatId, false)?.abortController?.abort();
         delete this.streamSessions[chatId];
         delete this.chatSessions[chatId];
+        await this.deleteChatMedia(chatId);
 
         const wasCurrent = this.currentChatId === chatId;
         this.chatHistory = this.chatHistory.filter(c => c.id !== chatId);
@@ -6053,6 +6492,7 @@
         this.chatHistory = [];
         this.chatSessions = {};
         this.streamSessions = {};
+        await this.clearChatMedia();
         this.saveChatHistory();
         await this.startNewChat();
 

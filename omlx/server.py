@@ -40,6 +40,7 @@ The server provides:
 
 import argparse
 import asyncio
+import base64
 import inspect
 import json
 import logging
@@ -97,6 +98,11 @@ from .api.embedding_utils import (
     normalize_embedding_items,
     normalize_input,
     truncate_embedding,
+)
+from .api.image_models import (
+    ImageData,
+    ImageGenerationRequest,
+    ImageGenerationResponse,
 )
 from .api.markitdown import (
     MARKITDOWN_MODEL_ID,
@@ -176,6 +182,7 @@ from .api.utils import (
 )
 from .engine import BaseEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
+from .engine.image_generation import ImageGenerationEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
 from .exceptions import (
@@ -213,6 +220,7 @@ class EngineType(Enum):
     LLM = "llm"
     EMBEDDING = "embedding"
     RERANKER = "reranker"
+    IMAGE_GENERATION = "image_generation"
 
 
 @dataclass
@@ -873,7 +881,7 @@ async def get_engine(
     engine_type: EngineType = EngineType.LLM,
     _lease: bool = False,
     _leased_out: list | None = None,
-) -> Union[BaseEngine, EmbeddingEngine, RerankerEngine]:
+) -> Union[BaseEngine, EmbeddingEngine, RerankerEngine, ImageGenerationEngine]:
     """
     Get engine for the specified model and type.
 
@@ -1013,6 +1021,13 @@ async def get_engine(
                     detail=f"Model '{model_id}' is not a reranker model. "
                     f"Use a SequenceClassification model for reranking.",
                 )
+        elif engine_type == EngineType.IMAGE_GENERATION:
+            if not isinstance(engine, ImageGenerationEngine):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model '{model_id}' is not an image generation model. "
+                    "Use an mflux FLUX.2 Klein model.",
+                )
         elif engine_type == EngineType.LLM:
             # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
             # fell through and crashed on `engine.model_type` with an unhandled
@@ -1062,6 +1077,8 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
         return "Use /v1/embeddings for embedding models."
     if isinstance(engine, RerankerEngine):
         return "Use /v1/rerank for reranker models."
+    if isinstance(engine, ImageGenerationEngine):
+        return "Use /v1/images/generations for image generation models."
     return "Use the model's dedicated endpoint (see /v1/models)."
 
 
@@ -1193,6 +1210,11 @@ async def get_reranker_engine(model: str) -> RerankerEngine:
     return await get_engine(model, EngineType.RERANKER)
 
 
+async def get_image_generation_engine(model: str) -> ImageGenerationEngine:
+    """Get an mflux image generation engine for the specified model."""
+    return await get_engine(model, EngineType.IMAGE_GENERATION)
+
+
 @asynccontextmanager
 async def acquire_embedding_engine(model: str):
     """Acquire an embedding engine with an atomic, eviction-proof in-use lease.
@@ -1222,6 +1244,20 @@ async def acquire_reranker_engine(model: str):
     leased: list = []
     engine = await get_engine(
         model, EngineType.RERANKER, _lease=True, _leased_out=leased
+    )
+    try:
+        yield engine
+    finally:
+        if leased:
+            await get_engine_pool().release_engine(leased[0])
+
+
+@asynccontextmanager
+async def acquire_image_generation_engine(model: str):
+    """Acquire an image engine with an eviction-proof in-use lease."""
+    leased: list = []
+    engine = await get_engine(
+        model, EngineType.IMAGE_GENERATION, _lease=True, _leased_out=leased
     )
     try:
         yield engine
@@ -2830,6 +2866,59 @@ async def create_embeddings(
     return StreamingResponse(
         _with_json_keepalive(http_request, _build_embeddings()),
         media_type="application/json",
+    )
+
+
+# =============================================================================
+# Image Generation Endpoint
+# =============================================================================
+
+
+@app.post("/v1/images/generations")
+async def create_image(
+    request: ImageGenerationRequest,
+    _: bool = Depends(verify_api_key),
+) -> ImageGenerationResponse:
+    """Generate one PNG image using an mflux FLUX.2 Klein model."""
+    oq_manager = getattr(_server_state, "oq_manager", None)
+    if oq_manager and oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again later.",
+        )
+
+    width, height = request.dimensions()
+    started = time.perf_counter()
+    try:
+        async with acquire_image_generation_engine(request.model) as engine:
+            output = await engine.generate(
+                request.prompt,
+                seed=request.seed,
+                steps=request.steps,
+                width=width,
+                height=height,
+                guidance=request.guidance,
+            )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    elapsed = time.perf_counter() - started
+    logger.info(
+        "Image generation: model=%s, size=%sx%s, steps=%s, seed=%s in %.3fs",
+        request.model,
+        width,
+        height,
+        request.steps,
+        request.seed,
+        elapsed,
+    )
+    return ImageGenerationResponse(
+        created=int(time.time()),
+        data=[
+            ImageData(
+                b64_json=base64.b64encode(output.png_bytes).decode("ascii"),
+            )
+        ],
     )
 
 
