@@ -1738,6 +1738,18 @@
                             :title="window.t('chat.upload_document')">
                             <i data-lucide="file-text" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                         </button>
+                        <!-- One-click, turn-based voice call. Text chat controls remain unchanged. -->
+                        <button @click="toggleVoiceCall()"
+                            :disabled="!apiKeySet || !currentModel || isVoiceCallStarting"
+                            class="h-10 m-1 shrink-0 px-3 rounded-full border transition-colors flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                            :class="voiceCallActive ? 'bg-red-500 hover:bg-red-600 border-red-500 text-white' : 'bg-surface-muted hover:bg-surface border-line'"
+                            :title="voiceCallActive ? voiceText('chat.voice.end_call', '结束语音通话') : voiceText('chat.voice.start_call', '开始语音通话')">
+                            <i :data-lucide="voiceCallActive ? 'phone-off' : 'phone'" class="w-4 h-4"
+                                :style="voiceCallActive ? 'color: white;' : 'color: var(--text-tertiary);'"></i>
+                            <span class="text-xs font-medium" x-text="voiceCallActive
+                                ? voiceText('chat.voice.in_call', '通话中')
+                                : voiceText('chat.voice.start_call', '语音通话')"></span>
+                        </button>
 
                         <textarea x-ref="messageInput" x-model="inputMessage"
                             autocomplete="off" autocorrect="off"
@@ -1766,6 +1778,8 @@
                                 x-text="uploadDocuments.length"></div>
                         </div>
                     </div>
+                    <p x-show="voiceCallActive" class="px-2 pb-1 text-[11px]" style="color: var(--text-tertiary);"
+                        x-text="voiceCallStatus"></p>
                 </div>
                 <!-- Context usage: status line — active model on the left, a capsule holding
                      tokens · % + a ring on the right. Hover the capsule for the exact count. -->
@@ -2370,6 +2384,45 @@
                         <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
                     </select>
                 </div>
+                <div class="pt-4 border-t border-line space-y-3">
+                    <div>
+                        <h4 class="text-xs font-bold uppercase tracking-wider text-fg-tertiary"
+                            x-text="voiceText('chat.voice.title', '语音通话')"></h4>
+                        <p class="mt-1 text-[11px]" style="color: var(--text-tertiary);"
+                            x-text="voiceText('chat.voice.hint', '开始后自动识别停顿、回复并继续监听。')"></p>
+                    </div>
+                    <label class="flex items-center justify-between gap-3 text-sm" style="color: var(--text-primary);">
+                        <span x-text="voiceText('chat.voice.auto_play', '文字聊天自动播报')"></span>
+                        <input type="checkbox" x-model="voiceSettings.autoPlay" @change="saveVoiceSettings()"
+                            class="h-4 w-4 rounded border-line">
+                    </label>
+                    <div>
+                        <label class="block text-xs mb-1" style="color: var(--text-secondary);"
+                            x-text="voiceText('chat.voice.stt_model', '语音识别（STT）模型')"></label>
+                        <select x-model="voiceSettings.sttModel" @change="saveVoiceSettings()"
+                            class="w-full px-3 py-2 border border-line rounded-xl text-sm focus:outline-none focus:border-line-strong"
+                            style="background: var(--bg-primary); color: var(--text-primary);">
+                            <option value="" x-text="voiceText('chat.voice.no_model', '未选择')"></option>
+                            <template x-for="model in voiceModels('audio_stt')" :key="model.id">
+                                <option :value="model.id" x-text="model.name"></option>
+                            </template>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs mb-1" style="color: var(--text-secondary);"
+                            x-text="voiceText('chat.voice.tts_model', '语音合成（TTS）模型')"></label>
+                        <select x-model="voiceSettings.ttsModel" @change="saveVoiceSettings()"
+                            class="w-full px-3 py-2 border border-line rounded-xl text-sm focus:outline-none focus:border-line-strong"
+                            style="background: var(--bg-primary); color: var(--text-primary);">
+                            <option value="" x-text="voiceText('chat.voice.no_model', '未选择')"></option>
+                            <template x-for="model in voiceModels('audio_tts')" :key="model.id">
+                                <option :value="model.id" x-text="model.name"></option>
+                            </template>
+                        </select>
+                    </div>
+                    <p x-show="audioModels.length === 0" class="text-[11px]" style="color: var(--text-tertiary);"
+                        x-text="voiceText('chat.voice.no_audio_models', '未发现音频模型。')"></p>
+                </div>
                 <div class="pt-4 border-t border-line">
                     <h4 class="text-xs font-bold uppercase tracking-wider text-fg-tertiary mb-2">{{ t('chat.chat_history_label') }}</h4>
                     <div class="space-y-1">
@@ -2461,6 +2514,7 @@
     const ALLOW_SVG_STORAGE_KEY = 'omlx-chat-allow-svg';
     const SYSTEM_PROMPT_STORAGE_KEY = 'omlx_chat_system_prompt';
     const PROMPT_PROFILES_STORAGE_KEY = 'omlx_chat_prompt_profiles';
+    const VOICE_SETTINGS_STORAGE_KEY = 'omlx_chat_voice_settings';
 
     function resolveChatUntitledLabel() {
         if (typeof window.t === 'function') {
@@ -2511,6 +2565,30 @@
             chatSessions: {},
             messages: [],
             inputMessage: '',
+
+            // Voice-call state. The microphone remains open for the whole
+            // call; browser-side VAD splits speech turns at natural pauses.
+            audioModels: [],
+            voiceSettings: (() => {
+                // Keep the original text-chat behavior unchanged; voice-call
+                // mode always speaks replies regardless of this preference.
+                const defaults = { sttModel: '', ttsModel: '', autoPlay: false };
+                try { return { ...defaults, ...JSON.parse(localStorage.getItem(VOICE_SETTINGS_STORAGE_KEY) || '{}') }; }
+                catch { return defaults; }
+            })(),
+            voiceCallActive: false,
+            isVoiceCallStarting: false,
+            voiceCallPhase: 'idle',
+            voiceCallStatus: '',
+            _voiceMediaStream: null,
+            _voiceAudioContext: null,
+            _voiceAnalyser: null,
+            _voiceVadFrame: null,
+            _voiceRecorder: null,
+            _voiceChunks: [],
+            _voiceSpeechStartedAt: 0,
+            _voiceLastSpeechAt: 0,
+            _voiceReplyAudio: null,
 
             // Model State
             availableModels: [],
@@ -3991,6 +4069,259 @@
             || this.uploadDocuments.some(doc => !doc.base64);
     },
 
+    voiceText(key, fallback) {
+        const translated = typeof window.t === 'function' ? window.t(key) : key;
+        return translated === key ? fallback : translated;
+    },
+
+    voiceModels(type) {
+        return this.audioModels.filter(model => model.type === type);
+    },
+
+    saveVoiceSettings() {
+        localStorage.setItem(VOICE_SETTINGS_STORAGE_KEY, JSON.stringify(this.voiceSettings));
+    },
+
+    reconcileVoiceModels() {
+        const sttModels = this.voiceModels('audio_stt');
+        const ttsModels = this.voiceModels('audio_tts');
+        if (!sttModels.some(model => model.id === this.voiceSettings.sttModel)) {
+            // Never silently choose between multiple recognizers: quality and
+            // processor assets vary across conversions, so require one setup
+            // choice when there is more than one candidate.
+            this.voiceSettings.sttModel = sttModels.length === 1 ? sttModels[0]?.id : '';
+        }
+        if (!ttsModels.some(model => model.id === this.voiceSettings.ttsModel)) {
+            this.voiceSettings.ttsModel = ttsModels.length === 1 ? ttsModels[0]?.id : '';
+        }
+        this.saveVoiceSettings();
+    },
+
+    async toggleVoiceCall() {
+        if (this.voiceCallActive || this.isVoiceCallStarting) {
+            this.stopVoiceCall();
+        } else {
+            await this.startVoiceCall();
+        }
+    },
+
+    async startVoiceCall() {
+        if (!this.voiceSettings.sttModel || !this.voiceSettings.ttsModel) {
+            alert(this.voiceText('chat.voice.models_required', '请先在设置中选择语音识别和语音合成模型。'));
+            return;
+        }
+        if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+            alert(this.voiceText('chat.voice.browser_unsupported', '当前浏览器不支持麦克风录音。'));
+            return;
+        }
+
+        this.isVoiceCallStarting = true;
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+            });
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContextClass) throw new Error('Web Audio API unavailable');
+            const context = new AudioContextClass();
+            const analyser = context.createAnalyser();
+            analyser.fftSize = 2048;
+            context.createMediaStreamSource(stream).connect(analyser);
+            await context.resume();
+
+            this._voiceMediaStream = stream;
+            this._voiceAudioContext = context;
+            this._voiceAnalyser = analyser;
+            this.voiceCallActive = true;
+            this.voiceCallPhase = 'listening';
+            this.voiceCallStatus = this.voiceText('chat.voice.listening', '正在聆听… 说完后会自动发送');
+            this.monitorVoiceActivity();
+        } catch (error) {
+            console.error('Unable to start voice call:', error);
+            alert(this.voiceText('chat.voice.microphone_denied', '无法使用麦克风，请检查浏览器的麦克风权限。'));
+        } finally {
+            this.isVoiceCallStarting = false;
+        }
+    },
+
+    stopVoiceCall() {
+        this.voiceCallActive = false;
+        this.voiceCallPhase = 'idle';
+        this.voiceCallStatus = '';
+        if (this._voiceVadFrame) cancelAnimationFrame(this._voiceVadFrame);
+        this._voiceVadFrame = null;
+        if (this._voiceRecorder?.state === 'recording') this._voiceRecorder.stop();
+        this._voiceRecorder = null;
+        this._voiceChunks = [];
+        this._voiceMediaStream?.getTracks().forEach(track => track.stop());
+        this._voiceMediaStream = null;
+        this._voiceAudioContext?.close().catch(() => {});
+        this._voiceAudioContext = null;
+        this._voiceAnalyser = null;
+        this.stopSpeaking();
+        if (this.isCurrentChatStreaming()) this.stopStreaming();
+    },
+
+    monitorVoiceActivity() {
+        if (!this.voiceCallActive || !this._voiceAnalyser) return;
+        if (this.voiceCallPhase === 'listening') {
+            const samples = new Uint8Array(this._voiceAnalyser.fftSize);
+            this._voiceAnalyser.getByteTimeDomainData(samples);
+            let energy = 0;
+            for (const sample of samples) {
+                const normalized = (sample - 128) / 128;
+                energy += normalized * normalized;
+            }
+            const rms = Math.sqrt(energy / samples.length);
+            const now = performance.now();
+            const isSpeech = rms >= 0.018;
+            if (isSpeech) {
+                this._voiceLastSpeechAt = now;
+                if (!this._voiceRecorder) this.beginVoiceUtterance(now);
+            } else if (this._voiceRecorder
+                && now - this._voiceLastSpeechAt >= 850
+                && now - this._voiceSpeechStartedAt >= 350) {
+                this.finishVoiceUtterance();
+            }
+        }
+        this._voiceVadFrame = requestAnimationFrame(() => this.monitorVoiceActivity());
+    },
+
+    beginVoiceUtterance(startedAt) {
+        if (!this._voiceMediaStream || this._voiceRecorder || this.voiceCallPhase !== 'listening') return;
+        const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']
+            .find(type => MediaRecorder.isTypeSupported(type));
+        const recorder = mimeType
+            ? new MediaRecorder(this._voiceMediaStream, { mimeType })
+            : new MediaRecorder(this._voiceMediaStream);
+        this._voiceChunks = [];
+        this._voiceSpeechStartedAt = startedAt;
+        recorder.ondataavailable = event => {
+            if (event.data.size > 0) this._voiceChunks.push(event.data);
+        };
+        recorder.onstop = async () => {
+            const audioBlob = new Blob(this._voiceChunks, { type: recorder.mimeType || 'audio/webm' });
+            this._voiceChunks = [];
+            if (!this.voiceCallActive || this.voiceCallPhase !== 'transcribing' || audioBlob.size === 0) return;
+            await this.transcribeVoiceTurn(audioBlob);
+        };
+        recorder.start();
+        this._voiceRecorder = recorder;
+        this.voiceCallStatus = this.voiceText('chat.voice.hearing_speech', '正在听你说话…');
+    },
+
+    finishVoiceUtterance() {
+        const recorder = this._voiceRecorder;
+        if (!recorder || recorder.state !== 'recording') return;
+        this._voiceRecorder = null;
+        this.voiceCallPhase = 'transcribing';
+        this.voiceCallStatus = this.voiceText('chat.voice.transcribing', '正在识别语音…');
+        recorder.stop();
+    },
+
+    async transcribeVoiceTurn(audioBlob) {
+        try {
+            const form = new FormData();
+            form.append('file', audioBlob, 'voice-turn.webm');
+            form.append('model', this.resolveGatewayModelId(this.voiceSettings.sttModel));
+            const response = await fetch('/v1/audio/transcriptions', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${this.getApiKey()}` },
+                body: form,
+            });
+            const data = await response.json().catch(() => null);
+            if (!response.ok) {
+                throw new Error(data?.detail || data?.error?.message || `Error: ${response.status}`);
+            }
+            const text = (data?.text || '').trim();
+            if (!text) {
+                this.resumeVoiceListening();
+                return;
+            }
+            this.voiceCallPhase = 'responding';
+            this.voiceCallStatus = this.voiceText('chat.voice.thinking', '正在回复…');
+            this.inputMessage = text;
+            await this.sendMessage();
+            if (this.voiceCallActive && this.voiceCallPhase === 'responding') {
+                this.resumeVoiceListening();
+            }
+        } catch (error) {
+            console.error('Voice transcription failed:', error);
+            this.voiceCallStatus = `${this.voiceText('chat.voice.failed', '语音处理失败')}：${error.message}`;
+            if (this.voiceCallActive) setTimeout(() => this.resumeVoiceListening(), 1000);
+        }
+    },
+
+    resumeVoiceListening() {
+        if (!this.voiceCallActive) return;
+        this.voiceCallPhase = 'listening';
+        this._voiceLastSpeechAt = 0;
+        this._voiceSpeechStartedAt = 0;
+        this.voiceCallStatus = this.voiceText('chat.voice.listening', '正在聆听… 说完后会自动发送');
+    },
+
+    speechText(content) {
+        return this.getTextContent(content)
+            .replace(/```[\s\S]*?```/g, '')
+            .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+            .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+            .replace(/[#>*_`~]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 4000);
+    },
+
+    stopSpeaking() {
+        if (!this._voiceReplyAudio) return;
+        this._voiceReplyAudio.pause();
+        URL.revokeObjectURL(this._voiceReplyAudio.src);
+        this._voiceReplyAudio = null;
+    },
+
+    async speakText(content, { resumeCall = false } = {}) {
+        const text = this.speechText(content);
+        if (!text || !this.voiceSettings.ttsModel) {
+            if (resumeCall) this.resumeVoiceListening();
+            return;
+        }
+        this.stopSpeaking();
+        if (resumeCall) {
+            this.voiceCallPhase = 'speaking';
+            this.voiceCallStatus = this.voiceText('chat.voice.speaking', '助手正在说话…');
+        }
+        try {
+            const response = await fetch('/v1/audio/speech', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.getApiKey()}`,
+                },
+                body: JSON.stringify({
+                    model: this.resolveGatewayModelId(this.voiceSettings.ttsModel),
+                    input: text,
+                    response_format: 'mp3',
+                }),
+            });
+            if (!response.ok) {
+                const data = await response.json().catch(() => null);
+                throw new Error(data?.detail || data?.error?.message || `Error: ${response.status}`);
+            }
+            const url = URL.createObjectURL(await response.blob());
+            const audio = new Audio(url);
+            this._voiceReplyAudio = audio;
+            const complete = () => {
+                if (this._voiceReplyAudio === audio) this._voiceReplyAudio = null;
+                URL.revokeObjectURL(url);
+                if (resumeCall) this.resumeVoiceListening();
+            };
+            audio.addEventListener('ended', complete, { once: true });
+            audio.addEventListener('error', complete, { once: true });
+            await audio.play();
+        } catch (error) {
+            console.warn('Unable to play speech:', error);
+            if (resumeCall) this.resumeVoiceListening();
+        }
+    },
+
             // ===== MCP Tools =====
 
             async fetchMcpTools() {
@@ -4539,6 +4870,16 @@
 
             const modelsData = await modelsResponse.json();
             const allModels = modelsData.data || [];
+
+            // Keep audio models out of the regular chat picker, but expose
+            // them to the independent voice-call settings section.
+            this.audioModels = this.dedupeAvailableModels(
+                allModels.map(m => {
+                    const id = this.aliasToGateway[m.id] || m.id;
+                    return { id, name: m.id, type: (this.modelTypeMap[id] || '').toLowerCase() };
+                }).filter(model => model.type === 'audio_stt' || model.type === 'audio_tts')
+            );
+            this.reconcileVoiceModels();
 
             // Favorite gateway ids from the admin list; used to sort favorites first
             const favoriteIds = new Set(
@@ -6128,11 +6469,27 @@
                 // Persist perf timeline that was just attached (saved earlier, before finally ran)
                 this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
             }
+            const finalReply = depth === 0 && !stream.abortController?.signal.aborted
+                ? [...chatSession.messages].reverse().find(message =>
+                    message.role === 'assistant' && message._ui !== false
+                )
+                : null;
+            const shouldSpeak = finalReply
+                && !String(finalReply.content || '').startsWith('Error:')
+                && (this.voiceCallActive || this.voiceSettings.autoPlay);
+            // A typed message can also be sent while a voice call is open;
+            // pause VAD for every spoken reply to avoid the mic hearing it.
+            const resumeVoiceCall = this.voiceCallActive;
             this.resetStreamSession(stream, { preserveFinalContent: true });
             this.thinkingAutoScroll = true;
             if (depth === 0) {
                 this.stopStatsPollingIfIdle();
                 this.ensureStatsPollingForCurrentChat();
+                if (shouldSpeak) {
+                    void this.speakText(finalReply.content, { resumeCall: resumeVoiceCall });
+                } else if (resumeVoiceCall) {
+                    this.resumeVoiceListening();
+                }
             }
         }
     },
