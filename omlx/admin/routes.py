@@ -6077,6 +6077,9 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     from ..model_discovery import _resolve_hf_cache_entry
 
+    def _has_model_config(path: Path) -> bool:
+        return (path / "config.json").exists() or (path / "configuration.json").exists()
+
     def _add_model(
         model_path: Path,
         model_name: str,
@@ -6111,14 +6114,14 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
 
-            if (subdir / "config.json").exists():
+            if _has_model_config(subdir):
                 # Level 1: direct model folder
                 _add_model(subdir, subdir.name)
             else:
                 # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
                 hf_resolved = _resolve_hf_cache_entry(subdir)
                 if hf_resolved is not None:
-                    if (hf_resolved.snapshot_path / "config.json").exists():
+                    if _has_model_config(hf_resolved.snapshot_path):
                         _add_model(
                             hf_resolved.snapshot_path,
                             hf_resolved.model_id,
@@ -6130,7 +6133,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 for child in sorted(subdir.iterdir()):
                     if not child.is_dir() or child.name.startswith("."):
                         continue
-                    if (child / "config.json").exists():
+                    if _has_model_config(child):
                         _add_model(child, child.name)
 
     # Sort by the UI display name so organization prefixes group together.
@@ -6152,6 +6155,9 @@ async def delete_hf_model(
 
     model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
 
+    def _has_model_config(path: Path) -> bool:
+        return (path / "config.json").exists() or (path / "configuration.json").exists()
+
     # Search for model across all directories in both flat and org-folder layouts
     model_path = None
     parent_model_dir = None
@@ -6159,7 +6165,7 @@ async def delete_hf_model(
         if not model_dir.exists():
             continue
         candidate = model_dir / model_name
-        if candidate.is_dir() and (candidate / "config.json").exists():
+        if candidate.is_dir() and _has_model_config(candidate):
             model_path = candidate
             parent_model_dir = model_dir
             break
@@ -6168,7 +6174,7 @@ async def delete_hf_model(
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
             candidate = subdir / model_name
-            if candidate.is_dir() and (candidate / "config.json").exists():
+            if candidate.is_dir() and _has_model_config(candidate):
                 model_path = candidate
                 parent_model_dir = model_dir
                 break

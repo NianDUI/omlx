@@ -956,6 +956,13 @@ class TestHFDownloaderRoutes:
         )
         (nested_model / "model.safetensors").write_bytes(b"q" * 4096)
 
+        image_model = model_dir_with_models / "mlx-community" / "flux-image-4bit"
+        image_model.mkdir(parents=True)
+        (image_model / "configuration.json").write_text(
+            '{"framework": "pytorch", "task": "text-to-image"}'
+        )
+        (image_model / "transformer.safetensors").write_bytes(b"i" * 2048)
+
         # Create a mock global settings
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
@@ -971,13 +978,14 @@ class TestHFDownloaderRoutes:
             result = await list_hf_models(is_admin=True)
             models = result["models"]
 
-            assert len(models) == 5
+            assert len(models) == 6
             names = [m["name"] for m in models]
             assert "model-a" in names
             assert "model-b" in names
             assert "Zebra-Model" in names
             assert "apple-model" in names
             assert "Qwen3.6-27B-MLX-oQ5-FP16" in names
+            assert "flux-image-4bit" in names
             assert "not-a-model" not in names
             assert ".hidden" not in names
 
@@ -986,6 +994,7 @@ class TestHFDownloaderRoutes:
                 display_names["Qwen3.6-27B-MLX-oQ5-FP16"]
                 == "deepsweet/Qwen3.6-27B-MLX-oQ5-FP16"
             )
+            assert display_names["flux-image-4bit"] == "mlx-community/flux-image-4bit"
             assert display_names["model-a"] == "model-a"
 
             for m in models:
@@ -1057,8 +1066,8 @@ class TestHFDownloaderRoutes:
         org_dir = model_dir / "Jundot"
         model_path = org_dir / "Qwen-only-child"
         model_path.mkdir(parents=True)
-        (model_path / "config.json").write_text(
-            '{"architectures": ["Qwen2ForCausalLM"]}'
+        (model_path / "configuration.json").write_text(
+            '{"framework": "pytorch", "task": "text-to-image"}'
         )
         (model_path / "model.safetensors").write_bytes(b"x" * 8)
 

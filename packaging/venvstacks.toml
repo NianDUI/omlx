@@ -26,7 +26,7 @@ requirements = []
 platforms = [
     "macosx_arm64",
 ]
-# Exclude cv2's duplicate dylibs (same libs already provided by Pillow/PIL)
+# Prefer the existing cv2/Pillow copies when pygame bundles the same dylibs.
 dynlib_exclude = [
     "cv2/.dylibs/libavif*",
     "cv2/.dylibs/liblcms2*",
@@ -37,6 +37,14 @@ dynlib_exclude = [
     "cv2/.dylibs/liblzma*",
     "cv2/.dylibs/libxcb*",
     "cv2/.dylibs/libXau*",
+    "pygame/.dylibs/libglib-2.0*",
+    "pygame/.dylibs/libSDL2-2.0*",
+    "pygame/.dylibs/libintl.8*",
+    "pygame/.dylibs/libopus.0*",
+    "pygame/.dylibs/libpng16.16*",
+    "pygame/.dylibs/libfreetype.6*",
+    "pygame/.dylibs/libsharpyuv.0*",
+    "pygame/.dylibs/libwebp.7*",
 ]
 
 [tool.uv]
