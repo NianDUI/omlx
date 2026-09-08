@@ -416,12 +416,23 @@ def qwen35_ane_compile_linear(
         return _ext.qwen35_ane_compile_linear(weight, sequence_length)
 
 
+def qwen35_ane_bank_compiler_available() -> bool:
+    """True when both the private ANE runtime and the procedure-bank compiler
+    entry point are present. Callers that would otherwise discover
+    unavailability via the RuntimeError below (the ANE tuner in particular)
+    can probe this up front instead of failing deep inside a compile ladder
+    (#3044)."""
+    return (
+        qwen35_ane_available()
+        and _ext is not None
+        and hasattr(_ext, "qwen35_ane_compile_linear_bank")
+    )
+
+
 def qwen35_ane_compile_linear_bank(
     weights: list[mx.array], sequence_length: int, ane_instance: int
 ):
-    if not qwen35_ane_available() or _ext is None or not hasattr(
-        _ext, "qwen35_ane_compile_linear_bank"
-    ):
+    if not qwen35_ane_bank_compiler_available():
         raise RuntimeError("Private ANE procedure-bank compiler is unavailable")
     return _ext.qwen35_ane_compile_linear_bank(
         weights, sequence_length, ane_instance
@@ -813,7 +824,34 @@ _nax_available_cache: bool | None = None
 _stock_nax_cache: bool | None = None
 _qmm_nax_cache: bool | None = None
 
-QMM_NAX_VARIANT = int(os.environ.get("OMLX_QWEN35_QMM_NAX_VARIANT", "0"))
+# Bundled NAX tiles (must match qwen_q_affine_nax_variant in qwen35_prefill.cpp):
+#   0: 64x64x64 wm2 wn2 (stock MLX tile, default)   1: bm 32   2: bm 128
+#   3: bn 128   4: bk 32   5: wm4 wn1
+NAX_QMM_VARIANTS = range(6)
+_qmm_nax_variant_warned = False
+
+
+def _resolve_qmm_nax_variant() -> int:
+    global _qmm_nax_variant_warned
+    raw = os.environ.get("OMLX_QWEN35_QMM_NAX_VARIANT", "0").strip()
+    try:
+        variant = int(raw)
+    except ValueError:
+        variant = -1
+    if variant in NAX_QMM_VARIANTS:
+        return variant
+    if not _qmm_nax_variant_warned:
+        _qmm_nax_variant_warned = True
+        logger.warning(
+            "OMLX_QWEN35_QMM_NAX_VARIANT=%r is not a bundled NAX tile "
+            "(valid: 0-%d); using variant 0",
+            raw,
+            NAX_QMM_VARIANTS[-1],
+        )
+    return 0
+
+
+QMM_NAX_VARIANT = _resolve_qmm_nax_variant()
 
 
 def _nax_available_fallback(

@@ -97,6 +97,7 @@ class BatchedEngine(BaseEngine):
                 "_mlx_executor",
                 None,
             ),
+            text_only=True,
         )
 
     @property
@@ -108,6 +109,21 @@ class BatchedEngine(BaseEngine):
     def tokenizer(self) -> Any:
         """Get the tokenizer."""
         return self._tokenizer
+
+    @property
+    def supports_early_tool_call_streaming(self) -> bool:
+        """Opt in only when the local scheduler has no structured parser."""
+
+        scheduler = getattr(
+            getattr(getattr(self, "_engine", None), "engine", None),
+            "scheduler",
+            None,
+        )
+        return bool(
+            scheduler is not None
+            and hasattr(scheduler, "_output_parser_factory")
+            and scheduler._output_parser_factory is None
+        )
 
     @property
     def model_type(self) -> str | None:
@@ -291,7 +307,7 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), materialize_lazy_state, self._model
         )
 
-        # Qwen3.5/3.6 MoE gate+up regroup: concatenate the routed experts'
+        # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
         # MoE layer instead of 3 (issue #2238). Bit-exact; runs on the MLX
         # executor because it rewrites weights in place.
@@ -310,7 +326,7 @@ class BatchedEngine(BaseEngine):
                     self._model,
                 )
             except Exception:
-                logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
+                logger.debug("MoE gate+up fusion not applied", exc_info=True)
 
         # Qwen MoE decode router: fuse the top-k select + renormalize chain
         # into one launch (the composed argpartition chain is ~2 ms/token on
@@ -1008,6 +1024,7 @@ class BatchedEngine(BaseEngine):
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
+                    first_token_at=getattr(output, "first_token_at", None),
                     benchmark_prefill_chunks=(
                         list(chunks)
                         if (chunks := getattr(output, "benchmark_prefill_chunks", []))

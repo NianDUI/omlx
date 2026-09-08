@@ -47,7 +47,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
@@ -162,11 +162,13 @@ from .api.responses_utils import (
 )
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
+    ToolCallStreamSegment,
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
     extract_tool_calls_with_thinking,
+    parse_tool_calls,
     parse_json_output,
     restore_gemma4_param_names,
     sanitize_tool_call_markup,
@@ -430,6 +432,24 @@ async def lifespan(app: FastAPI):
 
     _reset_boundary_snapshots_for_server()
 
+    # Reap distributed ranks orphaned by a crashed previous coordinator
+    # (G8): all teardown used to live in-process, so a SIGKILL/panic of
+    # omlx-server stranded loaded ranks with no owner. The launch manifest
+    # written at spawn lets this new coordinator finish the teardown.
+    # Best effort: a reaping failure must never block server startup.
+    try:
+        from .cluster.launch import reap_orphaned_launches
+
+        orphan_report = await asyncio.to_thread(reap_orphaned_launches)
+        if orphan_report["reaped"] or orphan_report["failures"]:
+            logger.warning(
+                "Reaped orphaned distributed launches from a previous "
+                "coordinator: %s",
+                orphan_report,
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Orphaned-launch reaper failed at startup: %s", exc)
+
     # Publish the interpreter another Mac's coordinator discovers over SSH.
     # Without it a packaged-app peer fails every discovery candidate and gets
     # reported as "worker runtime is not installed" (#2680). Best effort: a
@@ -473,6 +493,48 @@ async def lifespan(app: FastAPI):
 
         bonjour_task = asyncio.create_task(_bonjour_supervisor())
 
+    # Cluster v2: always-on peer discovery (mDNS + IPv6 multicast fallback +
+    # manual + Tailscale). Best-effort: discovery failures must never block
+    # serving. OMLX_DISCOVERY=0 disables it for hostile networks.
+    discovery_service = None
+    if (
+        distributed_inference_enabled()
+        and os.environ.get("OMLX_DISCOVERY", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    ):
+        try:
+            from .cluster.discovery import (
+                DiscoveryConfig,
+                DiscoveryService,
+                configure_discovery_service,
+                load_cluster_name,
+            )
+            from .cluster.identity import get_node_identity
+            from .cluster.registry import get_device_registry
+
+            cluster_base = (
+                Path(_server_state.global_settings.base_path)
+                if _server_state.global_settings is not None
+                else Path.home() / ".omlx"
+            )
+            discovery_service = DiscoveryService(
+                get_node_identity(),
+                get_device_registry(),
+                DiscoveryConfig(
+                    cluster_name=load_cluster_name(cluster_base),
+                    http_port=(
+                        _server_state.global_settings.server.port
+                        if _server_state.global_settings is not None
+                        else 8000
+                    )
+                ),
+            )
+            configure_discovery_service(discovery_service)
+            await asyncio.to_thread(discovery_service.start)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Cluster discovery service failed to start: %s", exc)
+            discovery_service = None
+
     # Start process memory enforcer if configured
     if (
         _server_state.global_settings is not None
@@ -506,6 +568,11 @@ async def lifespan(app: FastAPI):
         # unloaded before the new weights allocate (#2319).
         _server_state.engine_pool._get_admission_soft_target = (
             enforcer.get_admission_soft_target
+        )
+        # Resident-vs-mmap is a throughput call and must not read the
+        # instantaneous ceiling, which dips right after a model swap.
+        _server_state.engine_pool._get_residency_ceiling = (
+            enforcer.get_residency_ceiling
         )
         enforcer.start()
 
@@ -574,6 +641,14 @@ async def lifespan(app: FastAPI):
             await bonjour_task
     if bonjour_publisher is not None:
         bonjour_publisher.stop()
+    if discovery_service is not None:
+        try:
+            from .cluster.discovery import configure_discovery_service
+
+            await asyncio.to_thread(discovery_service.stop)
+            configure_discovery_service(None)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Cluster discovery service failed to stop: %s", exc)
     if preload_task is not None and not preload_task.done():
         # SIGTERM arrived while pinned models were still loading. Cancel the
         # await; engine_pool.shutdown() below unloads whatever finished.
@@ -680,12 +755,51 @@ def _register_cluster_routes() -> None:
             Depends(require_distributed_inference_enabled),
         ],
     )
+    # Cluster v2 model-sync manifest: admin-gated like the rest of the
+    # cluster surface; peers use it to compare model contents before sync.
+    from .cluster.modelsync import manifest_router as cluster_manifest_router
+    from .cluster.modelsync import set_modelsync_getters
+
+    set_modelsync_getters(get_engine_pool)
+    app.include_router(
+        cluster_manifest_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
     # The bootstrap bytes are public but pinned by SHA-256 in an admin-created
     # command. Claim/source/complete authenticate with one-time enrollment
     # credentials, not the browser's admin cookie.
     app.include_router(
         cluster_join_router,
         dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    # Cluster v2: /api/cluster/node_id is a deliberately unauthenticated,
+    # rate-limited probe peers use to verify announced addresses before any
+    # pairing trust exists; /api/cluster/devices requires admin per-route.
+    from .cluster.discovery_routes import discovery_router
+
+    app.include_router(
+        discovery_router,
+        dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    # Cluster v2 pairing (Module B): pair/request carries only a salted PBKDF2
+    # verifier bound to the node and SSH identities; pair/status returns a
+    # code-encrypted cluster key only after admin approval. Approve, deny, and
+    # unpair are admin-only like every other cluster mutation.
+    from .cluster.pairing_routes import pair_admin_router, pair_router
+
+    app.include_router(
+        pair_router,
+        dependencies=[Depends(require_distributed_inference_enabled)],
+    )
+    app.include_router(
+        pair_admin_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
     )
     _cluster_routes_registered = True
 
@@ -873,6 +987,23 @@ def _prefill_memory_error_detail(exc: PrefillMemoryExceededError) -> str:
     )
 
 
+def _streaming_error_payload(e: Exception, context: str) -> dict:
+    """Error body for a failure inside an OpenAI SSE generator.
+
+    A prefill-guard rejection raised during streaming must keep its
+    structured body (root ``type``, ``omlx_code``, byte fields) — the
+    blanket ``except`` in the generators would otherwise flatten it to a
+    generic ``server_error`` that clients cannot classify, and the correct
+    handler in ``_with_sse_keepalive`` never sees the exception because the
+    generator's own handler is the innermost one (#3036).
+    """
+    if isinstance(e, PrefillMemoryExceededError):
+        logger.warning(f"{context} prefill rejected: {e}")
+        return _prefill_memory_openai_error_body(e)
+    logger.error(f"Error during {context}: {e}")
+    return {"error": {"message": str(e), "type": "server_error"}}
+
+
 def _prefill_memory_openai_error_body(
     exc: PrefillMemoryExceededError,
     *,
@@ -1048,6 +1179,93 @@ class DebugRequestLoggingMiddleware:
         await self.app(scope, cached_receive, send)
 
 
+_DISCONNECT_SIGNAL_SCOPE_KEY = "omlx.client_disconnect_signal"
+_disconnect_callback_tasks: set[asyncio.Task] = set()
+
+
+class _ClientDisconnectSignal:
+    """Fan one ASGI disconnect message out to request-owned cleanup hooks.
+
+    Starlette's ``StreamingResponse`` and ``Request.is_disconnected()`` both
+    consume the same one-shot ``http.disconnect`` receive message.  Whichever
+    one wins used to hide it from the other.  In particular, a real Uvicorn
+    socket could close while a long distributed prefill kept running because
+    the response generator never reached its nested ``aclose()`` chain.
+
+    The outer ASGI middleware records the message before either consumer sees
+    it, then schedules request-scoped callbacks outside Starlette's response
+    cancellation scope.  A callback is keyed by the inference request id, so
+    cancelling one client can never fall back to aborting every active request.
+    """
+
+    def __init__(self) -> None:
+        self._disconnected = False
+        self._next_token = 0
+        self._callbacks: dict[int, Callable[[], Awaitable[None]]] = {}
+
+    def register(self, callback: Callable[[], Awaitable[None]]) -> int:
+        self._next_token += 1
+        token = self._next_token
+        if self._disconnected:
+            self._spawn(callback)
+        else:
+            self._callbacks[token] = callback
+        return token
+
+    def unregister(self, token: int) -> None:
+        self._callbacks.pop(token, None)
+
+    def disconnect(self) -> None:
+        if self._disconnected:
+            return
+        self._disconnected = True
+        callbacks = tuple(self._callbacks.values())
+        self._callbacks.clear()
+        for callback in callbacks:
+            self._spawn(callback)
+
+    @staticmethod
+    def _spawn(callback: Callable[[], Awaitable[None]]) -> None:
+        async def run_callback() -> None:
+            try:
+                await callback()
+            except Exception:
+                logger.exception("Request-scoped disconnect callback failed")
+
+        task = asyncio.create_task(run_callback())
+        # asyncio only holds weak task references.  Retain the detached abort
+        # until it completes; Starlette may already be cancelling the response
+        # task that observed the disconnect.
+        _disconnect_callback_tasks.add(task)
+        task.add_done_callback(_disconnect_callback_tasks.discard)
+
+
+class ClientDisconnectTrackingMiddleware:
+    """Record ``http.disconnect`` before competing ASGI consumers receive it."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        signal = _ClientDisconnectSignal()
+        scope[_DISCONNECT_SIGNAL_SCOPE_KEY] = signal
+
+        async def tracked_receive():
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                signal.disconnect()
+            return message
+
+        await self.app(scope, tracked_receive, send)
+
+
+# Keep this outside response middleware so every consumer of ASGI ``receive``
+# passes through the same one-shot disconnect fan-out.
+app.add_middleware(ClientDisconnectTrackingMiddleware)
 app.add_middleware(DebugRequestLoggingMiddleware)
 
 
@@ -1993,15 +2211,49 @@ def init_server(
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
     )
-    from .cluster.enrollment import configure_cluster_enrollment
+    from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
-    from .cluster.registry import configure_cluster_registry
+    from .cluster.pairing import configure_pairing_manager
+    from .cluster.registry import (
+        configure_cluster_registry,
+        configure_device_registry,
+        get_device_registry,
+    )
     from .cluster.strategy_benchmarks import configure_strategy_benchmark_store
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
     configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
+    # Cluster v2: stable node identity + trusted device inventory. Best
+    # effort — a failure here must never block local inference. Configured
+    # before the pairing manager so pairing approvals persist into the real
+    # device registry instead of the schema-compatible fallback store.
+    try:
+        from .cluster.identity import configure_node_identity
+
+        configure_node_identity(base_path)
+        configure_device_registry(base_path / "cluster" / "devices.json")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Cluster v2 identity/device stores unavailable: %s", exc)
+    try:
+        device_registry = get_device_registry()
+    except RuntimeError:
+        device_registry = None
+    # Cluster v2 pairing manager, bridged onto Module A's DeviceRegistry when
+    # available (DeviceRegistryBridge adapts the API and fails loudly on
+    # drift); otherwise the schema-compatible fallback store is used. Resolve
+    # capabilities lazily because the discovery service starts later.
+    from .cluster.discovery import announced_addrs, announced_caps
+
+    configure_pairing_manager(
+        base_path,
+        registry=device_registry,
+        enrollment_store=get_cluster_enrollment(),
+        caps_provider=announced_caps,
+        address_provider=announced_addrs,
+        http_port=global_settings.server.port if global_settings else 8000,
+    )
 
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool._settings_manager = _server_state.settings_manager
@@ -2207,6 +2459,56 @@ async def _safe_anext(ait):
         return _KEEPALIVE_SENTINEL
 
 
+async def _aclose_async_iterator(iterator: object) -> None:
+    """Close an async generator when the response transport ends."""
+
+    close = getattr(iterator, "aclose", None)
+    if callable(close):
+        await close()
+
+
+def _request_abort_id(engine: BaseEngine) -> str | None:
+    """Mint an opaque id only for engines with targeted abort semantics."""
+
+    if not getattr(engine, "supports_request_scoped_abort", False):
+        return None
+    abort = getattr(engine, "abort_request", None)
+    if not callable(abort):
+        return None
+    return f"transport-{uuid.uuid4().hex}"
+
+
+async def _with_request_disconnect_abort(
+    generator: AsyncIterator[str],
+    http_request: FastAPIRequest,
+    engine: BaseEngine,
+    request_id: str | None,
+) -> AsyncIterator[str]:
+    """Bind one public response transport to one inference request."""
+
+    signal = http_request.scope.get(_DISCONNECT_SIGNAL_SCOPE_KEY)
+    token: int | None = None
+    if request_id is not None and isinstance(signal, _ClientDisconnectSignal):
+        abort = getattr(engine, "abort_request")
+
+        async def abort_disconnected_request() -> None:
+            await abort(
+                request_id,
+                reason="public client transport disconnected",
+                error_code="client_disconnected",
+            )
+
+        token = signal.register(abort_disconnected_request)
+
+    try:
+        async for chunk in generator:
+            yield chunk
+    finally:
+        if token is not None:
+            signal.unregister(token)
+        await _aclose_async_iterator(generator)
+
+
 async def _with_sse_keepalive(
     generator: AsyncIterator[str],
     http_request: Optional["FastAPIRequest"] = None,
@@ -2347,21 +2649,37 @@ async def _run_with_disconnect_guard(
     return task.result()
 
 
+# Below this, prefer racing the coroutine to a real HTTP status code over
+# committing early to the keepalive-streaming fallback (see
+# _json_response_or_keepalive). Matches the keepalive loop's own
+# disconnect_poll cadence -- short enough that ordinary requests never
+# notice it, long enough that it isn't just a formality.
+_JSON_KEEPALIVE_GRACE_S = 2.0
+
+
 async def _with_json_keepalive(
     http_request: FastAPIRequest,
-    coro,
+    coro_or_task,
     interval: float = 10.0,
     disconnect_poll: float = 2.0,
 ) -> AsyncIterator[str]:
-    """Wrap a coroutine to send keepalive spaces while waiting for completion.
+    """Send keepalive spaces while waiting for a coroutine or task.
 
     For non-streaming requests, the HTTP response body is buffered until
     generation finishes, causing client read timeouts on long prefills.
     This wrapper uses StreamingResponse to send space characters as
     keepalive. JSON parsers ignore leading whitespace, so the final
     response parses normally.
+
+    Callers reaching this generator via ``_json_response_or_keepalive``
+    have already confirmed the task is still running past the grace period
+    -- from this point on, HTTP has committed the response status to 200
+    (the status line ships with the first byte), so a failure discovered
+    here can only be reported through the JSON body, never the status code.
+    ``asyncio.ensure_future`` is a no-op when given an already-scheduled
+    task, so passing either shape is safe.
     """
-    task = asyncio.ensure_future(coro)
+    task = asyncio.ensure_future(coro_or_task)
     keepalive_elapsed = 0.0
 
     yield " "
@@ -2405,6 +2723,66 @@ async def _with_json_keepalive(
                 await task
             except (asyncio.CancelledError, StopAsyncIteration):
                 pass
+
+
+async def _json_response_or_keepalive(
+    http_request: FastAPIRequest,
+    coro,
+    *,
+    media_type: str = "application/json",
+    headers: dict | None = None,
+    lease: "_LLMEngineLease | None" = None,
+) -> Response:
+    """Resolve a non-streaming JSON-body coroutine, preferring a real HTTP
+    status code over the keepalive-streaming fallback.
+
+    Most rejections (validation, guard checks) resolve in well under a
+    second. Racing the coroutine against ``_JSON_KEEPALIVE_GRACE_S`` lets
+    those return a plain ``Response``/``JSONResponse`` with the correct
+    status code (e.g. 400 for a memory-guard rejection) instead of the
+    keepalive wrapper's forced 200 -- a request that fails fast must not
+    look like a success to the client. Only requests still running past
+    the grace period fall back to keepalive streaming, where any later
+    failure can only be signaled via the JSON body: the status line ships
+    with the first keepalive byte and cannot be revised afterward, an
+    HTTP/ASGI constraint, not a choice.
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        done, _pending = await asyncio.wait(
+            {task}, timeout=_JSON_KEEPALIVE_GRACE_S
+        )
+    except BaseException:
+        # The handler can unwind during the grace period (server shutdown,
+        # middleware cancellation, or another request-level abort). The task
+        # was scheduled independently by ensure_future(), so cancellation does
+        # not propagate into it automatically. Drain it before releasing the
+        # lease; otherwise inference can continue after ModelRegistry considers
+        # the engine idle and eligible for unload.
+        task.cancel()
+        with suppress(BaseException):
+            await task
+        if lease is not None:
+            await lease.release()
+        raise
+    if done:
+        if lease is not None:
+            await lease.release()
+        try:
+            result = task.result()
+        except PrefillMemoryExceededError as e:
+            logger.warning(f"JSON keepalive prefill rejected (fast path): {e}")
+            return JSONResponse(
+                status_code=400,
+                content=_prefill_memory_openai_error_body(e),
+                headers=headers,
+            )
+        return Response(content=result, media_type=media_type, headers=headers)
+
+    generator = _with_json_keepalive(http_request, task)
+    if lease is not None:
+        generator = _release_after_stream(generator, lease)
+    return StreamingResponse(generator, media_type=media_type, headers=headers)
 
 
 @app.get("/health")
@@ -2827,9 +3205,8 @@ async def _create_markitdown_chat_completion(
             markdown,
         ).model_dump_json(exclude_none=True)
 
-    return StreamingResponse(
-        _with_json_keepalive(http_request, _build_markitdown_completion()),
-        media_type="application/json",
+    return await _json_response_or_keepalive(
+        http_request, _build_markitdown_completion()
     )
 
 
@@ -3141,10 +3518,7 @@ async def create_embeddings(
             ),
         ).model_dump_json()
 
-    return StreamingResponse(
-        _with_json_keepalive(http_request, _build_embeddings()),
-        media_type="application/json",
-    )
+    return await _json_response_or_keepalive(http_request, _build_embeddings())
 
 
 # =============================================================================
@@ -3363,6 +3737,7 @@ async def create_completion(
         for prompt in prompts:
             await engine.preflight_completion(prompt, request_id=upstream_request_id)
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
 
         if request.stream:
             response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -3371,18 +3746,24 @@ async def create_completion(
                 keepalive = _completion_keepalive_chunk(response_id)
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_completion(
-                            engine,
-                            prompts[0],
-                            request,
-                            model_load_duration=model_load_duration,
-                            prompt_token_ids=prompt_token_ids_by_prompt[0],
-                            resolved_model=resolved_model,
-                            response_id=response_id,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_completion(
+                                engine,
+                                prompts[0],
+                                request,
+                                model_load_duration=model_load_duration,
+                                prompt_token_ids=prompt_token_ids_by_prompt[0],
+                                resolved_model=resolved_model,
+                                response_id=response_id,
+                                inference_request_id=inference_request_id,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=keepalive,
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=keepalive,
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -3428,6 +3809,8 @@ async def create_completion(
             thinking_budget = _resolve_thinking_budget(request, request.model)
             if thinking_budget is not None:
                 gen_kwargs["thinking_budget"] = thinking_budget
+            if inference_request_id is not None:
+                gen_kwargs["_request_id"] = inference_request_id
             # Widen the repetition-penalty look-back window when the client
             # asks for it (mlx-lm default window is 20 tokens).
             repetition_context_size = getattr(
@@ -3513,12 +3896,8 @@ async def create_completion(
                 ),
             ).model_dump_json(exclude_none=True)
 
-        return StreamingResponse(
-            _release_after_stream(
-                _with_json_keepalive(http_request, _build_completion()),
-                lease,
-            ),
-            media_type="application/json",
+        return await _json_response_or_keepalive(
+            http_request, _build_completion(), lease=lease
         )
     except BaseException:
         await lease.release()
@@ -3902,6 +4281,9 @@ async def create_chat_completion(
         )
 
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
+        if inference_request_id is not None:
+            chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             # Pre-mint the completion id so the keepalive frame (emitted before the
@@ -3915,18 +4297,23 @@ async def create_chat_completion(
                 sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_chat_completion(
-                            engine,
-                            messages,
-                            request,
-                            model_load_duration=model_load_duration,
-                            resolved_model=resolved_model,
-                            response_id=response_id,
-                            **chat_kwargs,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_chat_completion(
+                                engine,
+                                messages,
+                                request,
+                                model_load_duration=model_load_duration,
+                                resolved_model=resolved_model,
+                                response_id=response_id,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=keepalive,
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=keepalive,
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -4057,13 +4444,8 @@ async def create_chat_completion(
         json_headers = (
             {"Warning": response_format_warning} if response_format_warning else None
         )
-        return StreamingResponse(
-            _release_after_stream(
-                _with_json_keepalive(http_request, _build_chat_completion()),
-                lease,
-            ),
-            media_type="application/json",
-            headers=json_headers,
+        return await _json_response_or_keepalive(
+            http_request, _build_chat_completion(), lease=lease, headers=json_headers
         )
 
     except BaseException:
@@ -4486,6 +4868,7 @@ async def stream_completion(
     prompt_token_ids: list[int] | None = None,
     resolved_model: str | None = None,
     response_id: str | None = None,
+    inference_request_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -4527,6 +4910,8 @@ async def stream_completion(
     thinking_budget = _resolve_thinking_budget(request, request.model)
     if thinking_budget is not None:
         gen_kwargs["thinking_budget"] = thinking_budget
+    if inference_request_id is not None:
+        gen_kwargs["_request_id"] = inference_request_id
     # Widen the repetition-penalty look-back window when the client
     # asks for it (mlx-lm default window is 20 tokens).
     repetition_context_size = getattr(
@@ -4577,8 +4962,7 @@ async def stream_completion(
             }
             yield f"data: {json.dumps(data)}\n\n"
     except Exception as e:
-        logger.error(f"Error during completion streaming: {e}")
-        error_data = {"error": {"message": str(e), "type": "server_error"}}
+        error_data = _streaming_error_payload(e, "completion streaming")
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -4735,6 +5119,96 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+def _registered_tool_names(tools: object) -> set[str]:
+    """Return nonempty function names explicitly registered by the request."""
+
+    names: set[str] = set()
+    for tool in tools or []:
+        function = (
+            tool.get("function")
+            if isinstance(tool, dict)
+            else getattr(tool, "function", None)
+        )
+        name = (
+            function.get("name")
+            if isinstance(function, dict)
+            else getattr(function, "name", None)
+        )
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
+def _tool_call_semantic_key(tool_call: object) -> tuple[str, str] | None:
+    """Canonical name/JSON-object identity, or ``None`` when malformed.
+
+    This is syntactic validation plus the separate registered-name check at the
+    call site; it is deliberately not full JSON Schema argument validation.
+    """
+
+    function = getattr(tool_call, "function", None)
+    name = getattr(function, "name", None)
+    arguments = getattr(function, "arguments", None)
+    if not isinstance(name, str) or not name or not isinstance(arguments, str):
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    canonical = json.dumps(
+        parsed,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return name, canonical
+
+
+def _chat_can_stream_qwen_tool_envelopes(engine: BaseEngine) -> bool:
+    """Narrow Chat-only early-tool gate.
+
+    The engine capability is authoritative and defaults false. The tokenizer
+    must independently expose mlx-lm's qwen3_coder parser; all other APIs and
+    parser families remain terminal-buffered.
+    """
+
+    if getattr(engine, "supports_early_tool_call_streaming", False) is not True:
+        return False
+    tokenizer = getattr(engine, "tokenizer", None)
+    parser = getattr(tokenizer, "tool_parser", None)
+    try:
+        from mlx_lm.tool_parsers.qwen3_coder import (
+            parse_tool_call as expected_parser,
+        )
+    except ImportError:
+        return False
+    return bool(
+        parser is expected_parser
+        and getattr(parser, "__name__", None) == "parse_tool_call"
+        and getattr(parser, "__module__", None)
+        == "mlx_lm.tool_parsers.qwen3_coder"
+    )
+
+
+def _merge_streamed_tool_call_prefix(streamed: list, terminal: list | None) -> list:
+    """Keep validated early calls as an occurrence-aware semantic prefix."""
+
+    remaining = list(terminal or [])
+    merged = list(streamed)
+    for early in streamed:
+        key = _tool_call_semantic_key(early)
+        if key is None:
+            continue
+        for index, candidate in enumerate(remaining):
+            if _tool_call_semantic_key(candidate) == key:
+                remaining.pop(index)
+                break
+    merged.extend(remaining)
+    return merged
+
+
 async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
@@ -4752,6 +5226,7 @@ async def stream_chat_completion(
     """
     start_time = time.perf_counter()
     first_token_time = None
+    first_visible_time = None
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
@@ -4768,6 +5243,11 @@ async def stream_chat_completion(
     except Exception as exc:
         logger.debug("Could not detect chat stream thinking state: %s", exc)
     thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+
+    def mark_visible_delta() -> None:
+        nonlocal first_visible_time
+        if first_visible_time is None:
+            first_visible_time = time.perf_counter()
 
     # Reuse the id pre-minted by the caller (so the keepalive frame can share
     # it); otherwise mint one for direct/non-streaming callers.
@@ -4790,9 +5270,22 @@ async def stream_chat_completion(
     # clients do not see raw envelopes/tags in assistant content deltas.
     tool_filter = None
     thinking_filter = None
+    streamed_tool_calls = []
+    stream_tool_sequence_safe = True
+    stream_completed_qwen_tools = False
+    qwen_tool_envelope_streaming_capable = False
+    registered_tool_names: set[str] = set()
     stream_content = True
     if has_tools:
-        _content_filter = ToolCallStreamFilter(engine.tokenizer)
+        registered_tool_names = _registered_tool_names(kwargs.get("tools"))
+        qwen_tool_envelope_streaming_capable = bool(
+            registered_tool_names and _chat_can_stream_qwen_tool_envelopes(engine)
+        )
+        stream_completed_qwen_tools = qwen_tool_envelope_streaming_capable
+        _content_filter = ToolCallStreamFilter(
+            engine.tokenizer,
+            capture_ordered_segments=stream_completed_qwen_tools,
+        )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
         # reasoning delta after the channel closed.
@@ -4804,11 +5297,26 @@ async def stream_chat_completion(
             thinking_filter = _thinking_filter
         else:
             stream_content = False
+    engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
-            if first_token_time is None and output.new_text:
-                first_token_time = time.perf_counter()
+        async for output in engine_stream:
+            if first_token_time is None:
+                produced_at = getattr(output, "first_token_at", None)
+                if produced_at is None:
+                    produced_at = getattr(output, "generated_at", None)
+                if produced_at is not None:
+                    first_token_time = float(produced_at)
+                elif getattr(output, "completion_tokens", 0) > 0 or output.new_text:
+                    # Engines without producer timestamps can only expose the
+                    # exact API-observation time. Never substitute end-of-turn.
+                    first_token_time = time.perf_counter()
             last_output = output
+            if output.tool_calls:
+                # A structured producer is authoritative. Correct engines keep
+                # the explicit capability false; this guard also prevents a
+                # same-output raw envelope from racing its structured result.
+                stream_completed_qwen_tools = False
+                stream_tool_sequence_safe = False
             if output.new_text:
                 accumulated_text += output.new_text
 
@@ -4819,6 +5327,10 @@ async def stream_chat_completion(
                 if thinking_delta:
                     if thinking_filter:
                         thinking_delta = thinking_filter.feed(thinking_delta)
+                        # Thinking-channel calls are terminal fallback only:
+                        # content-channel calls take precedence, so they cannot
+                        # be streamed safely before the turn finishes.
+                        thinking_filter.take_completed_envelopes()
                     chunk = ChatCompletionChunk(
                         id=response_id,
                         model=request.model,
@@ -4832,30 +5344,127 @@ async def stream_chat_completion(
                         ],
                     )
                     if thinking_delta:
-                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        event = (
+                            f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        )
+                        mark_visible_delta()
+                        yield event
 
                 # Emit content delta — filter out tool-call markup when
                 # tools are present so clients see clean streamed text.
                 if content_delta:
+                    ordered_segments: list[ToolCallStreamSegment] = []
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
-                    if content_delta:
-                        chunk = ChatCompletionChunk(
-                            id=response_id,
-                            model=request.model,
-                            choices=[
-                                ChatCompletionChunkChoice(
-                                    delta=ChatCompletionChunkDelta(
-                                        content=content_delta
-                                    ),
-                                    finish_reason=None,
+                        if stream_completed_qwen_tools:
+                            ordered_segments = tool_filter.take_ordered_segments()
+                            # The legacy completed queue shares the same string
+                            # objects; drain it so ordered capture adds no
+                            # retained duplicate state.
+                            tool_filter.take_completed_envelopes()
+                            if tool_filter.completed_envelope_overflowed:
+                                logger.warning(
+                                    "Early qwen tool streaming disabled for this "
+                                    "Chat turn: completed-envelope queue exceeded "
+                                    "its count or byte bound"
                                 )
-                            ],
+                                stream_completed_qwen_tools = False
+                                stream_tool_sequence_safe = False
+                                ordered_segments = [
+                                    segment
+                                    for segment in ordered_segments
+                                    if segment.kind == "content"
+                                ]
+                        else:
+                            tool_filter.take_ordered_segments()
+                            tool_filter.take_completed_envelopes()
+                    if not ordered_segments and content_delta:
+                        ordered_segments = [
+                            ToolCallStreamSegment("content", content_delta)
+                        ]
+
+                    for segment in ordered_segments:
+                        if segment.kind == "content":
+                            chunk = ChatCompletionChunk(
+                                id=response_id,
+                                model=request.model,
+                                choices=[
+                                    ChatCompletionChunkChoice(
+                                        delta=ChatCompletionChunkDelta(
+                                            content=segment.text
+                                        ),
+                                        finish_reason=None,
+                                    )
+                                ],
+                            )
+                            event = (
+                                f"data: {chunk.model_dump_json(exclude_none=True)}"
+                                "\n\n"
+                            )
+                            mark_visible_delta()
+                            yield event
+                            continue
+
+                        if segment.kind != "envelope":
+                            stream_tool_sequence_safe = False
+                            continue
+                        _cleaned, completed_calls = parse_tool_calls(
+                            segment.text,
+                            engine.tokenizer,
+                            kwargs.get("tools"),
                         )
-                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        completed_calls = completed_calls or []
+                        completed_keys = [
+                            _tool_call_semantic_key(tc) for tc in completed_calls
+                        ]
+                        if (
+                            not completed_calls
+                            or any(key is None for key in completed_keys)
+                            or any(
+                                key[0] not in registered_tool_names
+                                for key in completed_keys
+                                if key is not None
+                            )
+                        ):
+                            stream_tool_sequence_safe = False
+                            continue
+                        if not stream_tool_sequence_safe:
+                            continue
+                        for tc in completed_calls:
+                            index = len(streamed_tool_calls)
+                            streamed_tool_calls.append(tc)
+                            tc_chunk = ChatCompletionChunk(
+                                id=response_id,
+                                model=request.model,
+                                choices=[
+                                    ChatCompletionChunkChoice(
+                                        delta=ChatCompletionChunkDelta(
+                                            tool_calls=[
+                                                {
+                                                    "index": index,
+                                                    "id": tc.id,
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": tc.function.name,
+                                                        "arguments": (
+                                                            tc.function.arguments
+                                                        ),
+                                                    },
+                                                }
+                                            ]
+                                        ),
+                                        finish_reason=None,
+                                    )
+                                ],
+                            )
+                            event = (
+                                f"data: {tc_chunk.model_dump_json(exclude_none=True)}"
+                                "\n\n"
+                            )
+                            mark_visible_delta()
+                            yield event
     except Exception as e:
-        logger.error(f"Error during chat streaming: {e}")
-        error_data = {"error": {"message": str(e), "type": "server_error"}}
+        error_data = _streaming_error_payload(e, "chat streaming")
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -4879,7 +5488,9 @@ async def stream_chat_completion(
                         )
                     ],
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                mark_visible_delta()
+                yield event
         if thinking_filter:
             remaining_thinking = thinking_filter.finish()
             if remaining_thinking:
@@ -4895,7 +5506,9 @@ async def stream_chat_completion(
                         )
                     ],
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                mark_visible_delta()
+                yield event
         if content_delta:
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
@@ -4910,7 +5523,9 @@ async def stream_chat_completion(
                         )
                     ],
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                mark_visible_delta()
+                yield event
 
         if tool_filter:
             remaining = tool_filter.finish()
@@ -4925,11 +5540,14 @@ async def stream_chat_completion(
                         )
                     ],
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                mark_visible_delta()
+                yield event
 
     # Parse tool calls from accumulated text
     tool_calls = None
     cleaned_text = accumulated_text
+    terminal_tool_calls_authoritative = bool(last_output and last_output.tool_calls)
     if last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -4947,6 +5565,20 @@ async def stream_chat_completion(
         cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
         cleaned_thinking = extraction.cleaned_thinking
+        if tool_calls and qwen_tool_envelope_streaming_capable:
+            # Raw-text parsing is never allowed to promote malformed or
+            # unregistered functions on the explicitly capability-gated qwen
+            # early-stream path. Other parser families retain their existing
+            # terminal semantics; engine-native structured calls above are
+            # authoritative and intentionally bypass this API-layer filter.
+            tool_calls = [
+                tool_call
+                for tool_call in tool_calls
+                if (
+                    (key := _tool_call_semantic_key(tool_call)) is not None
+                    and key[0] in registered_tool_names
+                )
+            ]
 
         # Process response_format if specified
         if request.response_format and not tool_calls:
@@ -4973,7 +5605,9 @@ async def stream_chat_completion(
                         )
                     ],
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                mark_visible_delta()
+                yield event
             if cleaned_text:
                 chunk = ChatCompletionChunk(
                     id=response_id,
@@ -4985,7 +5619,9 @@ async def stream_chat_completion(
                         )
                     ],
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                mark_visible_delta()
+                yield event
 
     # Surface an unterminated paired envelope only when final parsing could not
     # recover a structured tool call. The candidate begins at the opening marker,
@@ -5008,7 +5644,9 @@ async def stream_chat_completion(
                     )
                 ],
             )
-            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            mark_visible_delta()
+            yield event
         if recovered_content:
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -5020,7 +5658,40 @@ async def stream_chat_completion(
                     )
                 ],
             )
-            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            event = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            mark_visible_delta()
+            yield event
+
+    # A qwen3_coder raw-envelope stream has no engine-side structured parser,
+    # so preserve each already-emitted validated occurrence even if malformed
+    # later markup makes terminal extraction partial. Structured engine output
+    # is authoritative and, by capability contract, can never race this path.
+    if streamed_tool_calls and not terminal_tool_calls_authoritative:
+        tool_calls = _merge_streamed_tool_call_prefix(
+            streamed_tool_calls,
+            tool_calls,
+        )
+
+    # Reconcile by canonical JSON semantics plus occurrence—not raw argument
+    # formatting or list position. Repeated identical calls remain distinct.
+    streamed_by_fingerprint: dict[tuple[str, str], list] = {}
+    reconcilable_streamed = (
+        [] if terminal_tool_calls_authoritative else streamed_tool_calls
+    )
+    for streamed in reconcilable_streamed:
+        fingerprint = _tool_call_semantic_key(streamed)
+        if fingerprint is not None:
+            streamed_by_fingerprint.setdefault(fingerprint, []).append(streamed)
+    streamed_tool_call_ids: set[str] = set()
+    for final in tool_calls or []:
+        fingerprint = _tool_call_semantic_key(final)
+        if fingerprint is None:
+            continue
+        candidates = streamed_by_fingerprint.get(fingerprint) or []
+        if candidates:
+            streamed = candidates.pop(0)
+            final.id = streamed.id
+            streamed_tool_call_ids.add(streamed.id)
 
     # Reverse Gemma 4 parameter renaming for streaming path
     if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
@@ -5036,6 +5707,8 @@ async def stream_chat_completion(
     # Emit tool call chunks if found
     if tool_calls:
         for i, tc in enumerate(tool_calls):
+            if tc.id in streamed_tool_call_ids:
+                continue
             tc_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
@@ -5057,7 +5730,9 @@ async def stream_chat_completion(
                     )
                 ],
             )
-            yield f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
+            event = f"data: {tc_chunk.model_dump_json(exclude_none=True)}\n\n"
+            mark_visible_delta()
+            yield event
 
     # Final chunk with finish_reason
     finish_reason = (
@@ -5081,16 +5756,35 @@ async def stream_chat_completion(
     if last_output and last_output.finished:
         end_time = time.perf_counter()
         total_duration = end_time - start_time
-        ttft = (first_token_time - start_time) if first_token_time else total_duration
+        model_ttft = (
+            max(0.0, first_token_time - start_time)
+            if first_token_time is not None
+            else None
+        )
+        visible_ttft = (
+            max(0.0, first_visible_time - start_time)
+            if first_visible_time is not None
+            else None
+        )
         is_diffusion = getattr(engine, "is_diffusion_model", False)
         if is_diffusion:
             gen_duration = total_duration
         else:
-            gen_duration = end_time - (first_token_time or start_time)
+            gen_duration = max(
+                0.0,
+                end_time
+                - (
+                    first_token_time
+                    if first_token_time is not None
+                    else start_time
+                ),
+            )
         metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
             last_output,
             is_diffusion=is_diffusion,
-            prefill_duration=ttft,
+            prefill_duration=(
+                model_ttft if model_ttft is not None else total_duration
+            ),
             generation_duration=gen_duration,
         )
         get_server_metrics().record_request_complete(
@@ -5110,13 +5804,21 @@ async def stream_chat_completion(
             tokens_per_sec,
             is_diffusion=is_diffusion,
         )
+        model_ttft_text = (
+            f"{model_ttft:.2f}s" if model_ttft is not None else "unavailable"
+        )
+        visible_ttft_text = (
+            f"{visible_ttft:.2f}s" if visible_ttft is not None else "unavailable"
+        )
         logger.info(
             f"Chat completion: model={resolved_model or request.model}, "
             f"{last_output.completion_tokens} tokens in "
             f"{total_duration:.2f}s ({speed_text}), "
             f"prompt: {last_output.prompt_tokens}, finish_reason={finish_reason}, "
             f"max_tokens={kwargs.get('max_tokens')}, "
-            f"request_max_tokens={request.max_tokens}"
+            f"request_max_tokens={request.max_tokens}, "
+            f"stream_model_ttft={model_ttft_text}, "
+            f"stream_visible_ttft={visible_ttft_text}"
         )
 
         # Emit usage chunk if requested
@@ -5140,7 +5842,14 @@ async def stream_chat_completion(
                         if model_load_duration > 1.0
                         else None
                     ),
-                    time_to_first_token=round(ttft, 2),
+                    time_to_first_token=(
+                        round(model_ttft, 2) if model_ttft is not None else None
+                    ),
+                    time_to_first_visible_token=(
+                        round(visible_ttft, 2)
+                        if visible_ttft is not None
+                        else None
+                    ),
                     total_time=round(total_time, 2),
                     prompt_eval_duration=round(metric_prefill_duration, 2),
                     generation_duration=round(metric_gen_duration, 2),
@@ -5342,8 +6051,18 @@ async def stream_anthropic_messages(
             if output.finished:
                 break
     except Exception as e:
-        logger.error(f"Error during Anthropic streaming: {e}")
-        yield create_error_event("api_error", str(e))
+        if isinstance(e, PrefillMemoryExceededError):
+            # Same shadowing as the OpenAI generators (#3036): keep the
+            # rejection classifiable. invalid_request_error is the Anthropic
+            # terminal request-error type — a retry without shrinking the
+            # prompt cannot succeed.
+            logger.warning(f"Anthropic streaming prefill rejected: {e}")
+            yield create_error_event(
+                "invalid_request_error", _prefill_memory_error_detail(e)
+            )
+        else:
+            logger.error(f"Error during Anthropic streaming: {e}")
+            yield create_error_event("api_error", str(e))
         yield create_message_stop_event()
         return
 
@@ -5847,20 +6566,28 @@ async def create_anthropic_message(
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
+        if inference_request_id is not None:
+            chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_anthropic_messages(
-                            engine,
-                            messages,
-                            request,
-                            resolved_model=resolved_model,
-                            **chat_kwargs,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_anthropic_messages(
+                                engine,
+                                messages,
+                                request,
+                                resolved_model=resolved_model,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=_resolve_keepalive("anthropic"),
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=_resolve_keepalive("anthropic"),
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -5946,12 +6673,8 @@ async def create_anthropic_message(
 
             return response.model_dump_json()
 
-        return StreamingResponse(
-            _release_after_stream(
-                _with_json_keepalive(http_request, _build_anthropic_message()),
-                lease,
-            ),
-            media_type="application/json",
+        return await _json_response_or_keepalive(
+            http_request, _build_anthropic_message(), lease=lease
         )
 
     except BaseException:
@@ -6363,6 +7086,9 @@ async def create_response(
             **chat_kwargs,
         )
         await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = _request_abort_id(engine)
+        if inference_request_id is not None:
+            chat_kwargs["_request_id"] = inference_request_id
 
         if request.stream:
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}
@@ -6370,21 +7096,26 @@ async def create_response(
                 sse_headers["Warning"] = response_format_warning
             return StreamingResponse(
                 _release_after_stream(
-                    _with_sse_keepalive(
-                        stream_responses_api(
-                            engine,
-                            messages,
-                            request,
-                            input_messages=current_input_messages,
-                            store_response=_should_store_response(request.store),
-                            model_load_duration=model_load_duration,
-                            resolved_model=resolved_model,
-                            response_format=response_format,
-                            native_reasoning=native_reasoning,
-                            **chat_kwargs,
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_responses_api(
+                                engine,
+                                messages,
+                                request,
+                                input_messages=current_input_messages,
+                                store_response=_should_store_response(request.store),
+                                model_load_duration=model_load_duration,
+                                resolved_model=resolved_model,
+                                response_format=response_format,
+                                native_reasoning=native_reasoning,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=_resolve_keepalive("openai_responses"),
                         ),
-                        http_request=http_request,
-                        keepalive_chunk=_resolve_keepalive("openai_responses"),
+                        http_request,
+                        engine,
+                        inference_request_id,
                     ),
                     lease,
                 ),
@@ -6537,13 +7268,8 @@ async def create_response(
         json_headers = (
             {"Warning": response_format_warning} if response_format_warning else None
         )
-        return StreamingResponse(
-            _release_after_stream(
-                _with_json_keepalive(http_request, _build_responses_api()),
-                lease,
-            ),
-            media_type="application/json",
-            headers=json_headers,
+        return await _json_response_or_keepalive(
+            http_request, _build_responses_api(), lease=lease, headers=json_headers
         )
 
     except BaseException:
@@ -6862,13 +7588,29 @@ async def stream_responses_api(
                             },
                         )
     except Exception as e:
-        logger.error(f"Error during Responses API streaming: {e}")
+        if isinstance(e, PrefillMemoryExceededError):
+            # Same shadowing as the chat generator (#3036): surface the
+            # guard's code and message in the response.failed error object
+            # instead of failing with no error at all.
+            logger.warning(f"Responses API streaming prefill rejected: {e}")
+            guard_body = _prefill_memory_openai_error_body(e)["error"]
+            failure_error = {
+                "code": guard_body.get("omlx_code", "prefill_memory_exceeded"),
+                "message": guard_body["message"],
+            }
+        else:
+            logger.error(f"Error during Responses API streaming: {e}")
+            failure_error = {"code": "server_error", "message": str(e)}
         seq += 1
         yield format_sse_event(
             "response.failed",
             {
                 "type": "response.failed",
-                "response": {**initial_data, "status": "failed"},
+                "response": {
+                    **initial_data,
+                    "status": "failed",
+                    "error": failure_error,
+                },
                 "sequence_number": seq,
             },
         )

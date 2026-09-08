@@ -653,6 +653,104 @@ class TestQwenCpuShareMemoryEstimate:
 
         assert pool._entry_runtime_resident_size(entry, settings) == 2000
 
+    def test_qwen4_ple_offload_reduces_resident_projection(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+        from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+            Qwen4ExpResidencyEstimate,
+        )
+
+        model = tmp_path / "qwen4"
+        model.mkdir()
+        settings = ModelSettings(qwen4_ple_ssd_offload=False)
+        entry = EngineEntry(
+            model_id="qwen4",
+            model_path=str(model),
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type="qwen4_exp",
+            estimated_size=1000,
+        )
+        estimate = Qwen4ExpResidencyEstimate(
+            supported=True,
+            checkpoint_bytes=950,
+            ple_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = _make_pool(ceiling=500)
+        pool._entries[entry.model_id] = entry
+
+        with patch(
+            "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+            "qwen4_exp_residency_estimate",
+            return_value=estimate,
+        ):
+            projected = pool._entry_runtime_resident_size(entry, settings)
+            effective = pool._effective_qwen4_model_settings(entry, settings)
+            signature = dict(pool._engine_runtime_signature("qwen4", settings))
+
+        assert projected == 400
+        assert settings.qwen4_ple_ssd_offload is False
+        assert effective.qwen4_ple_ssd_offload is True
+        assert signature["qwen4_ple_ssd_offload"] == "True"
+
+    @pytest.mark.asyncio
+    async def test_qwen4_live_admission_keeps_viable_mmap_fallback(self, tmp_path):
+        """Real pressure may select mmap without making that override sticky."""
+        from omlx.model_settings import ModelSettings
+        from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+            Qwen4ExpResidencyEstimate,
+        )
+
+        model = tmp_path / "qwen4"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+        settings = ModelSettings(qwen4_ple_ssd_offload=False)
+        entry = EngineEntry(
+            model_id="qwen4",
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            config_model_type="qwen4_exp",
+            estimated_size=1000,
+        )
+        estimate = Qwen4ExpResidencyEstimate(
+            supported=True,
+            checkpoint_bytes=950,
+            ple_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = _make_pool(ceiling=500)
+        pool._get_admission_soft_target = lambda: 500
+        pool._get_residency_ceiling = lambda: 1000
+        pool._entries[entry.model_id] = entry
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine) as cls,
+            patch("omlx.engine_pool.get_phys_footprint", return_value=0),
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch(
+                "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+                "qwen4_exp_residency_estimate",
+                return_value=estimate,
+            ),
+        ):
+            loaded = await pool.get_engine("qwen4", runtime_settings=settings)
+            reused = await pool.get_engine("qwen4", runtime_settings=settings)
+
+        assert loaded is mock_engine
+        assert reused is mock_engine
+        cls.assert_called_once()
+        effective = cls.call_args.kwargs["model_settings"]
+        assert effective.qwen4_ple_ssd_offload is True
+        assert settings.qwen4_ple_ssd_offload is False
+        assert entry.runtime_estimated_size == 400
+        signature = dict(entry.runtime_settings_signature or ())
+        assert signature["qwen4_ple_ssd_offload"] == "False"
+
 
 class TestApplySettingsOverrides:
     """Tests for apply_settings_overrides method."""
@@ -1543,7 +1641,10 @@ class TestEnginePoolAsync:
             engine_idx[0] += 1
             return engine
 
-        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+        with (
+            patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine),
+            patch("omlx.engine_pool.shutdown_mlx_executor") as shutdown_executor,
+        ):
             await pool.get_engine("model-a")
             await pool.get_engine("model-b")
 
@@ -1551,7 +1652,22 @@ class TestEnginePoolAsync:
 
         mock_engine_a.stop.assert_called_once()
         mock_engine_b.stop.assert_called_once()
+        shutdown_executor.assert_called_once_with()
         assert pool.loaded_model_count == 0
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancels_failed_load_reclaim_before_global_worker(self):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool._schedule_failed_load_reclaim("failed-model", pre_load_memory=0)
+        reclaim_task = pool._failed_load_reclaim_task
+        assert reclaim_task is not None
+
+        with patch("omlx.engine_pool.shutdown_mlx_executor") as shutdown_executor:
+            await pool.shutdown()
+
+        assert reclaim_task.cancelled()
+        assert not pool._failed_load_reclaim_tasks
+        shutdown_executor.assert_called_once_with()
 
 
 class TestEnginePoolEviction:
@@ -2192,6 +2308,137 @@ class TestEnginePoolPrefillEviction:
         pool._unload_engine.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_prefill_releases_ane_banks_when_reclaim_is_not_enough(self):
+        """No idle victim and the pooled reclaim frees nothing, but the
+        requesting model carries ANE prefill banks -> shed them on the
+        engine thread (latching GPU fallback), then admit."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        # 45GB resident against a 40GB target with a 10GB transient: the
+        # pooled reclaim frees nothing, then shedding the banks drops the
+        # footprint to 29GB and 29 + 10 fits under the cap.
+        phys = [45 * gb]
+        scheduler = self._reclaim_scheduler(lambda: None)
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=45 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="adaptive_prefill_throttle",
+        )
+
+        target_model = object()
+        released_on = []
+
+        def release(model):
+            released_on.append(model)
+            phys[0] = 29 * gb
+            return 96, 2
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            entry = self._entry(
+                "target", 25 * gb, scheduler=scheduler, executor=executor
+            )
+            entry.engine._model = target_model
+            pool._entries = {"target": entry}
+            pool._current_model_memory = 25 * gb
+            pool._unload_engine = AsyncMock()
+
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint",
+                    side_effect=lambda: phys[0],
+                ),
+                patch(
+                    "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+                    side_effect=release,
+                ),
+            ):
+                admitted = await pool._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is True
+        # The ladder ran in order: reclaim first, then the bank release on
+        # the requesting model itself; no model was unloaded.
+        scheduler._reclaim_prefill_headroom.assert_called_once()
+        assert released_on == [target_model]
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recurring_headroom_pressure_escalates_to_bank_release(self):
+        """A long prompt refills the buffer cache continuously, so the
+        pooled reclaim can 'succeed' marginally on every pass and starve
+        the durable rung. The second pass for the same request must go
+        straight to the bank release instead of reclaiming again first."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        phys = [45 * gb]
+
+        def reclaim():
+            phys[0] = 38 * gb  # marginal: 38 + 10 fits the 49GB target
+
+        scheduler = self._reclaim_scheduler(reclaim)
+
+        def make_req():
+            return PrefillEvictionRequest(
+                request_id="req-long",
+                model_id="target",
+                current_bytes=phys[0],
+                target_cap_bytes=49 * gb,
+                predicted_transient_bytes=10 * gb,
+                requested_tokens=2048,
+                reason="adaptive_prefill_throttle",
+            )
+
+        target_model = object()
+        released_on = []
+
+        def release(model):
+            released_on.append(model)
+            phys[0] -= 13 * gb  # the banks
+            return 96, 2
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            entry = self._entry(
+                "target", 25 * gb, scheduler=scheduler, executor=executor
+            )
+            entry.engine._model = target_model
+            pool._entries = {"target": entry}
+            pool._current_model_memory = 20 * gb
+            pool._unload_engine = AsyncMock()
+
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint",
+                    side_effect=lambda: phys[0],
+                ),
+                patch(
+                    "omlx.patches.qwen35_ane_prefill.release_qwen35_ane_prefill",
+                    side_effect=release,
+                ),
+            ):
+                # Pass 1: the marginal reclaim satisfies the target check.
+                first = await pool._evict_idle_lru_for_prefill(
+                    "target", make_req()
+                )
+                # KV growth brings the pressure back on the same request.
+                phys[0] = 45 * gb
+                second = await pool._evict_idle_lru_for_prefill(
+                    "target", make_req()
+                )
+
+        assert first is True and second is True
+        # One reclaim (pass 1 only); pass 2 escalated straight to release.
+        scheduler._reclaim_prefill_headroom.assert_called_once()
+        assert released_on == [target_model]
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_prefill_admits_when_reclaim_delta_is_masked(self):
         """A reclaim whose footprint delta is masked by concurrent allocation
         must not be treated as a failed reclaim: the loop re-measures with a
@@ -2202,8 +2449,8 @@ class TestEnginePoolPrefillEviction:
 
         # The helper's before/after reads both see 45GB (another engine
         # allocates while the reclaim frees, masking the delta as 0), but
-        # the loop's next reading sees the real 25GB baseline. Exactly four
-        # reads: loop #1, helper before, helper after, loop #2.
+        # the loop's next reading sees the real 25GB baseline. The log uses
+        # that same sample without taking another measurement.
         phys = iter([45 * gb, 45 * gb, 45 * gb, 25 * gb])
         scheduler = self._reclaim_scheduler(lambda: None)
         req = PrefillEvictionRequest(
@@ -2370,6 +2617,74 @@ class TestEnginePoolPrefillEviction:
         scheduler._reclaim_prefill_headroom.assert_called_once()
         pool._unload_engine.assert_not_awaited()
         assert pool._entries["busy"].engine is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("released_gb, expected_fit", [(25, True), (35, False)])
+    async def test_noop_first_pass_escalates_second_pass_to_ane_release(
+        self, caplog, released_gb, expected_fit
+    ):
+        """A no-op callback still counts toward bank-release escalation."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=0)
+
+        state = {"pressure": 20 * gb, "released": False}
+
+        def _phys():
+            return released_gb * gb if state["released"] else state["pressure"]
+
+        async def _release_ane(model_id, request_id):
+            state["released"] = True
+            return (45 - released_gb) * gb
+
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=20 * gb,
+            target_cap_bytes=40 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=2048,
+            reason="prefill_safety_cap",
+        )
+
+        pool._entries = {"target": self._entry("target", 25 * gb)}
+        pool._current_model_memory = 15 * gb
+        pool._unload_engine = AsyncMock()
+        pool._release_ane_prefill_for_headroom = AsyncMock(side_effect=_release_ane)
+        pool._reclaim_pooled_buffers_for_prefill = AsyncMock(return_value=0)
+
+        with (
+            patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+            patch("omlx.engine_pool.get_phys_footprint", side_effect=_phys),
+            caplog.at_level(logging.INFO, logger="omlx.engine_pool"),
+        ):
+            first = await pool._evict_idle_lru_for_prefill("target", req)
+            # Pressure returns after the first callback found enough headroom.
+            state["pressure"] = 45 * gb
+            second = await pool._evict_idle_lru_for_prefill("target", req)
+
+        assert first is False
+        assert second is expected_fit
+        if expected_fit:
+            pool._reclaim_pooled_buffers_for_prefill.assert_not_awaited()
+        else:
+            pool._reclaim_pooled_buffers_for_prefill.assert_awaited_once()
+        pool._release_ane_prefill_for_headroom.assert_awaited_once()
+        pool._unload_engine.assert_not_awaited()
+        decisions = [
+            record.getMessage()
+            for record in caplog.records
+            if "[prefill-eviction]" in record.getMessage()
+        ]
+        assert len(decisions) == 2
+        assert "action=already_fit" in decisions[0]
+        assert "retry=1" in decisions[0]
+        assert "action=release_ane" in decisions[1]
+        assert "retry=2" in decisions[1]
+
+        outcome = "headroom_available" if expected_fit else "insufficient_headroom"
+        assert "outcome=headroom_available" in decisions[0]
+        assert f"outcome={outcome}" in decisions[1]
+        assert f"phys_footprint={released_gb:.2f}GB" in decisions[1]
 
 
 class TestEnginePoolStatus:
