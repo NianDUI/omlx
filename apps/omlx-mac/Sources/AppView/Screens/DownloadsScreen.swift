@@ -1,7 +1,7 @@
 // PR 8 — Downloads screen.
 //
 // Wires the HF downloader endpoints (POST /admin/api/hf/download,
-// GET /admin/api/hf/tasks at 1 Hz, cancel / retry / delete, /hf/recommended).
+// GET /admin/api/hf/tasks at 2 Hz, cancel / retry / delete, /hf/recommended).
 //
 // Phase 2 — adds a source selector (HF / ModelScope) at the top. The MS
 // branch mirrors the HF flow 1:1 against /admin/api/ms/*. Switching the
@@ -12,7 +12,7 @@
 import SwiftUI
 
 /// Active downloader source. Mirrors the HTML admin's `downloaderSource`
-/// state at `omlx/admin/static/js/dashboard.js:266`.
+/// state at `apps/omlx-web/omlx_web/static/js/dashboard.js:266`.
 enum DownloadSource: String, CaseIterable, Hashable, Sendable {
     case hf, ms
 
@@ -585,7 +585,7 @@ private struct SearchDropdown: View {
             // free for the info button (rendered as a sibling outside
             // this row Button so its tap doesn't fall through to onPick).
             if !isHovered, let downloads = m.downloads, downloads > 0 {
-                Text(formatNumber(downloads))
+                Text(CountFormat.compact(downloads))
                     .font(.omlxMono(10.5))
                     .foregroundStyle(theme.textTertiary)
                     .padding(.trailing, 12)
@@ -642,11 +642,23 @@ private struct ActiveDownloadsSection: View {
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                 Spacer(minLength: 4)
+                                if let speed = task.speedText {
+                                    Text(speed)
+                                        .font(.omlxMono(11))
+                                        .foregroundStyle(theme.blueDot)
+                                }
                                 Text(String(localized: "downloads.progress.bytes",
                                             defaultValue: "\(Int(task.progress))% · \(formatBytes(task.downloadedSize)) of \(formatBytes(task.totalSize))",
                                             comment: "Per-row progress line during downloads. Placeholders: percent, bytes downloaded, total bytes"))
                                     .font(.omlxMono(11))
                                     .foregroundStyle(theme.textSecondary)
+                                if let eta = task.etaText {
+                                    Text(String(localized: "downloads.progress.eta",
+                                                defaultValue: "\(eta) left",
+                                                comment: "Remaining download time after the progress line. Placeholder: duration such as 2h 30m"))
+                                        .font(.omlxMono(11))
+                                        .foregroundStyle(theme.textSecondary)
+                                }
                                 Button {
                                     if task.statusEnum == .pending || task.statusEnum == .downloading {
                                         onCancel(task.taskId)
@@ -899,7 +911,7 @@ private struct SuggestedSection: View {
         var bits: [String] = []
         if let p = m.paramsFormatted { bits.append(p) }
         if let s = m.sizeFormatted { bits.append(s) }
-        if let dl = m.downloads { bits.append("\(formatNumber(dl)) ↓") }
+        if let dl = m.downloads { bits.append("\(CountFormat.compact(dl)) ↓") }
         return bits.isEmpty ? "—" : bits.joined(separator: " · ")
     }
 }
@@ -922,14 +934,4 @@ enum SuggestedSort: String, Hashable, CaseIterable {
                                        comment: "Sort option: rank suggested models by on-disk size, descending")
         }
     }
-}
-
-// MARK: - Helpers
-
-func formatNumber(_ n: Int) -> String {
-    let v = Double(n)
-    if v >= 1e9 { return String(format: "%.1fB", v / 1e9) }
-    if v >= 1e6 { return String(format: "%.1fM", v / 1e6) }
-    if v >= 1e3 { return String(format: "%.1fK", v / 1e3) }
-    return String(n)
 }

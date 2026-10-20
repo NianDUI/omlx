@@ -585,9 +585,17 @@ def decode_hello(data: bytes) -> tuple[int, int] | None:
     return nonce, cluster_hash
 
 
-def encode_wassup(nonce: int, node_id: str, http_port: int) -> bytes:
+def encode_wassup(
+    nonce: int, node_id: str, http_port: int, loopback_only: bool = False
+) -> bytes:
+    # Older decoders ignore keys they do not know.
     payload = json.dumps(
-        {"nonce": nonce, "node_id": node_id, "http_port": int(http_port)},
+        {
+            "nonce": nonce,
+            "node_id": node_id,
+            "http_port": int(http_port),
+            "loopback_only": bool(loopback_only),
+        },
         separators=(",", ":"),
     ).encode("utf-8")
     return _WASSUP_MAGIC + payload
@@ -613,7 +621,12 @@ def decode_wassup(data: bytes) -> dict[str, Any] | None:
         return None
     if not isinstance(http_port, int) or not 1 <= http_port <= 65535:
         return None
-    return {"nonce": nonce, "node_id": node_id, "http_port": http_port}
+    return {
+        "nonce": nonce,
+        "node_id": node_id,
+        "http_port": http_port,
+        "loopback_only": payload.get("loopback_only") is True,
+    }
 
 
 @dataclass
@@ -623,6 +636,8 @@ class PeerCaps:
     backends: list[str] = field(default_factory=list)
     thunderbolt: bool = False
     jaccl: bool = False
+    # The HTTP server binds only loopback, so peers cannot reach it.
+    loopback_only: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -631,6 +646,7 @@ class PeerCaps:
             "backends": list(self.backends),
             "thunderbolt": self.thunderbolt,
             "jaccl": self.jaccl,
+            "loopback_only": self.loopback_only,
         }
 
     @classmethod
@@ -646,6 +662,7 @@ class PeerCaps:
             else [],
             thunderbolt=bool(payload.get("thunderbolt")),
             jaccl=bool(payload.get("jaccl")),
+            loopback_only=bool(payload.get("loopback_only")),
         )
 
 
@@ -832,20 +849,32 @@ def load_cluster_name(base_path: Path | str | None = None) -> str:
 
 
 def _default_interface_lister() -> list[str]:
-    """Names of multicast-capable candidate interfaces (never raises)."""
+    """Names of active IPv6 multicast interfaces (never raises)."""
 
     names: list[str] = []
     if sys.platform == "darwin":
         try:
             result = subprocess.run(  # noqa: S603 - fixed system executable
-                ["/sbin/ifconfig", "-l"],
+                ["/sbin/ifconfig", "-a"],
                 capture_output=True,
                 text=True,
                 timeout=2.0,
                 check=False,
             )
             if result.returncode == 0:
-                names = result.stdout.split()
+                for block in re.split(r"\n(?=\S)", result.stdout):
+                    header = re.match(r"^(\S+):\s+flags=[0-9a-fA-F]+<([^>]*)>", block)
+                    if header is None:
+                        continue
+                    name, flags = header.groups()
+                    if (
+                        not name.startswith("lo")
+                        and {"UP", "MULTICAST"} <= set(flags.split(","))
+                        and not re.search(r"^\s+status:\s+inactive\s*$", block, re.M)
+                        and re.search(r"^\s+inet6\s+", block, re.M) is not None
+                    ):
+                        names.append(name)
+                return names
         except (OSError, subprocess.SubprocessError):
             names = []
     if not names:
@@ -1033,9 +1062,7 @@ def _tailscale_executable() -> str | None:
     discovered = shutil.which("tailscale")
     if discovered:
         return discovered
-    candidate = Path(
-        os.environ.get("OMLX_TAILSCALE_CLI", _MACOS_TAILSCALE_CLI)
-    ).expanduser()
+    candidate = Path(_MACOS_TAILSCALE_CLI)
     if (
         sys.platform == "darwin"
         and candidate.is_file()
@@ -1198,6 +1225,31 @@ class DiscoveryService:
             "candidate_states": candidate_states,
             "peers": len(self._peers),
         }
+
+    def address_health(self, node_id: str) -> dict[str, dict[str, Any]]:
+        """Return transient per-address health; persisted pairing is not liveness."""
+        with self._lock:
+            now = self._clock()
+            result = {}
+            for (ip, _port), candidate in self._candidates.items():
+                if candidate.get("node_id") != node_id:
+                    continue
+                success = candidate.get("last_success")
+                failures = candidate.get("consecutive_failures", 0)
+                fresh = success is not None and now - success < self.config.dead_after
+                result[ip] = {
+                    "state": (
+                        "verified"
+                        if candidate.get("verified") and fresh
+                        else (
+                            "stale"
+                            if failures >= 3 or success is not None
+                            else "unknown"
+                        )
+                    ),
+                    "consecutive_failures": failures,
+                }
+            return result
 
     def on_change(self, callback: Callable[[PeerRecord], None]) -> None:
         with self._lock:
@@ -1383,7 +1435,14 @@ class DiscoveryService:
         current = set(names)
         for name, ifindex in list(self._joined.items()):
             if name not in current:
-                # Interface vanished; its group membership dies with it.
+                # An inactive interface can retain membership until explicitly left.
+                membership = socket.inet_pton(
+                    socket.AF_INET6, MULTICAST_GROUP
+                ) + struct.pack("@I", ifindex)
+                with suppress(OSError):
+                    sock.setsockopt(
+                        socket.IPPROTO_IPV6, socket.IPV6_LEAVE_GROUP, membership
+                    )
                 self._joined.pop(name, None)
                 continue
             try:
@@ -1504,12 +1563,13 @@ class DiscoveryService:
                 self._joined.clear()
 
     def _send_hello(self, sock: Any) -> None:
-        nonce = secrets.randbits(64)
         with self._lock:
+            joined = list(self._joined.values())
+            if not joined:
+                return
+            nonce = secrets.randbits(64)
             self._nonces.append(nonce)
         payload = encode_hello(nonce, self._cluster_hash)
-        with self._lock:
-            joined = list(self._joined.values()) or [0]
         any_ok = False
         last_error: str | None = None
         now = self._clock()
@@ -1519,11 +1579,7 @@ class DiscoveryService:
             # IPV6_MULTICAST_IF on the shared socket per round instead; that
             # state goes stale when macOS renumbers interfaces on
             # Thunderbolt hotplug and every send then fails EHOSTUNREACH.)
-            target = (
-                (MULTICAST_GROUP, MULTICAST_PORT, 0, ifindex)
-                if ifindex
-                else (MULTICAST_GROUP, MULTICAST_PORT)
-            )
+            target = (MULTICAST_GROUP, MULTICAST_PORT, 0, ifindex)
             try:
                 sock.sendto(payload, target)
                 any_ok = True
@@ -1534,7 +1590,7 @@ class DiscoveryService:
                     >= _TX_FAIL_LOG_INTERVAL
                 ):
                     self._tx_fail_logged_at[ifindex] = now
-                    logger.debug("HELLO send on if %d failed: %s", ifindex, exc)
+                    logger.log(5, "HELLO send on if %d failed: %s", ifindex, exc)
         if any_ok:
             self._consecutive_tx_fail_rounds = 0
             self._consecutive_socket_resets = 0
@@ -1597,7 +1653,12 @@ class DiscoveryService:
         # link-local HELLO source requires the ingress interface as scope id
         # in the reply destination; without it the kernel has no route and
         # the handshake silently never completes.
-        reply = encode_wassup(nonce, self.identity.node_id, self.config.http_port)
+        reply = encode_wassup(
+            nonce,
+            self.identity.node_id,
+            self.config.http_port,
+            self.config.caps.loopback_only,
+        )
         target_sock = sock if sock is not None else self._socket
         if target_sock is not None:
             target = (
@@ -1632,6 +1693,7 @@ class DiscoveryService:
                 peer = PeerRecord(node_id=node_id)
                 self._peers[node_id] = peer
             peer.http_port = payload["http_port"]
+            peer.caps.loopback_only = payload.get("loopback_only") is True
             peer.last_seen = now
             if peer.state == "dead":
                 peer.state = "discovered"
@@ -1729,6 +1791,11 @@ class DiscoveryService:
                 if candidate is not None:
                     candidate["last_transport"] = diagnostic.get("transport")
                     candidate["last_error"] = diagnostic.get("error")
+                    candidate["consecutive_failures"] = (
+                        candidate.get("consecutive_failures", 0) + 1
+                    )
+                    if candidate["consecutive_failures"] >= 3:
+                        candidate["verified"] = False
             return
         node_id = result.get("node_id")
         if hint is not None and node_id != hint:
@@ -1745,6 +1812,8 @@ class DiscoveryService:
             candidate = self._candidates.get((ip, port))
             if candidate is not None:
                 candidate["verified"] = True
+                candidate["last_success"] = now
+                candidate["consecutive_failures"] = 0
                 candidate["rtt"] = rtt
                 candidate["node_id"] = node_id
                 candidate["last_transport"] = diagnostic.get("transport")

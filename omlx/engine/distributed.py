@@ -24,7 +24,15 @@ from ..cluster.launch import (
     DistributedLaunchError,
     _run_cluster_ssh,
 )
-from ..cluster.liveness import check_peers, describe_failure, read_marker
+from ..cluster.liveness import (
+    _DEFAULT_STALE_AFTER,
+    check_peers,
+    describe_failure,
+    marker_age_seconds,
+    marker_owner_is_live,
+    read_marker,
+)
+from ..exceptions import InvalidRequestError
 from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
 from .batched import BatchedEngine
@@ -219,6 +227,7 @@ class DistributedBatchedEngine(BatchedEngine):
         self._active_requests = 0
         self._active_lock = asyncio.Lock()
         self._peer_health: tuple[float, bool, str] | None = None
+        self._peer_reach: tuple[float, bool] | None = None
         self._peer_health_lock = asyncio.Lock()
         self._abort_drain_timeout = float(abort_drain_timeout)
         self._orphan_reap_grace = float(orphan_reap_grace)
@@ -231,7 +240,7 @@ class DistributedBatchedEngine(BatchedEngine):
     def runtime_failed_reason(self) -> str | None:
         """Terminal worker failure observed by the coordinator, if any."""
 
-        if self._runtime_failed_reason is None and self._loaded:
+        if self._runtime_failed_reason is None and getattr(self, "_supervisor", None) is not None:
             status = self._supervisor.status()
             reason = status.failure_reason
             if reason is None and status.returncode is not None:
@@ -475,6 +484,7 @@ raise SystemExit(2)
                 "mtp_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
+                "qwen35_ane_prefill_enabled",
             )
             if bool(getattr(settings, name, False))
         ]
@@ -484,14 +494,17 @@ raise SystemExit(2)
                 + ", ".join(incompatible)
             )
 
-    async def stop(self) -> None:
+    async def stop(self, *, local_only: bool = False) -> None:
         client, self._client = self._client, None
         try:
             if client is not None:
                 await client.aclose()
         finally:
             try:
-                await asyncio.to_thread(self._supervisor.stop)
+                await asyncio.to_thread(
+                    self._supervisor.stop,
+                    **({"local_only": True} if local_only else {}),
+                )
             finally:
                 self._tokenizer = None
                 self._model_type = None
@@ -598,6 +611,12 @@ raise SystemExit(2)
             raise ValueError("logit_bias is not yet supported by distributed inference")
         if kwargs.get("specprefill") is True:
             raise ValueError("SpecPrefill is not supported by distributed inference")
+        if kwargs.get("no_repeat_ngram_size"):
+            # Ranks run mlx-lm's server, which has no n-gram ban.
+            raise InvalidRequestError(
+                "no_repeat_ngram_size is not supported by distributed inference",
+                field="no_repeat_ngram_size",
+            )
 
     def _completion_payload(
         self,
@@ -904,6 +923,41 @@ raise SystemExit(2)
         quiescence evidence an abort or unload should wait for (G5).
         """
 
+        if self.runtime_failed_reason is not None:
+            return 0
+
+        marker = read_marker(
+            Path(self._supervisor.state_dir).expanduser()
+            / f"{self.deployment.deployment_id}-rank-0.json"
+        )
+        if not isinstance(marker, dict):
+            return None
+        if not marker_owner_is_live(marker) or marker.get("error"):
+            return 0
+        age = marker_age_seconds(marker)
+        if age is not None and age > _DEFAULT_STALE_AFTER:
+            return 0
+        metrics = marker.get("metrics")
+        if not isinstance(metrics, dict):
+            return None
+        active = metrics.get("active_requests")
+        if isinstance(active, int) and not isinstance(active, bool) and active >= 0:
+            return active
+        return None
+
+    def get_live_metrics(self) -> dict[str, Any] | None:
+        """Rank zero's latest telemetry snapshot for the admin dashboard.
+
+        The coordinator owns no scheduler, so the only truthful live rates
+        (decode/prefill tok/s, prefill progress, prompt-cache stats) are the
+        ones rank 0 publishes into its runtime marker roughly once a second.
+        Returns None when the marker or its metrics are absent, otherwise
+        ``{"metrics", "updated_at", "age_seconds", "stale"}``; ``stale`` marks
+        a heartbeat older than the liveness staleness bound, in which case
+        consumers must present the model as idle rather than trusting the
+        rates.
+        """
+
         marker = read_marker(
             Path(self._supervisor.state_dir).expanduser()
             / f"{self.deployment.deployment_id}-rank-0.json"
@@ -913,10 +967,13 @@ raise SystemExit(2)
         metrics = marker.get("metrics")
         if not isinstance(metrics, dict):
             return None
-        active = metrics.get("active_requests")
-        if isinstance(active, int) and not isinstance(active, bool) and active >= 0:
-            return active
-        return None
+        age = marker_age_seconds(marker)
+        return {
+            "metrics": metrics,
+            "updated_at": marker.get("updated_at"),
+            "age_seconds": age,
+            "stale": age is not None and age > _DEFAULT_STALE_AFTER,
+        }
 
     async def abort_request(
         self,
@@ -1856,6 +1913,38 @@ raise SystemExit(2)
         if not cached[1]:
             raise DistributedInferenceError(f"cluster is not serving: {cached[2]}")
 
+    async def peers_reachable(self) -> bool:
+        """Does every Mac of the deployment still answer over SSH?
+
+        A dead worker group can only be torn down and relaunched while its
+        peers are reachable: ``stop()`` verifies the rank exit on every host,
+        which cannot succeed against a Mac that is off or off the network.
+        The verdict is cached for ``_PEER_HEALTH_TTL`` seconds and the probe
+        is bounded by the SSH connect timeout, so asking is cheap and safe to
+        do per request. A probe that itself fails counts as reachable, like
+        the health gate above: the teardown will then report the real error.
+        """
+
+        cached = self._peer_reach
+        if cached is None or time.monotonic() - cached[0] >= _PEER_HEALTH_TTL:
+            async with self._peer_health_lock:
+                cached = self._peer_reach
+                if cached is None or (time.monotonic() - cached[0] >= _PEER_HEALTH_TTL):
+                    hosts_by_rank = {
+                        rank: (host.node_id, host.ssh)
+                        for rank, host in enumerate(self.deployment.hosts)
+                    }
+                    try:
+                        health = await asyncio.to_thread(check_peers, hosts_by_rank)
+                    except Exception as exc:  # noqa: BLE001 - probe plumbing
+                        logger.warning("peer reachability probe failed: %s", exc)
+                        reachable = True
+                    else:
+                        reachable = all(item.reachable for item in health)
+                    cached = (time.monotonic(), reachable)
+                    self._peer_reach = cached
+        return cached[1]
+
     async def preflight_chat(self, *args: Any, **kwargs: Any) -> None:
         self._validate_request_features(kwargs)
         await self._require_healthy_cluster()
@@ -1867,6 +1956,8 @@ raise SystemExit(2)
         return None
 
     def has_active_requests(self) -> bool:
+        if self.runtime_failed_reason is not None:
+            return False
         # Sweep finished-but-abandoned requests first so a leaked generator
         # cannot hold quiescence-gated unload open forever (G4).
         self.reap_orphaned_generators()

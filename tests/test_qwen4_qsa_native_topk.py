@@ -8,13 +8,13 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from omlx.custom_kernels.glm_moe_dsa import fast
+from omlx.custom_kernels.sparse_index import fast
 
 TOPK = 512
 
 
 def _native_available() -> bool:
-    return fast.is_native_available() and fast.has_symbol("qwen4_qsa_topk_indices")
+    return fast.is_native_available() and fast.has_symbol("qsa_topk_indices")
 
 
 def _reference_indices(scores: mx.array) -> mx.array:
@@ -25,26 +25,25 @@ def _sorted_sets(indices: mx.array) -> mx.array:
     return mx.sort(indices.astype(mx.int32), axis=-1)
 
 
-def test_qwen4_qsa_topk_symbol_is_part_of_the_extension_abi():
-    assert "qwen4_qsa_topk_indices" in fast.NATIVE_SYMBOLS
-
-
 @pytest.mark.skipif(
     not _native_available(),
     reason="native Qwen4 QSA top-k ABI is unavailable",
 )
 @pytest.mark.parametrize("blocks", [12_500, 25_000])
 def test_qwen4_qsa_topk_matches_argpartition_at_50k_100k_equivalent(blocks):
-    """50K/100K tokens at Qwen4's four-token compression ratio."""
+    """50K/100K tokens at Qwen4's four-token compression ratio.
+
+    The prefill caller skips its sort, so rows must come back ascending.
+    """
     rng = np.random.default_rng(41 + blocks)
     scores = rng.standard_normal((1, 4, blocks), dtype=np.float32)
-    actual = fast.qwen4_qsa_topk_indices(mx.array(scores))
+    actual = fast.qsa_topk_indices(mx.array(scores))
     expected = _reference_indices(mx.array(scores))
     mx.eval(actual, expected)
 
     assert actual.shape == (1, 4, TOPK)
     assert actual.dtype == mx.uint32
-    assert mx.array_equal(_sorted_sets(actual), _sorted_sets(expected)).item()
+    assert mx.array_equal(actual.astype(mx.int32), _sorted_sets(expected)).item()
 
 
 @pytest.mark.skipif(
@@ -64,7 +63,7 @@ def test_qwen4_qsa_topk_cutoff_ties_match_argpartition_membership():
     scores[0, 0, tie_indices] = np.float32(0.5)
     scores[0, 0, strict_indices] = np.float32(1.0)
 
-    actual = fast.qwen4_qsa_topk_indices(mx.array(scores))
+    actual = fast.qsa_topk_indices(mx.array(scores))
     reference = _reference_indices(mx.array(scores))
     mx.eval(actual, reference)
 
@@ -84,7 +83,7 @@ def test_qwen4_qsa_topk_treats_signed_zero_as_one_numeric_tie():
     scores = np.empty((1, 1, 1024), dtype=np.float32)
     scores[..., ::2] = np.float32(-0.0)
     scores[..., 1::2] = np.float32(0.0)
-    actual = fast.qwen4_qsa_topk_indices(mx.array(scores))
+    actual = fast.qsa_topk_indices(mx.array(scores))
     reference = _reference_indices(mx.array(scores))
     mx.eval(actual, reference)
     assert mx.array_equal(_sorted_sets(actual), _sorted_sets(reference)).item()
@@ -104,7 +103,7 @@ def test_qwen4_qsa_topk_matches_causal_sentinel_rows(sentinel):
     for row, valid in enumerate(valid_counts):
         scores[0, row, :valid] = np.float32(0.0)
 
-    actual = fast.qwen4_qsa_topk_indices(mx.array(scores))
+    actual = fast.qsa_topk_indices(mx.array(scores))
     reference = _reference_indices(mx.array(scores))
     mx.eval(actual, reference)
 
@@ -142,5 +141,5 @@ def test_qwen4_qsa_topk_matches_causal_sentinel_rows(sentinel):
     ],
 )
 def test_qwen4_qsa_topk_fails_closed_outside_fixed_contract(scores, topk):
-    with pytest.raises(ValueError, match="qwen4_qsa_topk_indices"):
-        fast.qwen4_qsa_topk_indices(scores, topk)
+    with pytest.raises(ValueError, match="qsa_topk_indices"):
+        fast.qsa_topk_indices(scores, topk)

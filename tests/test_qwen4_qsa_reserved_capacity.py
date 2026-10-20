@@ -5,10 +5,13 @@
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+from omlx.scheduler import Scheduler
 
 compat.apply_mlx_vlm_qwen4_exp_compat_patch()
 language = importlib.import_module("mlx_vlm.models.qwen4_exp.language")
@@ -109,9 +112,55 @@ def test_next_capacity_policy_table():
     assert unreserved._next_capacity(64, 65, _STEP) == 128
 
 
-def test_scheduler_reservation_skips_non_qsa_caches():
-    from omlx.scheduler import Scheduler
+def _kv_cache_after(tokens: int):
+    cache = language.QSAKVCache()
+    cache.step = _STEP
+    values = mx.arange(tokens, dtype=mx.float32).reshape(1, 1, tokens, 1)
+    cache.update_and_fetch(values, values)
+    return cache
 
+
+def _append_kv(cache, start: int, stop: int) -> None:
+    values = mx.arange(start, stop, dtype=mx.float32).reshape(1, 1, stop - start, 1)
+    cache.update_and_fetch(values, values)
+
+
+def _reserve_kv(cache, tokens: int) -> None:
+    ns = SimpleNamespace(
+        _stream=mx.default_stream(mx.gpu),
+        _memory_hard_limit_bytes=0,
+    )
+    assert Scheduler._reserve_prefill_capacity(ns, [cache], tokens) == 1
+
+
+def test_unreserved_kv_doubles_past_the_prompt():
+    cache = _kv_cache_after(_STEP)
+    _append_kv(cache, _STEP, 4 * _STEP)
+    _append_kv(cache, 4 * _STEP, 5 * _STEP)
+
+    # Crossing 4 steps doubles to 8 steps for a 5-step prompt.
+    assert cache.keys.shape[2] == 8 * _STEP
+
+
+def test_scheduler_reserves_kv_once_and_decode_grows_in_steps():
+    cache = _kv_cache_after(_STEP)
+    _reserve_kv(cache, 5 * _STEP - 3)
+
+    # The prompt's 5 steps plus one spare step for the reply.
+    assert cache.keys.shape[2] == 6 * _STEP
+    assert cache.prefill_spare_bytes() == 5 * _STEP * 2 * 4
+    _append_kv(cache, _STEP, 6 * _STEP)
+    assert cache.keys.shape[2] == 6 * _STEP  # chunks and decode write in place
+
+    _append_kv(cache, 6 * _STEP, 6 * _STEP + 1)  # decode crosses the reservation
+
+    assert cache.keys.shape[2] == 7 * _STEP  # a step, not 12 steps
+    expected = mx.arange(6 * _STEP + 1, dtype=mx.float32)
+    assert mx.array_equal(cache.state[0].reshape(-1), expected).item()
+    assert mx.array_equal(cache.state[1].reshape(-1), expected).item()
+
+
+def test_scheduler_reservation_skips_non_qsa_caches():
     class _Plain:
         pass
 
@@ -130,3 +179,79 @@ def test_scheduler_reservation_skips_non_qsa_caches():
     assert count == 2
     assert (qsa_a.reserved, qsa_b.reserved) == (12345, 12345)
     assert Scheduler._reserve_qsa_index_capacity(object(), [qsa_a], 0) == 0
+
+
+def test_restored_index_reserves_full_horizon_on_first_growth():
+    cache = language.QSAKVCache()
+    cache.index_step = 64
+    cache.state = (None, None, mx.ones((1, 1088, 8)), mx.arange(1088)[None])
+    cache.reserve_index_capacity(2000)
+    cache.update_indexer(mx.ones((1, 1, 8)), mx.array([[1088]]))
+    mx.eval(cache.index_keys)
+    assert cache._index_keys.shape[1] == 2048
+    assert mx.all(cache.index_keys == 1).item()
+
+
+@pytest.mark.parametrize("snapshots_enabled", [False, True])
+def test_chunked_reservation_includes_restored_prefix(snapshots_enabled):
+    cache = language.QSAKVCache()
+    cache.state = (
+        mx.zeros((1, 1, 128, 4)),
+        mx.zeros((1, 1, 128, 4)),
+        mx.ones((1, 128, 8)),
+        mx.arange(128)[None],
+    )
+    ns = SimpleNamespace(
+        model=object(),
+        config=SimpleNamespace(paged_cache_block_size=64),
+        block_aware_cache=object() if snapshots_enabled else None,
+        _stream=mx.default_stream(mx.gpu),
+        _prefill_tail_plan=lambda *a: (None, False),
+        _memory_hard_limit_bytes=0,
+    )
+    state = Scheduler._begin_prefill(
+        ns,
+        SimpleNamespace(cached_tokens=128, request_id="reservation"),
+        [1] * 129,
+        [cache, SimpleNamespace(offset=128)],
+    )
+    ns._prefill_step_size_for_progress = lambda *a: 64
+    ns._reserve_qsa_index_capacity = (
+        lambda caches, tokens: Scheduler._reserve_qsa_index_capacity(ns, caches, tokens)
+    )
+
+    def stop(*args, **kwargs):
+        raise RuntimeError("reservation complete")
+
+    ns._adaptive_chunk_size = stop
+    with pytest.raises(RuntimeError, match="reservation complete"):
+        Scheduler._step_prefill_chunk(ns, state)
+    assert cache._index_reserved_tokens >= 256
+    assert cache.keys.shape[2] >= cache._index_reserved_tokens
+
+
+def test_reserved_qsa_prefill_and_decode_match_unreserved_model():
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+    from test_mlx_vlm_qwen4_exp_compat import _tiny_config
+
+    mx.random.seed(3455)
+    config = _tiny_config()
+    model = LanguageModel(config.text_config, config)
+    ordinary, reserved = model.make_cache(), model.make_cache()
+    for cache in ordinary + reserved:
+        if hasattr(cache, "index_step"):
+            cache.index_step = 8
+    Scheduler._reserve_qsa_index_capacity(object(), reserved, 36)
+    for start in range(0, 36, 6):
+        tokens = (mx.arange(start, start + 6) % 60 + 1)[None]
+        expected = model(tokens, cache=ordinary).logits
+        actual = model(tokens, cache=reserved).logits
+        mx.eval(expected, actual)
+        assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+    for _ in range(5):
+        token = mx.argmax(expected[:, -1], axis=-1)[:, None]
+        assert mx.array_equal(token, mx.argmax(actual[:, -1], axis=-1)[:, None]).item()
+        expected = model(token, cache=ordinary).logits
+        actual = model(token, cache=reserved).logits
+        mx.eval(expected, actual)
+        assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()

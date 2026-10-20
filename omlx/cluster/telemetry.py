@@ -11,9 +11,10 @@ import shutil
 import struct
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -917,6 +918,7 @@ class RuntimeTelemetry:
         end_to_end_tps = sample.completion_tokens / elapsed if elapsed > 0 else 0.0
         return {
             "status": status,
+            "request_id": sample.request_id,
             "prompt_tokens": sample.prompt_tokens,
             "cached_tokens": sample.cached_tokens,
             "completion_tokens": sample.completion_tokens,
@@ -964,6 +966,11 @@ class RuntimeTelemetry:
         result = {
             "scope": "end_to_end_pipeline",
             "active_requests": len(self._requests),
+            "active_request_metrics": [
+                self._sample_snapshot(sample, now=now, status="running")
+                for sample in list(self._requests.values())[:64]
+            ],
+            "active_request_metrics_truncated": max(0, len(self._requests) - 64),
             "requests_completed": self._requests_completed,
             "requests_failed": self._requests_failed,
             "requests_cancelled": self._requests_cancelled,
@@ -1095,9 +1102,11 @@ def install_server_telemetry(
     heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
     ssd_cache_dir: str | None = None,
     ssd_max_entries: int = 512,
+    ssd_cache_max_bytes: int = 20 * 1024**3,
     ssd_cache_persistent: bool = False,
     prefill_step_size: int = 2048,
     control_plane: Any | None = None,
+    on_generation_failed: Callable[[str], None] | None = None,
 ) -> Iterator[RuntimeTelemetry]:
     """Patch the pinned worker's generator at its rank-local queue boundary.
 
@@ -1170,6 +1179,7 @@ def install_server_telemetry(
             ssd_cache_dir,
             step=snapshot_step,
             max_entries=ssd_max_entries,
+            max_bytes=ssd_cache_max_bytes,
             persistent=ssd_cache_persistent,
         )
     try:
@@ -1402,9 +1412,41 @@ def install_server_telemetry(
             if getattr(response, "end_of_prompt", False):
                 self._omlx_tokens.pop(uid, None)
 
+        def _omlx_align_prefill_step(self, sequences) -> None:
+            if ssd_store is None:
+                return
+            step = min(self.prefill_step_size, snapshot_step)
+            for uid, segments in sequences:
+                # MLX-LM moves these directly to generation before prefill.
+                if len(segments) == 1 and len(segments[0]) == 1:
+                    continue
+                full = self._omlx_tokens.get(uid)
+                if full is not None:
+                    position = len(full) - sum(map(len, segments))
+                    step = min(step, snapshot_step - position % snapshot_step)
+            self.prefill_step_size = step
+
+        def _make_batch(self, n):
+            # Use the actual admission count, after generation frees capacity.
+            self._omlx_align_prefill_step(
+                (state[0], state[1]) for state in islice(self._unprocessed_sequences, n)
+            )
+            return super()._make_batch(n)
+
         def next(self) -> Any:
             started = time.perf_counter()
-            prompt_responses, generation_responses = super().next()
+            original_step = getattr(self, "prefill_step_size", None)
+            if ssd_store is not None and original_step is not None:
+                active = zip(
+                    getattr(getattr(self, "_prompt_batch", None), "uids", ()),
+                    getattr(self, "_currently_processing", ()),
+                )
+                self._omlx_align_prefill_step((uid, state[0]) for uid, state in active)
+            try:
+                prompt_responses, generation_responses = super().next()
+            finally:
+                if original_step is not None:
+                    self.prefill_step_size = original_step
             elapsed = time.perf_counter() - started
             for response in generation_responses:
                 response.token = _python_token_id(response.token)
@@ -1470,18 +1512,20 @@ def install_server_telemetry(
             # its writes; it runs later on this same generation thread.
             snapshot_ctx.model = model
             snapshot_ctx.prompt = list(tokens)
-            if ssd_store is not None:
-                # The collective is taken on every request, hit or miss, so all
-                # ranks reach it the same number of times regardless of their
-                # in-memory state; the agreed boundary is only used when the
-                # in-memory tier missed. This is what lets SSD serve the batched
-                # path, whose byte-based eviction can diverge across ranks.
+            cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
+            if ssd_store is not None and len(rest) == len(tokens):
+                # Memory agreement makes this branch uniform across ranks,
+                # including when only one rank had a hit or an invalid offset.
+                # A rejected memory hit must not suppress a usable SSD prefix.
+                cache = None
                 boundary = agree_ssd_boundary(model, tokens)
-                if cache is None and boundary > 0:
+                if boundary > 0:
                     loaded = ssd_store.load(model, tokens, boundary)
                     if loaded is not None:
                         cache, rest = loaded, list(tokens[boundary:])
-            cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
+                    # A file may disappear or fail to restore after the vote.
+                    # No rank may proceed until restored offsets agree too.
+                    cache, rest = agree_prompt_cache_plan(cache, tokens, rest)
             entries, nbytes = self._omlx_cache_inventory()
             telemetry.observe_cache_lookup(
                 prompt_tokens=len(tokens),
@@ -1658,6 +1702,17 @@ def install_server_telemetry(
             finally:
                 self._is_distributed = was_distributed
                 cancellation_state.sequential = previous
+
+        def _generate(self) -> Any:
+            # MLX-LM only logs a dead generation thread. Rank zero keeps
+            # answering 404 and other ranks exit 0, so no failure is reported.
+            try:
+                return super()._generate()
+            except Exception as exc:
+                if on_generation_failed is not None:
+                    logger.exception("Rank generation thread died")
+                    on_generation_failed(f"{type(exc).__name__}: {exc}")
+                raise
 
     original_stream_generate = mlx_server.stream_generate
 

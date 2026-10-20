@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import platform
+import pwd
 import secrets
 import socket
 import subprocess
@@ -56,6 +57,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .registry import SSH_USER_PATTERN
 
 logger = logging.getLogger(__name__)
 
@@ -486,6 +489,7 @@ class DeviceRegistryBridge:
                 addrs=record.get("last_addrs") or None,
                 paired_at=record.get("paired_at"),
                 http_port=record.get("http_port"),
+                ssh_user=record.get("ssh_user"),
             )
             return
         self._call(self._PUT, record)
@@ -606,6 +610,7 @@ class _PendingRequest:
     attempts: int = 0
     locked_until: float | None = None
     approving: bool = False
+    cancel_token_hash: str | None = None
 
     def to_dict(self, now: float) -> dict[str, Any]:
         locked = self.locked_until is not None and self.locked_until > now
@@ -709,6 +714,12 @@ def default_revocation_driver(revocation: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+class _NoPairingRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # A redirected connection failure cannot prove the POST was undelivered.
+        return None
+
+
 def _default_http_post(url: str, payload: dict[str, Any], timeout: float) -> Any:
     request = urllib.request.Request(
         url,
@@ -716,7 +727,8 @@ def _default_http_post(url: str, payload: dict[str, Any], timeout: float) -> Any
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    opener = urllib.request.build_opener(_NoPairingRedirects())
+    with opener.open(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -741,16 +753,10 @@ def _local_ssh_public_key() -> str | None:
 def _local_ssh_host_public_key() -> str | None:
     """Read the public half of the local SSH daemon host identity."""
 
-    override = os.environ.get("OMLX_CLUSTER_SSH_HOST_PUBLIC_KEY")
-    candidates = (
-        [Path(override).expanduser()]
-        if override
-        else [
-            Path("/etc/ssh/ssh_host_ed25519_key.pub"),
-            Path("/etc/ssh/ssh_host_rsa_key.pub"),
-        ]
-    )
-    for path in candidates:
+    for path in (
+        Path("/etc/ssh/ssh_host_ed25519_key.pub"),
+        Path("/etc/ssh/ssh_host_rsa_key.pub"),
+    ):
         try:
             return normalize_ssh_public_key(path.read_text(encoding="utf-8").strip())
         except (OSError, PairingRequestError):
@@ -776,6 +782,30 @@ def normalize_ssh_public_key(public_key: str) -> str:
             "join request carries an invalid SSH public key"
         ) from exc
     return normalized
+
+
+def _pairing_caps(caps: dict[str, Any]) -> dict[str, Any]:
+    # Enrollment installs keys in this account's ~/.ssh. Older peers reject new
+    # top-level fields but keep any caps key; discovery HELLO never sends it.
+    # A missing passwd entry (some containers, broken nsswitch) must degrade
+    # to "don't advertise a user", not break pairing/join outright.
+    try:
+        ssh_user = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        logger.warning(
+            "No passwd entry for euid %d; pairing caps will not advertise "
+            "an ssh_user",
+            os.geteuid(),
+        )
+        return dict(caps)
+    return {**caps, "ssh_user": ssh_user}
+
+
+def _advertised_ssh_user(caps: Any) -> str | None:
+    user = caps.get("ssh_user") if isinstance(caps, dict) else None
+    if isinstance(user, str) and SSH_USER_PATTERN.fullmatch(user):
+        return user
+    return None
 
 
 def ssh_host_target(address: str) -> str:
@@ -871,6 +901,9 @@ class PairingManager:
         self._pending: dict[str, _PendingRequest] = {}
         self._denied: dict[str, float] = {}
         self._local_code: dict[str, Any] | None = None
+        from .pairing_session import PairingSession
+
+        self.ui_session = PairingSession(self)
 
     # -- helpers ------------------------------------------------------------
 
@@ -919,13 +952,22 @@ class PairingManager:
         return {
             "node_id": self.node_id,
             "friendly_name": self.friendly_name,
-            "caps": self._caps_provider() if self._caps_provider else {},
+            "caps": _pairing_caps(self._caps_provider() if self._caps_provider else {}),
             "addrs": addresses,
             "ssh_public_key": normalize_ssh_public_key(self._ssh_key_provider() or ""),
-            "ssh_host_public_key": normalize_ssh_public_key(
-                self._ssh_host_key_provider() or ""
-            ),
+            "ssh_host_public_key": self._local_ssh_host_key(),
         }
+
+    def _local_ssh_host_key(self) -> str:
+        host_key = self._ssh_host_key_provider()
+        if not host_key:
+            # macOS creates host keys when sshd first accepts a connection.
+            raise PairingRequestError(
+                "This Mac has no SSH host key yet. Turn on Remote Login in "
+                "System Settings > General > Sharing. If it is already on, run "
+                "ssh localhost once in Terminal to create the key, then retry."
+            )
+        return normalize_ssh_public_key(host_key)
 
     def _record_audit(
         self, event: str, *, node_id: str = "", detail: dict[str, Any] | None = None
@@ -976,14 +1018,12 @@ class PairingManager:
         validate_pairing_code(code)
         caps = self._caps_provider() if self._caps_provider else {}
         ssh_public_key = normalize_ssh_public_key(self._ssh_key_provider() or "")
-        ssh_host_public_key = normalize_ssh_public_key(
-            self._ssh_host_key_provider() or ""
-        )
+        ssh_host_public_key = self._local_ssh_host_key()
         code_salt = secrets.token_bytes(16)
         return {
             "node_id": self.node_id,
             "friendly_name": self.friendly_name,
-            "caps": dict(caps),
+            "caps": _pairing_caps(caps),
             "code_hash": pairing_code_hash(
                 code,
                 self.node_id,
@@ -1116,6 +1156,8 @@ class PairingManager:
             "state": "paired",
             "role": "coordinator",
         }
+        if ssh_user := _advertised_ssh_user(coordinator.get("caps")):
+            record["ssh_user"] = ssh_user
         key_record = {
             "cluster_key": cluster_key.hex(),
             "peer_public_key": coordinator.get("ssh_public_key"),
@@ -1189,6 +1231,13 @@ class PairingManager:
         node_id = str(payload.get("node_id") or "").strip()
         friendly_name = str(payload.get("friendly_name") or "").strip()
         code_hash = str(payload.get("code_hash") or "").strip()
+        cancel_token_hash = payload.get("cancel_token_hash")
+        if cancel_token_hash is not None and (
+            not isinstance(cancel_token_hash, str)
+            or len(cancel_token_hash) != 64
+            or any(c not in "0123456789abcdef" for c in cancel_token_hash)
+        ):
+            raise PairingRequestError("invalid cancellation verifier")
         code_salt_encoded = str(payload.get("code_salt") or "").strip()
         caps = payload.get("caps")
         addrs = payload.get("addrs") or []
@@ -1242,6 +1291,7 @@ class PairingManager:
                     and existing.ssh_public_key == ssh_public_key
                     and existing.ssh_host_public_key == ssh_host_public_key
                     and existing.addrs == normalized_addrs[:8]
+                    and existing.cancel_token_hash == cancel_token_hash
                 )
                 if same_request:
                     return existing.to_dict(now)
@@ -1259,6 +1309,7 @@ class PairingManager:
                 caps=dict(caps),
                 code_hash=code_hash,
                 code_salt=code_salt,
+                cancel_token_hash=cancel_token_hash,
                 addrs=normalized_addrs[:8],
                 http_port=int(http_port) if http_port is not None else None,
                 ssh_public_key=ssh_public_key,
@@ -1405,6 +1456,8 @@ class PairingManager:
             "state": "paired",
             "role": "peer",
         }
+        if ssh_user := _advertised_ssh_user(pending.caps):
+            record["ssh_user"] = ssh_user
         key_record = {
             "cluster_key": cluster_key.hex(),
             # The joiner retrieves this package via pair/status and unwraps it
@@ -1479,6 +1532,24 @@ class PairingManager:
             "coordinator_identity_tag": coordinator_tag,
             "enrollment": enrollment,
         }
+
+    def cancel_join_request(self, node_id: str, token: str) -> dict[str, Any]:
+        """Withdraw only the pending attempt that owns this cancellation token."""
+        with self._lock:
+            self._prune_pending(self._clock())
+            pending = self._pending.get(node_id)
+            if pending is None:
+                return {"ok": True}
+            proof = hashlib.sha256(token.encode()).hexdigest()
+            if not pending.cancel_token_hash or not hmac.compare_digest(
+                pending.cancel_token_hash, proof
+            ):
+                raise PairingCodeError("invalid cancellation token")
+            if pending.approving:
+                raise PairingStateError("approval is already in progress")
+            self._pending.pop(node_id)
+        self._record_audit("join_request_cancelled", node_id=node_id)
+        return {"ok": True}
 
     def deny(self, node_id: str) -> bool:
         """Refuse a pending request; the joiner sees ``denied`` on its next poll."""

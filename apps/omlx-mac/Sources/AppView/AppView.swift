@@ -14,11 +14,15 @@ struct AppView: View {
     @State private var selection: AppSection? = .status
     @State private var presentedUpdate: AvailableUpdate?
 
+    @AppStorage(EnhancedReadability.enabledKey) private var enhancedReadability = false
+
     @Environment(\.colorScheme) private var scheme
     @Environment(AppServices.self) private var services
 
     var body: some View {
-        let theme = scheme == .dark ? OMLXTheme.dark : OMLXTheme.light
+        let theme = OMLXTheme.resolved(
+            for: scheme, enhancedReadability: enhancedReadability
+        )
         let section = selectedSection
 
         // The sidebar is the only way to switch screens, so it must never
@@ -28,12 +32,20 @@ struct AppView: View {
             SettingsSidebar(selection: bindingForSelection())
                 .toolbar(removing: .sidebarToggle)
         } detail: {
-            ContentScaffold(section: section, detailTitle: detailTitle) {
+            ContentScaffold(
+                section: section,
+                detailTitle: detailTitle,
+                detailSubtitle: detailSubtitle,
+                ownsScrollView: section == .models && services.modelDetailID != nil
+            ) {
                 screen(for: section)
             }
         }
         .navigationSplitViewStyle(.balanced)
-        .frame(minWidth: 880, idealWidth: 880, minHeight: 600, idealHeight: 600)
+        // Fixed width, like System Settings: the sidebar plus the 720 pt
+        // content column. A wider window would only add empty margins.
+        .frame(width: 920)
+        .frame(minHeight: 600, idealHeight: 600)
         // The theme resolves this through the dynamic macOS window color so
         // the shell tracks System Settings instead of a fixed canvas color.
         .background(theme.windowBg)
@@ -50,6 +62,9 @@ struct AppView: View {
                 selection = requested
                 services.requestedSection = nil
             }
+        }
+        .onChange(of: services.modelDetailID) { _, _ in
+            services.modelDetailPage = nil
         }
         .onChange(of: services.updates.confirmationUpdate, initial: true) { _, update in
             presentedUpdate = update
@@ -93,9 +108,15 @@ struct AppView: View {
 
     private var detailTitle: String? {
         if selectedSection == .models, let id = services.modelDetailID, !id.isEmpty {
-            return id
+            return services.modelDetailPage?.title ?? id
         }
         return nil
+    }
+
+    /// A model settings sub-page keeps the model id visible under its title.
+    private var detailSubtitle: String? {
+        guard selectedSection == .models, services.modelDetailPage != nil else { return nil }
+        return services.modelDetailID
     }
 
     @ViewBuilder
@@ -508,6 +529,9 @@ private struct SidebarRow: View {
 private struct ContentScaffold<Content: View>: View {
     let section: AppSection
     let detailTitle: String?
+    var detailSubtitle: String? = nil
+    /// The screen brings its own ScrollView, e.g. to reset scrolling per page.
+    var ownsScrollView = false
     @ViewBuilder var content: () -> Content
 
     @Environment(\.omlxTheme) private var theme
@@ -523,6 +547,10 @@ private struct ContentScaffold<Content: View>: View {
                     .frame(maxWidth: 720, alignment: .topLeading)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .padding(.bottom, 18)
+                    .background(theme.windowBg)
+            } else if ownsScrollView {
+                content()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .background(theme.windowBg)
             } else {
                 ScrollViewReader { proxy in
@@ -561,6 +589,7 @@ private struct ContentScaffold<Content: View>: View {
             }
         }
         .navigationTitle(titleText)
+        .navigationSubtitle(detailSubtitle ?? "")
         .modifier(ToolbarHeightKeeper())
         .background(theme.windowBg)
     }
