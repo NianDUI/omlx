@@ -11,6 +11,8 @@ All tests run without mlx-audio installed — only config.json parsing is tested
 import json
 from pathlib import Path
 
+import pytest
+
 from omlx.model_discovery import (
     AUDIO_STS_ARCHITECTURES,
     AUDIO_STS_MODEL_TYPES,
@@ -159,6 +161,19 @@ class TestDetectAudioModelType:
         """model_type='vibevoice' (no architecture) -> audio_tts."""
         _write_config(tmp_path, {"model_type": "vibevoice"})
         assert detect_model_type(tmp_path) == "audio_tts"
+
+    @pytest.mark.parametrize("architecture", [
+        "VibeVoiceForASRTraining",
+        "VibeVoiceForASRStreamingTraining",
+    ])
+    def test_vibevoice_asr_architecture_returns_audio_stt(self, tmp_path, architecture):
+        """ASR architectures override the shared VibeVoice TTS model type."""
+        _write_config(tmp_path, {
+            "model_type": "vibevoice",
+            "architectures": [architecture],
+            "quantization": {"group_size": 64, "bits": 4, "mode": "affine"},
+        })
+        assert detect_model_type(tmp_path) == "audio_stt"
 
     def test_vibevoice_streaming_architecture_returns_audio_tts(self, tmp_path):
         """VibeVoice streaming architecture -> audio_tts."""

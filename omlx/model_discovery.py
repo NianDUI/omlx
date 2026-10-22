@@ -387,6 +387,9 @@ AUDIO_STT_ARCHITECTURES = {
     "Qwen3ASRForConditionalGeneration",
     "ParakeetForCTC",
     "Qwen2AudioForConditionalGeneration",
+    # VibeVoice ASR checkpoints share model_type="vibevoice" with TTS.
+    "VibeVoiceForASRTraining",
+    "VibeVoiceForASRStreamingTraining",
 }
 
 AUDIO_TTS_ARCHITECTURES = {

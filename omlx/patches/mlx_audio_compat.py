@@ -3,12 +3,51 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from functools import wraps
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _RESAMPLE_EXPORT_CHECKED = False
+
+
+def ensure_vibevoice_asr_tokenizer() -> bool:
+    """Select Qwen2 tokenization for legacy VibeVoice ASR checkpoints.
+
+    Transformers 5 validates their shared ``vibevoice`` model type as TTS,
+    ignoring ``decoder_config`` and rejecting the hidden-size mismatch. The
+    mlx-audio hook then falls back to a base tokenizer without ASR tokens.
+    Explicit tokenizer selection skips that unrelated model-config validation.
+    """
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        return False
+
+    original = AutoTokenizer.from_pretrained
+    if getattr(original, "_omlx_vibevoice_asr", False) is True:
+        return True
+
+    @wraps(original)
+    def from_pretrained(cls, pretrained_model_name_or_path, *inputs, **kwargs):
+        if "tokenizer_type" not in kwargs and "config" not in kwargs:
+            try:
+                config_path = Path(pretrained_model_name_or_path) / "config.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                config = {}
+            if config.get("model_type") == "vibevoice" and any(
+                arch in {"VibeVoiceForASRTraining", "VibeVoiceForASRStreamingTraining"}
+                for arch in config.get("architectures", [])
+            ):
+                kwargs["tokenizer_type"] = "qwen2"
+        return original(pretrained_model_name_or_path, *inputs, **kwargs)
+
+    from_pretrained._omlx_vibevoice_asr = True
+    AutoTokenizer.from_pretrained = classmethod(from_pretrained)
+    return True
 
 
 def ensure_qwen3_asr_audio_quantization() -> bool:
