@@ -46,6 +46,10 @@ class ImageGenerationEngine(BaseNonStreamingEngine):
             from mflux.models.common.config import ModelConfig
             from mflux.models.flux2.variants import Flux2Klein
         except ImportError as exc:
+            if not isinstance(exc, ModuleNotFoundError) or exc.name != "mflux":
+                raise ImportError(
+                    f"Failed to import the mflux image generation runtime: {exc}"
+                ) from exc
             raise ImportError(
                 "mflux is required for image generation. "
                 'Install dependencies with `pip install "omlx[image]"`, then '

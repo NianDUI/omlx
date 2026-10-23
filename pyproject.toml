@@ -115,7 +115,9 @@ dependencies = [
     "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@9790231827a890eade1a626643a6bc94a1317c72",
     # mlx-vlm requires mlx-audio>=0.5.2 in the shared runtime.
     "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78",
-    "Pillow>=9.0.0",
+    # Pillow 13's PIL._typing imports numbers._IntegralLike at runtime,
+    # which fails on the bundled Python 3.11 when mflux imports it.
+    "Pillow>=9.0.0,<13",
     "markitdown[pdf,docx,pptx]==0.1.8",
 ]
 
