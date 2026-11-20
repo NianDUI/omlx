@@ -71,6 +71,7 @@ from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
+    compute_image_hash,
     compute_per_image_hashes,
     extract_images_from_messages,
     extract_media_from_messages,
