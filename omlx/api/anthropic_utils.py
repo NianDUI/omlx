@@ -458,9 +458,19 @@ def convert_anthropic_to_internal(
         ):
             msg["content"] = _strip_client_budget_markers(msg["content"])
 
-    from .utils import _merge_consecutive_roles
+    from .utils import _merge_consecutive_roles, _sort_tool_messages_by_call_order
 
-    return _merge_consecutive_roles(processed_messages)
+    processed_messages = _sort_tool_messages_by_call_order(processed_messages)
+    messages = _merge_consecutive_roles(processed_messages)
+    # A trailing assistant text turn is an Anthropic prefill.
+    last = messages[-1] if messages else {}
+    if (
+        last.get("role") == "assistant"
+        and last.get("content")
+        and not last.get(_PRESERVE_ROLE_BOUNDARY)
+    ):
+        last["partial"] = True
+    return messages
 
 
 def convert_anthropic_to_internal_harmony(
@@ -709,6 +719,19 @@ def _extract_system_text(system: str | list[SystemContent]) -> str:
             text_parts.append(text)
         return _strip_client_budget_markers("\n".join(text_parts))
     return ""
+
+
+_AUTO_MODE_CLASSIFIER_MARKER = (
+    "you are a security monitor for autonomous ai coding agents"
+)
+
+
+def is_auto_mode_classifier_request(request: MessagesRequest) -> bool:
+    """Match Claude Code's auto-mode safety classifier request."""
+    if request.stream or request.tools or not request.system:
+        return False
+    system_text = _extract_system_text(request.system).lower()
+    return _AUTO_MODE_CLASSIFIER_MARKER in system_text
 
 
 def _normalize_in_messages_system(
@@ -1076,6 +1099,10 @@ def map_finish_reason_to_stop_reason(
     Returns:
         Anthropic stop_reason
     """
+    # A length stop can cut a later call, so it wins over tool_use.
+    if finish_reason == "length":
+        return "max_tokens"
+
     if has_tool_calls:
         return "tool_use"
 

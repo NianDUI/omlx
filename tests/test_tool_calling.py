@@ -550,7 +550,7 @@ class TestConvertToolsForTemplate:
 
     @pytest.mark.parametrize("render_properties", [False, True])
     def test_schema_key_order_does_not_change_rendered_tools(self, render_properties):
-        """Equivalent JSON object orders must produce the same prompt prefix."""
+        """Reordered schema keywords must produce the same prompt prefix."""
         from jinja2 import Environment, StrictUndefined
 
         schema = {
@@ -572,11 +572,17 @@ class TestConvertToolsForTemplate:
             "anyOf": [{"type": "string"}, {"type": "number"}],
         }
 
-        def reverse_object_keys(value):
+        def reverse_object_keys(value, in_properties=False):
+            # Property names keep their order: it is part of the tool definition.
             if isinstance(value, dict):
+                items = list(value.items())
+                if not in_properties:
+                    items.reverse()
                 return {
-                    key: reverse_object_keys(child)
-                    for key, child in reversed(list(value.items()))
+                    key: reverse_object_keys(
+                        child, in_properties=key == "properties" and not in_properties
+                    )
+                    for key, child in items
                 }
             if isinstance(value, list):
                 return [reverse_object_keys(child) for child in value]
@@ -606,6 +612,9 @@ class TestConvertToolsForTemplate:
         assert template.render(tools=converted) == template.render(tools=reordered)
         assert [json.dumps(tools), json.dumps(reordered_tools)] == originals
         parameters = converted[0]["function"]["parameters"]
+        assert list(parameters) == ["type", "properties", "required", "anyOf"]
+        assert list(parameters["properties"]) == ["query", "filters"]
+        assert list(parameters["properties"]["query"]) == ["type", "description"]
         assert parameters["required"] == ["query", "filters"]
         assert [item["type"] for item in parameters["anyOf"]] == ["string", "number"]
 
@@ -1660,6 +1669,65 @@ def test_recovery_candidate_payload_versus_quoted_marker(markers, text, is_paylo
     assert f.take_recovery_candidate()
 
 
+def test_recovery_candidate_unclosed_envelope_3153_is_payload():
+    """Issue #3153 sample is a truncated call payload, not quoted-marker prose.
+
+    Option 1 recovery is not attempted here: the sample has no closing tags
+    and uses bare query= rather than <parameter=query>.
+    """
+    sample = (
+        "I have comprehensive material. Let me do one final targeted check...\n"
+        "\n"
+        "<tool_call>\n"
+        "<function=websearch>\n"
+        'query="Flowable Work platform-api analytics process-instance query '
+        'endpoint frequency duration chart data REST" numResults=5'
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "websearch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    f = ToolCallStreamFilter(_make_tokenizer(), tools=tools)
+    visible = f.feed(sample) + f.finish()
+
+    assert "<tool_call>" not in visible
+    assert f.recovery_candidate_is_payload() is True
+    assert f.take_recovery_candidate().startswith("<tool_call>")
+
+
+@pytest.mark.parametrize(
+    "text,is_payload",
+    [
+        # Coding-agent tool names are common words: in prose they are not a call.
+        ("<tool_call>`, which the parser will read first. END", False),
+        ("<tool_call> opens the call; the model must write the name next. END", False),
+        ("<tool_call> then write to save. END", False),
+        # In call position, right after the opener, they still are.
+        ('<tool_call>write(content="hel', True),
+        ("<tool_call>\nread\n<arg_key>path</arg_key>", True),
+        ("<tool_call>  edit", True),
+        # MiniCPM5's opener ends at "name=", so the name follows a quote.
+        ('<function name="write"><param name="content">hel', True),
+    ],
+)
+def test_declared_tool_name_is_call_evidence_only_in_call_position(text, is_payload):
+    tokenizer = _make_tokenizer_with_end("<function name=", "</function>")
+    f = ToolCallStreamFilter(tokenizer, tools=["read", "write", "edit", "bash"])
+    f.feed(text)
+    f.finish()
+
+    assert f.recovery_candidate_is_payload() is is_payload
+    assert f.take_recovery_candidate()
+
+
 def test_close_marker_fallback_rescans_the_recovered_tail():
     """Prose recovered after a close marker is re-filtered, not emitted raw."""
     f = ToolCallStreamFilter(_make_tokenizer())
@@ -2633,6 +2701,25 @@ class TestThinkingFallbackGuardRegression:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].function.name == "write_file"
         assert result.tool_calls_from_thinking is True
+
+    def test_undeclared_thinking_call_drop_is_logged(self, caplog):
+        """The reasoning filter removes the envelope, so the drop must be
+        visible in the log (#4933)."""
+        thinking = (
+            "Let me read the log. "
+            '<tool_call>{"name": "Read", "arguments": {"path": "/tmp/a.log"}}'
+            "</tool_call>"
+        )
+        tools = [{"type": "function", "function": {"name": "read"}}]
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            result = extract_tool_calls_with_thinking(
+                thinking, "", tokenizer=_make_tokenizer(), tools=tools
+            )
+
+        assert result.tool_calls is None
+        assert result.cleaned_thinking == "Let me read the log."
+        assert "undeclared names: ['Read']" in caplog.text
 
     def test_empty_tools_list_drops_thinking_calls_no_regular(self):
         """tools=[] means 'no tools allowed' — drop thinking-embedded calls
@@ -5326,10 +5413,19 @@ class TestAttributeStyleFunctionDialect:
         '<function name="read"><param name="path">/workspace/TASK.md</param>'
         "</function>"
     )
+    # MiMo writes compact qwen3_coder calls and sometimes MiniMax-style
+    # <invoke> elements without their <minimax:tool_call> wrapper (#4933).
+    MIMO_TEMPLATE = "{{- '<tool_call><function=' ~ tool_call.name ~ '>' -}}"
+    BARE_INVOKE = (
+        '<invoke name="read">\n<parameter name="path">/workspace/TASK.md'
+        "</parameter>\n</invoke>"
+    )
 
-    def _tokenizer(self):
+    def _tokenizer(self, chat_template=None):
         tok = MagicMock(spec=[])
         tok.has_tool_calling = False
+        if chat_template is not None:
+            tok.chat_template = chat_template
         return tok
 
     def test_bare_element_parses_with_declared_tool(self):
@@ -5352,6 +5448,31 @@ class TestAttributeStyleFunctionDialect:
         assert "function" not in cleaned
         assert "I'll read the file." in cleaned
         assert "Standing by." in cleaned
+
+    def test_bare_invoke_parses_for_mimo_template(self):
+        text = f"I'll read the file. {self.BARE_INVOKE} Standing by."
+        cleaned, calls = parse_tool_calls(
+            text, self._tokenizer(self.MIMO_TEMPLATE), [self.READ_TOOL]
+        )
+        assert [c.function.name for c in calls] == ["read"]
+        assert json.loads(calls[0].function.arguments) == {"path": "/workspace/TASK.md"}
+        assert "invoke" not in cleaned
+        assert "I'll read the file." in cleaned
+        assert "Standing by." in cleaned
+
+    @pytest.mark.parametrize(
+        "chat_template, name",
+        [(None, "read"), (MIMO_TEMPLATE, "evil")],
+        ids=["other-template", "undeclared-name"],
+    )
+    def test_bare_invoke_left_as_text(self, chat_template, name):
+        text = f'<invoke name="{name}"><parameter name="path">/x</parameter></invoke>'
+        tok = self._tokenizer(chat_template)
+        cleaned, calls = parse_tool_calls(text, tok, [self.READ_TOOL])
+        assert calls is None
+        assert cleaned == text
+        f = ToolCallStreamFilter(tok, tools=[self.READ_TOOL])
+        assert f.feed(text) + f.finish() == text
 
     def test_parameter_spelling_variant(self):
         text = (
@@ -5437,6 +5558,21 @@ class TestAttributeStyleFunctionDialect:
             'ion name="read"><param name="pa',
             'th">/x</param></funct',
             "ion>",
+            " Done.",
+        ]
+        out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
+        assert out == "Sure.  Done."
+
+    def test_stream_filter_suppresses_bare_invoke_across_chunks(self):
+        f = ToolCallStreamFilter(
+            self._tokenizer(self.MIMO_TEMPLATE), tools=[self.READ_TOOL]
+        )
+        chunks = [
+            "Sure. ",
+            "<inv",
+            'oke name="re',
+            'ad">\n<parameter name="path">/x</parameter>\n</inv',
+            "oke>",
             " Done.",
         ]
         out = "".join(f.feed(chunk) for chunk in chunks) + f.finish()
@@ -5902,6 +6038,32 @@ def test_native_union_parameter_keeps_correct_python_literal_values(
 
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '["a"]\n["b"]',
+        '"[\\"a\\"]\\n[\\"b\\"]"',
+        '"[\\"a\\"]\\n[\\"b\\"]',
+    ],
+)
+def test_native_array_parameter_merges_string_fragments(raw):
+    tools = [
+        {
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "properties": {"v": {"type": "array", "items": {"type": "string"}}}
+                },
+            }
+        }
+    ]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        _qwen_parser_tokenizer("mlx_lm.tool_parsers.qwen3_coder"),
+        tools,
+    )
+    assert json.loads(calls[0].function.arguments)["v"] == ["a", "b"]
+
 def test_stream_filter_suppresses_envelope_with_long_tool_name():
     name = "t" * 120
     f = ToolCallStreamFilter(_make_tokenizer(), tools={name})
@@ -5933,3 +6095,21 @@ def test_qwen_missing_outer_close_does_not_merge_next_call():
     decoded = [(c.function.name, c.function.arguments) for c in calls]
     assert decoded == [("f", '{"a": "one"}'), ("f", '{"a": "two"}')]
     assert errors == ()
+
+
+@pytest.mark.parametrize(
+    "think_start, expected",
+    [
+        ("<think>", "Strip ```` spans."),
+        ("<mm:think>", "Strip ``<think>...</think>`` spans."),
+    ],
+)
+def test_think_tags_in_the_answer_survive_for_leading_thinking_models(
+    think_start, expected
+):
+    tok = _make_tokenizer()
+    tok.think_start = think_start
+    cleaned, calls = parse_tool_calls("Strip ``<think>...</think>`` spans.", tok, None)
+    assert calls is None
+    assert cleaned == expected
+

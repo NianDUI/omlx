@@ -87,6 +87,10 @@ final class OMLXClient: ObservableObject {
         try await post("/admin/api/global-settings", body: patch)
     }
 
+    func testWebSearch(_ settings: WebSearchTestRequest) async throws -> WebSearchTestResponse {
+        try await post("/admin/api/web-search/test", body: settings, timeout: 60)
+    }
+
     func getServerInfo() async throws -> ServerInfoDTO {
         try await get("/admin/api/server-info")
     }
@@ -173,6 +177,10 @@ final class OMLXClient: ObservableObject {
         try await get(AdminAPI.modelGenerationConfig(id))
     }
 
+    func listLoRAAdapters(id: String) async throws -> LoRAAdapterListResponse {
+        try await get(AdminAPI.modelLoRAAdapters(id))
+    }
+
     /// Server-side lookup of the best omlx.ai benchmarks for this device
     /// and model (proxied like the preset refresh).
     func listOptimalCandidates(id: String) async throws -> OptimalCandidatesDTO {
@@ -193,6 +201,30 @@ final class OMLXClient: ObservableObject {
     @discardableResult
     func importMtplxSidecar(id: String) async throws -> SimpleStatusResponse {
         try await postEmpty(AdminAPI.importMtplx(id))
+    }
+
+    // MARK: - Prefill Accelerator
+
+    func prefillHelperCandidates(id: String) async throws -> PrefillHelperCandidatesDTO {
+        try await get(AdminAPI.prefillHelperCandidates, query: [URLQueryItem(name: "model_id", value: id)])
+    }
+
+    func prefillHelperStatus(id: String) async throws -> PrefillHelperStatusDTO {
+        try await get(AdminAPI.prefillHelperStatus(id))
+    }
+
+    /// `action` is copy, retry or stop.
+    func prefillHelperAction(id: String, action: String) async throws -> PrefillHelperStatusDTO {
+        try await postEmpty(AdminAPI.prefillHelperAction(id, action))
+    }
+
+    func prefillLending() async throws -> PrefillLendingDTO {
+        try await get(AdminAPI.prefillLending)
+    }
+
+    @discardableResult
+    func stopPrefillLending() async throws -> PrefillLendingDTO {
+        try await postEmpty(AdminAPI.prefillLendingStop)
     }
 
     func listModelProfiles(id: String) async throws -> ProfileListResponse {
@@ -249,9 +281,21 @@ final class OMLXClient: ObservableObject {
         try await get(AdminAPI.hfTasks)
     }
 
-    func startHFDownload(repoId: String, hfToken: String = "") async throws -> StartHFDownloadResponse {
+    func listHFLocalModels() async throws -> HFLocalModelsResponse {
+        try await get(AdminAPI.hfModels)
+    }
+
+    func checkHFModelUpdates(repoIds: [String]) async throws -> HFUpdateCheckResponse {
+        try await post(AdminAPI.hfUpdates, body: HFUpdateCheckRequest(repoIds: repoIds), timeout: 120)
+    }
+
+    func startHFDownload(
+        repoId: String,
+        hfToken: String = "",
+        files: [String]? = nil
+    ) async throws -> StartHFDownloadResponse {
         try await post(AdminAPI.hfDownload, body: StartHFDownloadRequest(
-            repoId: repoId, hfToken: hfToken
+            repoId: repoId, hfToken: hfToken, files: files
         ))
     }
 
@@ -270,9 +314,9 @@ final class OMLXClient: ObservableObject {
         try await delete(AdminAPI.hfTask(taskId))
     }
 
-    func getHFRecommended(mlxOnly: Bool = true) async throws -> HFRecommendedResponse {
+    func getHFRecommended(modelFormat: HFModelFormat = .mlx) async throws -> HFRecommendedResponse {
         try await get(AdminAPI.hfRecommended, query: [
-            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+            URLQueryItem(name: "model_format", value: modelFormat.rawValue),
         ])
     }
 
@@ -284,13 +328,13 @@ final class OMLXClient: ObservableObject {
         query: String,
         sort: String = "trending",
         limit: Int = 20,
-        mlxOnly: Bool = true
+        modelFormat: HFModelFormat = .mlx
     ) async throws -> HFSearchResponse {
         try await get(AdminAPI.hfSearch, query: [
             URLQueryItem(name: "q", value: query),
             URLQueryItem(name: "sort", value: sort),
             URLQueryItem(name: "limit", value: String(limit)),
-            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+            URLQueryItem(name: "model_format", value: modelFormat.rawValue),
         ])
     }
 
@@ -563,9 +607,11 @@ final class OMLXClient: ObservableObject {
         try await request("GET", path: path, query: query, body: nil)
     }
 
-    private func post<U: Encodable, T: Decodable>(_ path: String, body: U) async throws -> T {
+    private func post<U: Encodable, T: Decodable>(
+        _ path: String, body: U, timeout: TimeInterval? = nil
+    ) async throws -> T {
         let data = try encoder.encode(body)
-        return try await request("POST", path: path, body: data)
+        return try await request("POST", path: path, body: data, timeout: timeout)
     }
 
     private func put<U: Encodable, T: Decodable>(_ path: String, body: U) async throws -> T {
@@ -594,6 +640,7 @@ final class OMLXClient: ObservableObject {
         path: String,
         query: [URLQueryItem] = [],
         body: Data?,
+        timeout: TimeInterval? = nil,
         isRetry: Bool = false
     ) async throws -> T {
         var components = URLComponents()
@@ -605,6 +652,7 @@ final class OMLXClient: ObservableObject {
         guard let url = components.url else { throw OMLXClientError.invalidURL }
 
         var req = URLRequest(url: url)
+        if let timeout { req.timeoutInterval = timeout }
         req.httpMethod = method
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         if body != nil {
@@ -620,7 +668,7 @@ final class OMLXClient: ObservableObject {
                 throw OMLXClientError.unauthenticated
             }
             try await login(apiKey: key)
-            return try await request(method, path: path, query: query, body: body, isRetry: true)
+            return try await request(method, path: path, query: query, body: body, timeout: timeout, isRetry: true)
         }
 
         guard 200..<300 ~= http.statusCode else {

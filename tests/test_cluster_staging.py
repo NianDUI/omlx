@@ -2,6 +2,7 @@
 """Staging must send each Mac its layers' shards and nothing else."""
 
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -15,6 +16,8 @@ from omlx.cluster.staging import (
     _REMOTE_FILE_SIZES_SNIPPET,
     _REMOTE_INSTALL_SNIPPET,
     ShardInfo,
+    fabric_transfer_address,
+    home_relative_model_path,
     index_shards,
     plan_cluster_staging,
     plan_staging,
@@ -85,6 +88,26 @@ def test_a_stage_gets_only_its_shards_plus_shared(tmp_path):
     assert "model-00006.safetensors" in names
     assert "model-shared.safetensors" in names, "embeddings/lm_head always travel"
     assert "model-00000.safetensors" not in names, "must not ship other stages' layers"
+
+
+def test_vision_only_shards_are_not_staged_or_required(tmp_path):
+    """Ranks load the text model only, so the vision tower never travels."""
+
+    root = _model(tmp_path / "m", layers=8, per_file=2, with_index=True)
+    vision = [
+        "vision_tower.blocks.6.attn.qkv.weight",
+        "vision_tower.patch_embed.weight",
+    ]
+    _write_shard(root, "model-vision.safetensors", vision)
+    index = json.loads((root / "model.safetensors.index.json").read_text())
+    index["weight_map"].update(dict.fromkeys(vision, "model-vision.safetensors"))
+    (root / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    staged = {s.name for s in shards_for_stage(index_shards(root), 6, 8)}
+    (root / "model-vision.safetensors").unlink()
+
+    assert "model-vision.safetensors" not in staged
+    assert validate_staged_model(root, 6, 8)["stage_ready"] is True
 
 
 def test_plan_reports_the_saving(tmp_path):
@@ -187,6 +210,64 @@ def test_remote_pull_does_not_expose_the_final_name_until_scp_finishes(
 
     assert (destination / "weights.safetensors").read_bytes() == b"complete"
     assert not list(destination.glob(".omlx-stage-*.part"))
+
+
+def test_copies_take_a_verified_fabric_address_with_the_paired_host_key(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "weights.safetensors").write_bytes(b"complete")
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        answered = command[0] != "ssh" or command[-2] != "me@10.0.0.9"
+        return SimpleNamespace(returncode=0 if answered else 255, stderr="", stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    # IPv6 and an address where SSH does not answer are skipped.
+    address = fabric_transfer_address(
+        "me@studio.local", ["fe80::1", "10.0.0.9", "169.254.3.2"]
+    )
+    assert address == "169.254.3.2"
+    assert commands[-1][-2:] == ["me@169.254.3.2", "true"]
+    # OpenSSH keeps the first value, so the strict check precedes accept-new.
+    probe = commands[-1]
+    assert "HostKeyAlias=studio.local" in probe
+    assert probe.index("StrictHostKeyChecking=yes") < probe.index(
+        "StrictHostKeyChecking=accept-new"
+    )
+
+    commands.clear()
+    scp_push(
+        destination_host="me@studio.local",
+        source_dir=str(source),
+        destination_dir="/models/example",
+        filename="weights.safetensors",
+        transfer_address=address,
+    )
+    scp_command = next(command for command in commands if command[0] == "scp")
+    assert scp_command[-1].startswith("me@169.254.3.2:")
+    assert "HostKeyAlias=studio.local" in scp_command
+    # Commands around the copy keep the paired name.
+    assert all(c[-2] == "me@studio.local" for c in commands if c[0] == "ssh")
+
+    # A scoped link-local address is bracketed and resolved as IPv6.
+    commands.clear()
+    scp_push(
+        destination_host="me@studio.local",
+        source_dir=str(source),
+        destination_dir="/models/example",
+        filename="weights.safetensors",
+        transfer_address="fe80::2%bridge0",
+    )
+    scp_command = next(command for command in commands if command[0] == "scp")
+    assert scp_command[-1].startswith("me@[fe80::2%bridge0]:")
+    assert scp_command.index("AddressFamily=inet6") < scp_command.index(
+        "AddressFamily=inet"
+    )
 
 
 def test_remote_install_refuses_a_wrong_sized_partial_without_replacing_final(
@@ -313,7 +394,7 @@ def test_manifest_reads_the_exact_model_path_on_local_and_remote(tmp_path, monke
 
     assert manifest["ready"] is True
     assert all(node["missing_files"] == 0 for node in manifest["nodes"])
-    assert remote_calls == [("Studio.local", str(root))]
+    assert remote_calls == [("Studio.local", home_relative_model_path(str(root)))]
 
 
 def test_manifest_is_not_ready_when_a_remote_sidecar_is_missing(
@@ -629,6 +710,9 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
         ),
     )
 
+    routes_by_node = {}
+    monkeypatch.setattr(routes, "fabric_transfer_address", lambda _host, ips: ips[0])
+
     def fake_stage(
         plan,
         *,
@@ -639,7 +723,10 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
         destination_dir,
         parallel,
         progress,
+        source_address,
+        destination_address,
     ):
+        routes_by_node[plan.node_id] = (source_address, destination_address)
         if not expected_sizes:
             return StagingResult(node_id=plan.node_id)
         filename = next(iter(expected_sizes))
@@ -699,6 +786,8 @@ def test_stage_route_runs_a_model_by_node_job_with_live_progress(
 
     assert job["status"] == "completed", json.dumps(job, indent=2)
     assert job["ready"] is True
+    # The remote Mac receives its files over the verified fabric address.
+    assert routes_by_node["studio"] == (None, "10.0.0.2")
     assert job["nodes"]["local"]["status"] == "ready"
     assert job["nodes"]["studio"]["status"] == "ready"
     assert job["nodes"]["studio"]["files_completed"] == 1
@@ -782,6 +871,26 @@ def test_free_space_is_readable_for_a_path_that_does_not_exist_yet(tmp_path):
     from omlx.cluster.staging import free_disk_bytes
 
     assert free_disk_bytes(tmp_path / "not" / "created" / "yet") > 0
+
+
+def test_remote_free_space_reads_a_destination_that_does_not_exist_yet(
+    tmp_path, monkeypatch
+):
+    from omlx.cluster.staging import free_disk_bytes
+
+    real_run = subprocess.run
+
+    def run_on_this_mac(argv, **kwargs):
+        # The peer's shell, with tmp_path as its home directory.
+        return real_run(
+            ["/bin/sh", "-c", argv[-1]],
+            env={**os.environ, "HOME": str(tmp_path)},
+            **kwargs,
+        )
+
+    monkeypatch.setattr(subprocess, "run", run_on_this_mac)
+
+    assert free_disk_bytes("~/Models/not staged yet", ssh_target="studio") > 0
 
 
 def test_remote_default_uses_published_worker_shim(monkeypatch):

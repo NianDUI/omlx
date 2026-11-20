@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for the Enhanced Readability accessibility toggle.
+r"""Regression tests for the Enhanced Readability accessibility toggle.
 
 These are static-template assertions (no browser render, no server). They pin
 the three behaviors the upstream reviewer asked for:
@@ -103,14 +103,6 @@ def test_no_jinja_block_in_comment():
     # Official base.html has exactly one `{% block head %}`; our comment says
     # "the head block" in plain words, so count stays 1.
     assert BASE.count("{% block head %}") == 1
-
-
-def test_switch_below_theme_and_wired():
-    # Switch sits BELOW the Theme section (user requirement).
-    assert CHAT.index("chat.theme_label") < CHAT.index("chat.enhanced_readability")
-    assert "enhancedReadability" in CHAT
-    assert "setEnhancedReadability" in CHAT
-    assert "setEnhancedReadability(!enhancedReadability)" in CHAT
 
 
 def test_dashboard_theme_menu_controls_same_readability_setting():

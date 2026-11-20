@@ -9,9 +9,11 @@ This module provides HTTP routes for the admin panel including:
 """
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -34,11 +36,11 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    ValidationInfo,
     field_validator,
     model_validator,
 )
 
+from .. import gguf
 from .._version import __version__ as _omlx_version
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
@@ -50,9 +52,23 @@ from ..engine.splash import (
     find_splash_binary,
     inspect_splash_binary,
 )
+from ..engine.splash import (
+    scan_ssd_cache as scan_splash_ssd_cache,
+)
+from ..exceptions import (
+    InsufficientMemoryError,
+    ModelBusyError,
+    ModelLoadingError,
+    ModelNotFoundError,
+    ModelTooLargeError,
+    ModelUnavailableError,
+)
+from ..logging_config import console_log_level, is_console_handler
+from ..lora_adapters import adapter_info, compatibility_problem, is_adapter_dir
 from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
     _is_hf_cache_mlx_compatible,
+    _is_model_dir,
     _resolve_hf_cache_entry,
 )
 from ..model_discovery import model_display_name as _model_display_name
@@ -66,34 +82,46 @@ from ..model_settings import (
     ModelSettings,
     ane_prefill_backend,
     ane_prefill_fraction,
+    lora_adapter_conflict,
+    resolve_lora_conflicts,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
     validate_ane_prefill,
     validate_moe_expert_offload,
     MOE_OFFLOAD_MTP_MODEL_TYPES,
     merge_chat_template_kwargs,
+    oq_a8_model_supported,
     validate_kv_compression_settings,
 )
+from ..oqh.format import is_oqh_checkpoint
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
 from ..patches.moe_offload_compat import moe_offload_compatibility
+from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
+from ..prefill_helper.routes import helper_status as prefill_helper_status
+from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
+from ..request import live_decode_rate
 from ..settings import (
     BURST_DECODE_MODES,
+    SPLASH_ACTIVATIONS,
     SPLASH_KV_FORMATS,
+    ConcurrentPriority,
     SubKeyEntry,
     burst_decode_env,
 )
+from ..utils import gpu_power
 from ..utils.fatal import is_command_buffer_error
 from ..utils.hardware import (
     compute_owner_hash,
+    get_apple_gpu_generation,
     get_chip_name,
     get_gpu_core_count,
     get_io_platform_uuid,
     get_total_memory_gb,
     parse_chip_info,
 )
-from ..utils.model_loading import dflash_compatibility
+from ..utils.model_loading import checkpoint_has_bf16_leaves, dflash_compatibility
 from ..utils.network import is_loopback_bind
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from ..websearch import (
@@ -124,6 +152,7 @@ from .benchmark import (
     _sanitize_upload_error,
     _upload_model_name,
 )
+from .hf_downloader import MODEL_FORMATS, _is_repo_id
 from .recipe import (
     ALL_FIELDS,
     DEFAULTS,
@@ -227,21 +256,11 @@ print(deleted)
     return deleted, len(node_ids)
 
 
-def _oq_a8_model_supported(config_type: str | None) -> bool:
-    """True for the model families the oQ A8 prefill patch can route.
-
-    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``) matches
-    exactly: only that validated checkpoint family has routed-expert A8, so a
-    ``qwen4`` prefix would admit unvalidated models.
-    """
-    config_type = str(config_type or "").lower().replace("-", "_")
-    return config_type == "qwen4_exp" or config_type.startswith(
-        ("qwen3_5", "qwen3_6", "qwen3_8")
-    )
+_oq_a8_model_supported = oq_a8_model_supported
 
 
 def _oq_a8_kernels_available() -> bool:
-    """True when the oQ A8 prefill kernels can actually run on this host.
+    """True when the A8 prefill kernels can actually run on this host.
 
     Enabling the setting on a machine without tensor units would leave every
     projection falling back, so the save is refused rather than accepted into
@@ -344,6 +363,67 @@ def _draft_path_is_unusable(value: str) -> bool:
     ) and not (path / "config.json").is_file()
 
 
+# Features whose draft model is stored next to an on/off toggle.
+_DRAFT_FEATURES = ("dflash", "specprefill", "vlm_mtp")
+
+
+def _model_config(entry) -> dict:
+    try:
+        config = json.loads((Path(entry.model_path) / "config.json").read_text())
+    except (OSError, ValueError, TypeError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def _draft_usability_problem(
+    settings: dict[str, Any], touched: set[str], entry=None
+) -> str | None:
+    """Return why a draft in ``settings`` cannot be used, or None to proceed.
+
+    A draft may stay parked while its feature is off (#4217): every settings
+    save re-sends the whole payload, so a draft directory deleted from disk
+    must not reject changes that never enable the feature. The check fires
+    only when the resulting state has the feature on *and* the change touches
+    that feature or its draft. ``touched`` is the set of fields the caller's
+    request (or the profile being saved) names.
+    """
+    for feature in _DRAFT_FEATURES:
+        enabled_key = f"{feature}_enabled"
+        draft_key = f"{feature}_draft_model"
+        if enabled_key not in touched and draft_key not in touched:
+            continue
+        draft = settings.get(draft_key)
+        if settings.get(enabled_key) and draft and _draft_path_is_unusable(draft):
+            return f"Draft model has no config.json: {draft}"
+    # The adapter path is its own toggle, so the same rule checks it when named.
+    adapter = settings.get("lora_adapter")
+    if adapter and "lora_adapter" in touched:
+        info = adapter_info(adapter)
+        if info is None:
+            return f"No LoRA adapter (adapter_config.json) at {adapter}"
+        problem = info.problem
+        if problem is None and entry is not None:
+            problem = compatibility_problem(info, _model_config(entry))
+        if problem:
+            return f"LoRA adapter {adapter}: {problem}"
+    return None
+
+
+def _profile_draft_problem(mgr, model_id: str, settings: dict, exposed) -> str | None:
+    """Check a profile's drafts in the state it will run with.
+
+    An exposed profile is merged over the base model's settings at request
+    time, so a draft it parks still loads when the base has the feature on.
+    """
+    merged = dict(settings)
+    if exposed:
+        base = mgr.get_settings(model_id).to_dict()
+        merged = {**base, **filter_profile_fields(settings)}
+    pool = _get_engine_pool()
+    entry = pool.get_entry(model_id) if pool is not None else None
+    return _draft_usability_problem(merged, set(settings), entry)
+
+
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
@@ -352,7 +432,7 @@ class ModelSettingsRequest(BaseModel):
     model_alias: str | None = None
     model_type_override: str | None = None
     max_context_window: int | None = None
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, ge=1)
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -374,11 +454,16 @@ class ModelSettingsRequest(BaseModel):
     qwen4_gdn_decode_wide_proj: bool | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
     deepseek_v41_ced_prefill_enabled: bool | None = None
+    prefill_helper_node_id: str | None = None
+    prefill_helper_layers: int | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
+    gpu_power_limit_w: int | None = None
     mtp_adaptive_max_depth: int | None = None
     # Fixed Lightning MTP draft depth (None = adaptive).
     mtp_fixed_depth: int | None = None
+    # Recast the checkpoint's bfloat16 leaves to float16 after load
+    activation_fp16_enabled: bool | None = None
     # KV cache compression
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_scheme: str | None = None
@@ -402,9 +487,9 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
-    # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8 and Qwen3.8 Flash-Next)
-    qwen35_oq_a8_enabled: bool | None = None
-    qwen35_oq_a8_min_tokens: int | None = None
+    # A8 prefill (Qwen3.5/3.6/3.8, Qwen3.8 Flash-Next, DeepSeek V4.1, MiniMax M3)
+    a8_prefill_enabled: bool | None = None
+    a8_prefill_min_tokens: int | None = None
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool | None = None
     moe_expert_offload_resident_fraction: float | None = None
@@ -430,6 +515,7 @@ class ModelSettingsRequest(BaseModel):
     vlm_mtp_enabled: bool | None = None
     vlm_mtp_draft_model: str | None = None
     vlm_mtp_draft_block_size: int | None = None
+    lora_adapter: str | None = None
     reasoning_parser: str | None = None
     guided_grammar_enabled: bool | None = None
     guided_grammar: str | None = None
@@ -449,6 +535,19 @@ class ModelSettingsRequest(BaseModel):
             return 4 if value == 0 else None
         if value not in (2, 2.5, 3, 3.5, 4, 6, 8):
             raise ValueError("turboquant_kv_bits must be 2, 2.5, 3, 3.5, 4, 6, or 8")
+        return value
+
+    @field_validator("gpu_power_limit_w")
+    @classmethod
+    def validate_gpu_power_limit(cls, value: int | None) -> int | None:
+        # Profiles and templates reuse this model, so the range applies to them too.
+        if value is None or value <= 0:
+            return None
+        if not gpu_power.MIN_WATTS <= value <= gpu_power.MAX_WATTS:
+            raise ValueError(
+                f"gpu_power_limit_w must be between {gpu_power.MIN_WATTS} and "
+                f"{gpu_power.MAX_WATTS} W, or 0 to turn it off"
+            )
         return value
 
     @field_validator("dflash_verify_mode")
@@ -476,16 +575,19 @@ class ModelSettingsRequest(BaseModel):
         return value
 
     @field_validator(
-        "specprefill_draft_model", "dflash_draft_model", "vlm_mtp_draft_model"
+        "specprefill_draft_model",
+        "dflash_draft_model",
+        "vlm_mtp_draft_model",
+        "lora_adapter",
     )
     @classmethod
-    def validate_draft_path(cls, value: str | None, info: ValidationInfo) -> str | None:
-        if not value:
-            return None
-        # A DFlash draft may stay parked while DFlash is off; the route checks it.
-        if info.field_name != "dflash_draft_model" and _draft_path_is_unusable(value):
-            raise ValueError(f"Draft model has no config.json: {value}")
-        return value
+    def validate_draft_path(cls, value: str | None) -> str | None:
+        # "" means "no draft"; usability depends on the feature toggle and on
+        # the state a save leaves behind, so the routes check it through
+        # _draft_usability_problem. Raising here would reject every
+        # whole-payload save, including saves that never touch the draft
+        # (#4217).
+        return value or None
 
 
 def _normalize_profile_settings(
@@ -580,6 +682,29 @@ class UpdateTemplateRequest(BaseModel):
         return _normalize_profile_settings(value, universal=True)
 
 
+_THEME_TOKEN = re.compile(r"[a-z][a-z0-9-]{0,47}")
+_THEME_HEX = re.compile(r"#[0-9a-f]{6}")
+
+
+class CustomThemeRequest(BaseModel):
+    """Saved color token overrides for the light and dark web UI themes."""
+
+    # omlx_web owns the token list and the contrast floor; check only the shape.
+    light: dict[str, str] = Field(default_factory=dict, max_length=64)
+    dark: dict[str, str] = Field(default_factory=dict, max_length=64)
+
+    @field_validator("light", "dark")
+    @classmethod
+    def _opaque_hex(cls, colors: dict[str, str]) -> dict[str, str]:
+        clean = {}
+        for token, value in colors.items():
+            color = value.strip().lower()
+            if not _THEME_TOKEN.fullmatch(token) or not _THEME_HEX.fullmatch(color):
+                raise ValueError(f"{token!r}: expected a token name and #rrggbb")
+            clean[token] = color
+        return clean
+
+
 # Dashboard layout grid contract. Keep in sync with static/js/dashboard_layout.js.
 DASHBOARD_COLUMNS = 24
 DASHBOARD_BLOCK_MIN_W = 6
@@ -589,7 +714,6 @@ DASHBOARD_BLOCK_IDS = (
     "active_models",
     "cache_observability",
     "api_endpoints",
-    "claude_code",
     "applications",
     "engine_versions",
 )
@@ -669,6 +793,7 @@ class GlobalSettingsRequest(BaseModel):
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
     gpu_keep_warm_interval: float | None = None
+    gpu_keep_warm_idle_window: float | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
 
@@ -692,6 +817,8 @@ class GlobalSettingsRequest(BaseModel):
     embedding_batch_size: int | None = None
     chunked_prefill: bool | None = None
     prefill_priority: str | None = None  # "context" | "speed"
+    concurrent_priority: ConcurrentPriority | None = None
+    # Older on/off form of concurrent_priority.
     decode_fairness: bool | None = None
 
     # Cache settings
@@ -731,7 +858,7 @@ class GlobalSettingsRequest(BaseModel):
     # Sampling defaults
     sampling_max_context_window: int | None = None
     sampling_max_context_window_policy: int | None = Field(default=None, ge=1)
-    sampling_max_tokens: int | None = None
+    sampling_max_tokens: int | None = Field(default=None, ge=1)
     sampling_temperature: float | None = None
     sampling_top_p: float | None = None
     sampling_top_k: int | None = None
@@ -776,6 +903,7 @@ class GlobalSettingsRequest(BaseModel):
     # External engines: Splash. An empty path means automatic detection.
     splash_path: str | None = None
     splash_kv_format: str | None = None
+    splash_activations: str | None = None
     splash_max_memory_gb: float | None = None
     splash_ssd_cache_gb: float | None = None
     splash_ane_prefill: bool | None = None
@@ -784,6 +912,8 @@ class GlobalSettingsRequest(BaseModel):
     ui_language: str | None = None
     # Explicit null restores the default dashboard layout.
     ui_dashboard_layout: DashboardLayoutRequest | None = None
+    # Explicit null restores the stock colors.
+    ui_custom_theme: CustomThemeRequest | None = None
 
     # Idle timeout settings. null/0/"" disables the global fallback.
     idle_timeout_seconds: int | None = Field(default=None, ge=60)
@@ -807,6 +937,14 @@ class HFDownloadRequest(BaseModel):
     """Request model for starting a HuggingFace model download."""
 
     repo_id: str
+    hf_token: str = ""
+    files: list[str] | None = None
+
+
+class HFUpdateCheckRequest(BaseModel):
+    """Request model for checking downloaded models for Hub updates."""
+
+    repo_ids: list[str]
     hf_token: str = ""
 
 
@@ -847,6 +985,8 @@ class OQStartRequest(BaseModel):
     imatrix_num_samples: int = 128
     imatrix_seq_length: int = 512
     mtp_assistant_model_path: str = ""
+    preserve_ngram_table: bool = False
+    hadamard: bool = False
 
 
 class HFUploadRequest(BaseModel):
@@ -908,6 +1048,9 @@ def _parse_hot_cache_max_size(value: str) -> int:
 _PAROQUANT_REASON = "Not supported on paroquant models yet (compatibility not verified)"
 
 
+_OQH_PREFILL_REASON = "A8 and ANE prefill do not read oQh weights."
+
+
 def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
     """Detect whether a model is paroquant-quantized.
 
@@ -936,14 +1079,17 @@ def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
     return False, ""
 
 
+# ParoQuant targets whose rotated layers are checked on the DFlash verify path.
+_PAROQUANT_DFLASH_MODEL_TYPES = {"qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe"}
+
+
 def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     """Resolve dflash compatibility for an engine_pool model dict."""
+    model_type = model_info.get("config_model_type")
     is_paro, paro_reason = _paroquant_compat_for_model(model_info)
-    if is_paro:
+    if is_paro and model_type not in _PAROQUANT_DFLASH_MODEL_TYPES:
         return False, paro_reason
-    return dflash_compatibility(
-        model_info.get("config_model_type"), model_info.get("engine_type")
-    )
+    return dflash_compatibility(model_type, model_info.get("engine_type"))
 
 
 def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list[dict]:
@@ -953,12 +1099,19 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
     if model_info.get("is_helper"):
         return []
     target, reason = engine_pool.splash_target(model_info["id"], settings)
+    draft_repo = (
+        engine_pool.splash_draft_to_download(model_info["id"], settings)
+        if target is None
+        else None
+    )
     return [
         {
             "id": engine_id,
             "label": label,
             "compatible": target is not None,
             "reason": reason,
+            # The draft the engine needs that a download provides.
+            "draft_repo": draft_repo,
         }
         for engine_id, label in EXTERNAL_ENGINES.items()
     ]
@@ -1000,6 +1153,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_verify_mode",
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
+        "lora_adapter",
     )
     for key in unsupported_none_fields:
         settings[key] = None
@@ -1105,11 +1259,22 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.vlm_mtp_draft_block_size = None
 
 
-def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
+_MTP_EXTERNAL_ENGINE_REASON = (
+    "MTP is not used when an external engine serves this model"
+)
+
+
+def _mtp_compat_for_model(
+    model_info: dict, external_engine: str | None = None
+) -> tuple[bool, str]:
     """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
 
     Returns ``(compatible, reason)``. Reason is empty on success and
     suitable for surfacing to users (admin UI shows it under the toggle).
+
+    ``external_engine`` is the engine that serves the model, if its settings
+    pick one. Lightning MTP runs in this process, so the external engine's own
+    speculation is used instead and the head is never read (issue #5146).
 
     The check is conservative: even when the config declares MTP layers
     we also peek at the safetensors weight index to verify that the
@@ -1129,6 +1294,9 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
         _is_mtp_compatible,
     )
 
+    if external_engine:
+        return False, _MTP_EXTERNAL_ENGINE_REASON
+
     is_paro, paro_reason = _paroquant_compat_for_model(model_info)
     if is_paro:
         return False, paro_reason
@@ -1144,6 +1312,20 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     except Exception as e:
         return False, f"failed to read config: {e}"
     model_type = cfg.get("model_type")
+    if model_type in ("minimax_m3", "minimax_m3_vl"):
+        # MiniMax M3.1 ships its DSpark draft in a dspark/ folder instead of
+        # declaring MTP heads in the target config.
+        from ..patches.minimax_m3_dspark import bundled_dspark_path
+
+        if bundled_dspark_path(model_path) is not None:
+            return True, ""
+        return False, "MiniMax checkpoint has no bundled dspark/ draft"
+    if model_type == "inkling2":
+        from ..patches.inkling2.dspark import bundled_inkling2_dspark_path
+
+        if bundled_inkling2_dspark_path(model_path) is not None:
+            return True, ""
+        return False, "Inkling 2 checkpoint has no bundled mtp.safetensors draft"
     if not _has_mtp_heads(cfg):
         return False, "model has no MTP heads in config"
     # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through
@@ -1193,7 +1375,10 @@ def _apply_log_level_runtime(level: str) -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
     for handler in root_logger.handlers:
-        handler.setLevel(log_level)
+        if is_console_handler(handler):
+            handler.setLevel(console_log_level(log_level))
+        else:
+            handler.setLevel(log_level)
 
     # Update omlx-related loggers
     omlx_loggers = [
@@ -1396,8 +1581,6 @@ async def _apply_memory_guard_tier_runtime(
 
 async def _apply_cache_settings_runtime(
     enabled: bool | None,
-    ssd_cache_dir: str | None,
-    ssd_cache_max_size: str | None,
     global_settings,
     hot_cache_max_size: str | None = None,
 ) -> tuple[bool, str]:
@@ -1437,51 +1620,26 @@ async def _apply_cache_settings_runtime(
         global_settings.cache.initial_cache_blocks
     )
 
-    pool._scheduler_config.paged_ssd_cache_auto_size = (
-        ssd_cache_max_size or global_settings.cache.ssd_cache_max_size
-    ).lower() == "auto"
-
     # Update scheduler config based on cache settings
-    if enabled is False or (enabled is None and not global_settings.cache.enabled):
+    if (
+        enabled is False
+        or (enabled is None and not global_settings.cache.enabled)
+        or global_settings.cache.is_ssd_cache_dir_unavailable()
+    ):
         pool._scheduler_config.paged_ssd_cache_dir = None
         pool._scheduler_config.paged_ssd_cache_max_size = 0
     else:
-        # Cache is enabled
-        if ssd_cache_dir is not None:
-            pool._scheduler_config.paged_ssd_cache_dir = ssd_cache_dir
-        elif global_settings.cache.ssd_cache_dir:
-            pool._scheduler_config.paged_ssd_cache_dir = (
-                global_settings.cache.ssd_cache_dir
-            )
-        else:
-            # Use default cache dir
-            pool._scheduler_config.paged_ssd_cache_dir = str(
-                global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
-            )
-
-        if ssd_cache_max_size is not None:
-            # Handle "auto" value
-            if ssd_cache_max_size.lower() == "auto":
-                pool._scheduler_config.paged_ssd_cache_max_size = (
-                    global_settings.cache.get_ssd_cache_max_size_bytes(
-                        global_settings.base_path
-                    )
-                )
-            else:
-                pool._scheduler_config.paged_ssd_cache_max_size = parse_size(
-                    ssd_cache_max_size
-                )
-        elif global_settings.cache.ssd_cache_max_size:
-            # Use settings value (handles "auto")
-            pool._scheduler_config.paged_ssd_cache_max_size = (
-                global_settings.cache.get_ssd_cache_max_size_bytes(
-                    global_settings.base_path
-                )
-            )
-        elif global_settings.cache.ssd_cache_max_size:
-            pool._scheduler_config.paged_ssd_cache_max_size = parse_size(
-                global_settings.cache.ssd_cache_max_size
-            )
+        # global_settings already holds the requested dir and size.
+        cache_cfg = global_settings.cache
+        pool._scheduler_config.paged_ssd_cache_dir = str(
+            cache_cfg.get_ssd_cache_dir(global_settings.base_path)
+        )
+        pool._scheduler_config.paged_ssd_cache_max_size = (
+            cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+        )
+        pool._scheduler_config.paged_ssd_cache_auto_size = (
+            cache_cfg.ssd_cache_max_size.lower() == "auto"
+        )
 
     # Apply hot cache max size
     if hot_cache_max_size is not None:
@@ -1707,6 +1865,17 @@ def configured_ui_language() -> str:
     except Exception:
         pass
     return "en"
+
+
+def configured_custom_theme() -> dict[str, dict[str, str]] | None:
+    """Return the saved web UI color overrides, or None for the stock colors."""
+    try:
+        settings = _get_global_settings() if _get_global_settings else None
+        if settings:
+            return settings.ui.custom_theme
+    except Exception:
+        pass
+    return None
 
 
 def format_size(size_bytes: int) -> str:
@@ -2245,8 +2414,11 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
 _OMLX_THINKING_TOGGLE_TYPES = ("deepseek_v4", "minimax_m3")
 
 
-def _reasoning_levels(model_info: dict, model_type: str, forced: bool) -> list[str]:
+def reasoning_levels(model_info: dict) -> list[str]:
     """Return the chat reasoning slider stops, or [] when the model has none."""
+    model_type = (model_info.get("config_model_type") or "").lower().replace("-", "_")
+    # K2 Horizon always thinks, so it has no "off" stop.
+    forced = model_type == "k2_horizon"
     toggle = model_info.get("thinking_default") is not None or model_type.startswith(
         _OMLX_THINKING_TOGGLE_TYPES
     )
@@ -2271,6 +2443,12 @@ def _reasoning_levels(model_info: dict, model_type: str, forced: bool) -> list[s
     return levels
 
 
+def _prefill_helper_status(model_id: str) -> dict | None:
+    engine_pool = _get_engine_pool()
+    entry = engine_pool.get_entry(model_id) if engine_pool is not None else None
+    return prefill_helper_status(entry) if entry is not None else None
+
+
 def _model_options(model_info: dict, settings) -> dict:
     """Describe model controls once for the web and native settings clients."""
     model_type = (model_info.get("config_model_type") or "").lower().replace("-", "_")
@@ -2278,8 +2456,9 @@ def _model_options(model_info: dict, settings) -> dict:
     thinking_modes = ["auto", "on_limit"] if is_k2 else [
         "auto", "on_unlimit", "on_limit", "off"
     ]
+    oqh = is_oqh_checkpoint(model_info.get("model_path") or "")
     ane_backend = (
-        None if model_info.get("is_helper") else ane_prefill_backend(model_type)
+        None if model_info.get("is_helper") or oqh else ane_prefill_backend(model_type)
     )
     return {
         "thinking_forced": is_k2,
@@ -2289,16 +2468,19 @@ def _model_options(model_info: dict, settings) -> dict:
         ),
         "reasoning_effort_default": "high" if is_k2 else "low",
         "reasoning_effort_custom": not is_k2,
-        "reasoning_levels": _reasoning_levels(model_info, model_type, is_k2),
+        "reasoning_levels": reasoning_levels(model_info),
         "ane_prefill_backend": ane_backend,
         "ane_prefill_default_fraction": ane_prefill_fraction(None, model_type),
         "ane_prefill_mlp_fractions": [1 / 3, 0.5] if ane_backend == "k2" else [],
         "ane_prefill_shared_fractions": [0, 1 / 3, 1] if ane_backend == "k2" else [],
         "embedding_audio_supported": model_type == "embedding_gemma2",
         # Lets the settings UIs hide the toggle the save would reject.
-        "qwen35_oq_a8_supported": (
-            _oq_a8_model_supported(model_type) and _oq_a8_kernels_available()
+        "a8_prefill_supported": (
+            not oqh
+            and _oq_a8_model_supported(model_type)
+            and _oq_a8_kernels_available()
         ),
+        "gpu_power_limit_supported": gpu_power.gpu_power_cap_supported(),
     }
 
 
@@ -2371,19 +2553,26 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
     # Combine model info with settings
     models = []
+    # M1/M2 GPUs (families 13/14) have no native bf16 ALU path.
+    fp16_recast_gpu = get_apple_gpu_generation() in (13, 14)
     for model_info in models_status:
         model_id = model_info["id"]
         settings = all_settings.get(model_id)
 
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
-        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(
+            model_info, external_engine=getattr(settings, "external_engine", None)
+        )
         external_engines = _external_engines_for_model(
             engine_pool, model_info, settings
         )
         from ..patches.moe_offload_compat import moe_offload_compatibility
 
         moe_offload_supported, _ = moe_offload_compatibility(
+            model_info.get("model_path") or ""
+        )
+        activation_fp16_supported = fp16_recast_gpu and checkpoint_has_bf16_leaves(
             model_info.get("model_path") or ""
         )
         qwen4_ple_ssd_offload_supported = False
@@ -2466,6 +2655,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 model_info.get("model_path", ""),
                 model_dirs,
                 source_repo_id=model_info.get("source_repo_id"),
+                source_path=model_info.get("source_path"),
             ),
             "loaded": model_info.get("loaded", False),
             "is_loading": model_info.get("is_loading", False),
@@ -2494,6 +2684,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
+            "realtime_voice": bool(model_info.get("realtime_voice")),
             # Native context window from the model's config.json — used by
             # the context bench UI to hide targets the model cannot reach.
             "model_context_length": model_info.get("model_context_length"),
@@ -2502,6 +2693,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "reasoning_efforts": model_info.get("reasoning_efforts"),
             "source_type": model_info.get("source_type", "local"),
             "source_repo_id": model_info.get("source_repo_id"),
+            "model_format": model_info.get("model_format"),
+            "source_path": model_info.get("source_path"),
             "distributed": model_info.get("distributed", False),
             "cluster": model_info.get("cluster"),
             "last_access": model_info.get("last_access"),
@@ -2525,6 +2718,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "deepseek_v41_engram_mmap_bytes": v41_mmap_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
+            "activation_fp16_supported": activation_fp16_supported,
+            "prefill_helper_supported": stage_adapter_for(
+                model_info.get("config_model_type"),
+                model_info.get("engine_type"),
+                model_info.get("model_path"),
+            )
+            is not None,
+            "prefill_helper": _prefill_helper_status(model_id),
         }
 
         model_data.update(_model_options(model_data, settings))
@@ -2579,6 +2780,51 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     return {"models": models}
 
 
+@router.get("/api/models/{model_id}/lora-adapters")
+async def list_lora_adapters(model_id: str, is_admin: bool = Depends(require_admin)):
+    """LoRA adapters in the model folders, each with why it does not fit this model."""
+    entry = _require_model(model_id)
+    config = _model_config(entry)
+    engine_problem = (
+        None
+        if entry.engine_type in ("batched", "vlm")
+        else "LoRA adapters apply only to language and VLM models"
+    )
+
+    manager = _get_settings_manager()
+    selected = manager.get_settings(model_id).lora_adapter if manager else None
+
+    def _row(adapter_id: str, path: str) -> dict[str, Any] | None:
+        info = adapter_info(path)
+        if info is None:
+            return None
+        row = info.to_dict()
+        row["id"] = adapter_id
+        row["size_formatted"] = format_size(info.size)
+        row["problem"] = engine_problem or compatibility_problem(info, config)
+        return row
+
+    def _rows() -> list[dict[str, Any]]:
+        rows = [
+            row
+            for adapter_id, path in sorted(_get_engine_pool().lora_adapters().items())
+            if (row := _row(adapter_id, path)) is not None
+        ]
+        # The saved adapter may live elsewhere or be gone; the picker shows why.
+        if selected and not any(row["path"] == selected for row in rows):
+            row = _row(Path(selected).name, selected) or {
+                "id": Path(selected).name,
+                "path": selected,
+                "rank": 0,
+                "targets": [],
+                "problem": "the adapter folder was not found",
+            }
+            rows.append(row)
+        return rows
+
+    return {"adapters": await asyncio.to_thread(_rows)}
+
+
 @router.post("/api/models/{model_id}/unload")
 async def unload_model(
     model_id: str,
@@ -2611,6 +2857,40 @@ async def unload_model(
 
     logger.info("Manually unloaded model: %s", model_id)
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
+
+
+@router.post("/api/models/{model_id}/requests/{request_id}/abort")
+async def abort_model_request(
+    model_id: str,
+    request_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Stop one waiting, prefilling or generating request; the model stays loaded."""
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+    if entry.engine is None:
+        raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+    abort = getattr(entry.engine, "abort_request", None)
+    if not callable(abort):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model cannot stop a single request: {model_id}",
+        )
+
+    found = await abort(
+        request_id,
+        reason="Request stopped by the server admin",
+        error_code="admin_abort",
+    )
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Request not found: {request_id}")
+    logger.info("Admin stopped request %s on %s", request_id, model_id)
+    return {"status": "ok", "model_id": model_id, "request_id": request_id}
 
 
 async def _require_admin_or_bearer(request: Request) -> bool:
@@ -2673,11 +2953,56 @@ async def load_model(
 
     try:
         await engine_pool.get_engine(model_id)
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except (ModelTooLargeError, InsufficientMemoryError) as e:
+        # Both mean "cannot fit": too large for the ceiling, or no room even
+        # after eviction. Same mapping as the inference path in server.py.
+        raise HTTPException(status_code=507, detail=str(e))
+    except (ModelUnavailableError, ModelLoadingError, ModelBusyError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
+        # Some load failures are not EnginePoolError; keep their reason.
         raise HTTPException(status_code=500, detail=str(e))
 
     logger.info(f"Manually loaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
+
+
+@router.get("/api/models/{model_id}/moe-offload-fit")
+async def get_moe_offload_fit(
+    model_id: str,
+    mtp_enabled: bool | None = None,
+    qwen4_ple_ssd_offload: bool | None = None,
+    deepseek_v41_engram_ssd_offload: bool | None = None,
+    is_admin: bool = Depends(require_admin),
+):
+    """Largest expert-offload residency that leaves prompt room on this machine.
+
+    The query flags override saved settings that change the size estimate, so
+    unsaved edits in the dashboard are sized too.
+    """
+    entry = _require_model(model_id)
+    if not moe_offload_compatibility(entry.model_path)[0]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model does not support MoE expert offload: {model_id}",
+        )
+    settings_manager = _get_settings_manager()
+    saved = settings_manager.get_settings(model_id) if settings_manager else None
+    settings = copy.copy(saved) if saved is not None else ModelSettings()
+    for key, value in (
+        ("mtp_enabled", mtp_enabled),
+        ("qwen4_ple_ssd_offload", qwen4_ple_ssd_offload),
+        ("deepseek_v41_engram_ssd_offload", deepseek_v41_engram_ssd_offload),
+    ):
+        if value is not None:
+            setattr(settings, key, value)
+    pool = _get_engine_pool()
+    # Read the live ceiling here; the per-probe header scans run off the loop.
+    return await asyncio.to_thread(
+        pool.moe_offload_fit, entry, settings, pool._current_ceiling()
+    )
 
 
 @router.post("/api/models/{model_id}/import-mtplx")
@@ -2825,6 +3150,11 @@ async def update_model_settings(
         }
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
+        if override_value is not None and entry.model_format == "gguf":
+            raise HTTPException(
+                status_code=400,
+                detail="A GGUF model's type comes from its file",
+            )
         if override_value is not None and override_value not in valid_types:
             raise HTTPException(
                 status_code=400,
@@ -2883,9 +3213,24 @@ async def update_model_settings(
         current_settings.enable_thinking = request.enable_thinking
     if "deepseek_v41_ced_prefill_enabled" in sent:
         is_v41 = (entry.config_model_type or "").replace("-", "_").lower() == "deepseek_v41"
-        current_settings.deepseek_v41_ced_prefill_enabled = bool(
-            request.deepseek_v41_ced_prefill_enabled and is_v41
+        # Left unset elsewhere; unset means on for DeepSeek V4.1.
+        current_settings.deepseek_v41_ced_prefill_enabled = (
+            request.deepseek_v41_ced_prefill_enabled if is_v41 else None
         )
+    if "prefill_helper_node_id" in sent:
+        supported = stage_adapter_for(
+            entry.config_model_type, entry.engine_type, entry.model_path
+        )
+        current_settings.prefill_helper_node_id = (
+            (request.prefill_helper_node_id or None) if supported else None
+        )
+    if "prefill_helper_layers" in sent:
+        layers = request.prefill_helper_layers
+        if layers is not None and layers < 1:
+            raise HTTPException(
+                status_code=400, detail="prefill_helper_layers must be at least 1"
+            )
+        current_settings.prefill_helper_layers = layers
     if "qwen4_ple_ssd_offload" in sent:
         is_qwen4_exp = (entry.config_model_type or "").replace(
             "-", "_"
@@ -2917,6 +3262,8 @@ async def update_model_settings(
             if request.thinking_budget_tokens and request.thinking_budget_tokens > 0
             else None
         )
+    if "gpu_power_limit_w" in sent:
+        current_settings.gpu_power_limit_w = request.gpu_power_limit_w
     for name in ("mtp_adaptive_max_depth", "mtp_fixed_depth"):
         if name not in sent:
             continue
@@ -2946,6 +3293,11 @@ async def update_model_settings(
             request.index_cache_freq
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
+        )
+    # Load-time activation dtype recast
+    if "activation_fp16_enabled" in sent:
+        current_settings.activation_fp16_enabled = (
+            request.activation_fp16_enabled or False
         )
     # KV cache compression settings
     if "turboquant_kv_enabled" in sent:
@@ -3072,18 +3424,18 @@ async def update_model_settings(
         current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
             request.qwen35_ane_prefill_cpu_shared_resource
         )
-    # oQ mixed-bit QxA8 prefill. Load-time like the ANE controls above: the
+    # INT8-activation (A8) prefill. Load-time like the ANE controls above: the
     # runtime signature re-creates a loaded model when this changes.
-    if "qwen35_oq_a8_enabled" in sent:
-        current_settings.qwen35_oq_a8_enabled = bool(request.qwen35_oq_a8_enabled)
-    if "qwen35_oq_a8_min_tokens" in sent:
-        value = request.qwen35_oq_a8_min_tokens
+    if "a8_prefill_enabled" in sent:
+        current_settings.a8_prefill_enabled = request.a8_prefill_enabled
+    if "a8_prefill_min_tokens" in sent:
+        value = request.a8_prefill_min_tokens
         if value is None or value < 1:
             raise HTTPException(
                 status_code=400,
-                detail="oQ A8 min tokens must be at least 1.",
+                detail="A8 prefill min tokens must be at least 1.",
             )
-        current_settings.qwen35_oq_a8_min_tokens = int(value)
+        current_settings.a8_prefill_min_tokens = int(value)
     budget_error = _ane_prefill_budget_error(
         current_settings.to_dict(), entry.config_model_type
     )
@@ -3132,8 +3484,12 @@ async def update_model_settings(
             False if is_diffusion_model else bool(request.dflash_enabled)
         )
         if new_dflash_enabled:
-            compat_ok, compat_reason = dflash_compatibility(
-                entry.config_model_type, entry.engine_type
+            compat_ok, compat_reason = _dflash_compat_for_model(
+                {
+                    "model_path": entry.model_path,
+                    "config_model_type": entry.config_model_type,
+                    "engine_type": entry.engine_type,
+                }
             )
             if not compat_ok:
                 raise HTTPException(status_code=400, detail=compat_reason)
@@ -3171,85 +3527,22 @@ async def update_model_settings(
         )
     if "dflash_verify_mode" in sent:
         current_settings.dflash_verify_mode = request.dflash_verify_mode
-    draft_model = current_settings.dflash_draft_model
-    if (
-        ("dflash_enabled" in sent or "dflash_draft_model" in sent)
-        and current_settings.dflash_enabled
-        and draft_model
-        and _draft_path_is_unusable(draft_model)
-    ):
-        raise HTTPException(
-            status_code=422, detail=f"Draft model has no config.json: {draft_model}"
-        )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
         new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
         if new_mtp_enabled:
-            # Compatibility check: the model needs MTP heads in config.json AND
-            # the model_type must be one PR 990 / PR 15 covers AND the weight
-            # files must actually contain MTP tensors (mtp.* or the native
-            # nextn layers). The last check is the one that catches
-            # mlx-community converted weights where the default sanitize
-            # path stripped the MTP heads.
-            import json
-            from pathlib import Path
-
-            from ..utils.model_loading import (
-                _checkpoint_has_mtp_weights,
-                _is_mtp_compatible,
+            # Same gate as the toggle status in the model list, which also
+            # accepts MiniMax M3.1 through its bundled dspark/ draft.
+            compat_ok, compat_reason = _mtp_compat_for_model(
+                {
+                    "model_path": entry.model_path,
+                    "config_model_type": entry.config_model_type,
+                    "engine_type": entry.engine_type,
+                }
             )
-
-            cfg_path = Path(entry.model_path) / "config.json"
-            if not cfg_path.exists():
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"MTP enabled but config.json missing at {cfg_path}; "
-                        "cannot verify MTP compatibility."
-                    ),
-                )
-            try:
-                cfg = json.loads(cfg_path.read_text())
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"MTP enabled but failed to read model config: {e}",
-                )
-            model_type = cfg.get("model_type")
-            # qwen4_exp routes through the dedicated VLM Lightning MTP path
-            # (see _mtp_compat_for_model); skip the mlx-lm whitelist here but
-            # keep the mtp.* weight check below.
-            if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Model is not MTP-compatible (model_type={model_type!r}, "
-                        f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
-                        "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4, "
-                        "GLM-5.2, or merged-assistant Gemma 4 checkpoint with "
-                        "MTP heads."
-                    ),
-                )
-            if not _checkpoint_has_mtp_weights(entry.model_path):
-                if model_type == "qwen4_exp":
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "Qwen4-Exp Lightning MTP requires embedded mtp.* "
-                            "tensors; native nextn layers are not supported by "
-                            "its dedicated runtime."
-                        ),
-                    )
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Config declares MTP layers but the weight files contain "
-                        "neither mtp.* tensors nor native nextn layers. Re-convert "
-                        "from HF with a converter that preserves MTP weights. The "
-                        "default mlx-lm sanitize() path strips them."
-                    ),
-                )
+            if not compat_ok:
+                raise HTTPException(status_code=400, detail=compat_reason)
             # Mutual exclusion with DFlash — ModelSettings.__post_init__
             # also enforces this, but we surface a clearer error here.
             dflash_after = (
@@ -3308,6 +3601,25 @@ async def update_model_settings(
         current_settings.vlm_mtp_draft_model = request.vlm_mtp_draft_model or None
     if "vlm_mtp_draft_block_size" in sent:
         current_settings.vlm_mtp_draft_block_size = request.vlm_mtp_draft_block_size
+    touched = set(sent)
+    if "lora_adapter" in sent:
+        new_adapter = None if is_diffusion_model else request.lora_adapter or None
+        if new_adapter == current_settings.lora_adapter:
+            # Whole-payload saves resend it; only a change is checked (#4217).
+            touched.discard("lora_adapter")
+        current_settings.lora_adapter = new_adapter
+
+    # Draft usability is only enforced for a feature that is on: the admin UI
+    # re-sends the whole payload, so a draft directory deleted from disk (or a
+    # path imported from another machine) must not reject saves that never
+    # enable the feature. The parked value is kept verbatim, exactly as #4217
+    # settled for DFlash. The profile routes apply the same rule through
+    # _draft_usability_problem.
+    draft_problem = _draft_usability_problem(
+        current_settings.to_dict(), touched, entry
+    )
+    if draft_problem:
+        raise HTTPException(status_code=422, detail=draft_problem)
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
@@ -3398,6 +3710,16 @@ async def update_model_settings(
 
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
+    helper_fields = {"prefill_helper_node_id", "prefill_helper_layers"}
+    if not _oq_a8_kernels_available():
+        # A8 here reaches only the helper's layers.
+        helper_fields |= {"a8_prefill_enabled", "a8_prefill_min_tokens"}
+    if helper_fields & set(sent):
+        if hasattr(entry.engine, "configure_prefill_helper"):
+            # Applied to the loaded model in place; no reload.
+            entry.engine.configure_prefill_helper(current_settings)
+        else:
+            prepare_prefill_helper(entry, current_settings)
 
     # A failed load is cached to prevent clients from retrying the same broken
     # configuration on every request. Clear that cache only when the effective
@@ -3574,6 +3896,18 @@ def _raise_if_alias_conflicts_exposed_profiles(
 def _validate_model_settings(entry, settings):
     from ..model_settings import validate_moe_expert_offload
 
+    if settings.get("lora_adapter"):
+        if getattr(entry, "engine_type", None) not in ("batched", "vlm"):
+            raise HTTPException(
+                status_code=400,
+                detail="A LoRA adapter applies only to language and VLM models.",
+            )
+        conflict = lora_adapter_conflict(settings)
+        if conflict:
+            raise HTTPException(
+                status_code=400,
+                detail=f"A LoRA adapter cannot be combined with {conflict}.",
+            )
     try:
         validate_moe_expert_offload(
             settings, model_type=getattr(entry, "config_model_type", None)
@@ -3587,34 +3921,29 @@ def _validate_model_settings(entry, settings):
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
-    if "qwen35_oq_a8_min_tokens" in settings:
-        value = settings["qwen35_oq_a8_min_tokens"]
+    if "a8_prefill_min_tokens" in settings:
+        value = settings["a8_prefill_min_tokens"]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise HTTPException(
-                status_code=400, detail="oQ A8 min tokens must be at least 1."
+                status_code=400, detail="A8 prefill min tokens must be at least 1."
             )
-    if settings.get("qwen35_oq_a8_enabled"):
+    if (
+        settings.get("a8_prefill_enabled") or settings.get("qwen35_ane_prefill_enabled")
+    ) and is_oqh_checkpoint(getattr(entry, "model_path", "") or ""):
+        raise HTTPException(status_code=400, detail=_OQH_PREFILL_REASON)
+    if settings.get("a8_prefill_enabled"):
         if not _oq_a8_model_supported(getattr(entry, "config_model_type", "")):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 and "
-                    "Qwen3.8-Flash-Next models."
-                ),
-            )
-        if not _oq_a8_kernels_available():
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "oQ A8 prefill needs the native Qwen3.5 prefill kernels and "
-                    "a Metal device with native INT8 tensor operations "
-                    "(M5-series or newer)."
+                    "A8 prefill is available only for Qwen3.5/3.6/3.8, "
+                    "Qwen3.8-Flash-Next, DeepSeek V4.1 and MiniMax M3 models."
                 ),
             )
         if settings.get("qwen35_ane_prefill_enabled"):
             raise HTTPException(
                 status_code=400,
-                detail="ANE prefill and oQ A8 prefill cannot both be enabled.",
+                detail="ANE prefill and A8 prefill cannot both be enabled.",
             )
     if any(key.startswith("qwen35_ane_prefill_") for key in settings):
         try:
@@ -3658,7 +3987,19 @@ async def create_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
-    _validate_model_settings(entry, request.settings or {})
+    # Profiles never carry the helper Mac; A8 checks need the model's own.
+    helper = mgr.get_settings(model_id).prefill_helper_node_id
+    settings = {"prefill_helper_node_id": helper, **(request.settings or {})}
+    _validate_model_settings(entry, settings)
+    # A profile that turns a feature on owns its draft: an exposed profile is
+    # applied at request time, so its content must be loadable too. A profile
+    # that only parks a draft stays editable unless it is exposed over a base
+    # model that has the feature on.
+    draft_problem = _profile_draft_problem(
+        mgr, model_id, settings, request.expose_as_model
+    )
+    if draft_problem:
+        raise HTTPException(status_code=422, detail=draft_problem)
     engine_pool = _get_engine_pool()
     try:
         profile = mgr.save_profile(
@@ -3703,7 +4044,21 @@ async def update_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
-    _validate_model_settings(entry, request.settings or {})
+    # Profiles never carry the helper Mac; A8 checks need the model's own.
+    helper = mgr.get_settings(model_id).prefill_helper_node_id
+    _validate_model_settings(
+        entry, {"prefill_helper_node_id": helper, **(request.settings or {})}
+    )
+    stored = mgr.get_profile(model_id, name) or {}
+    draft_problem = _profile_draft_problem(
+        mgr,
+        model_id,
+        (stored.get("settings") or {}) if request.settings is None else request.settings,
+        stored.get("expose_as_model") if request.expose_as_model is None
+        else request.expose_as_model,
+    )
+    if draft_problem:
+        raise HTTPException(status_code=422, detail=draft_problem)
     engine_pool = _get_engine_pool()
     try:
         updated = mgr.update_profile(
@@ -3761,11 +4116,23 @@ async def apply_model_profile(
 ):
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
+    stored = mgr.get_profile(model_id, name)
+    if stored is None:
+        raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
+    # The sanitizer sees the merged result, where every key is present, so the
+    # profile's own fields are what decide whether this apply turns a feature
+    # on. Without that gate an apply that never enables a feature would be
+    # rejected by a draft directory the profile does not even name.
+    touched = set(stored.get("settings") or {})
     is_diffusion_model = _entry_is_diffusion_model(entry)
+
     def sanitizer(settings):
         if is_diffusion_model:
             _sanitize_diffusion_settings_dict(settings)
         _validate_model_settings(entry, settings)
+        draft_problem = _draft_usability_problem(settings, touched, entry)
+        if draft_problem:
+            raise HTTPException(status_code=422, detail=draft_problem)
 
     try:
         applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
@@ -3927,22 +4294,26 @@ def _feature_problem(
     if name in ("turboquant", "index_cache"):
         is_paro, reason = _paroquant_compat_for_model(info)
         return reason if is_paro else None
+    if name in ("ane_prefill", "a8_prefill") and is_oqh_checkpoint(entry.model_path):
+        return _OQH_PREFILL_REASON
     if name == "ane_prefill":
         try:
             validate_ane_prefill(snapshot, entry.config_model_type)
         except ValueError as error:
             return str(error)
         return _ane_prefill_budget_error(snapshot, entry.config_model_type)
-    if name == "oq_a8":
+    if name == "a8_prefill":
         if not _oq_a8_model_supported(entry.config_model_type):
             return (
-                "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 and "
-                "Qwen3.8-Flash-Next models."
+                "A8 prefill is available only for Qwen3.5/3.6/3.8, "
+                "Qwen3.8-Flash-Next, DeepSeek V4.1 and MiniMax M3 models."
             )
-        if not _oq_a8_kernels_available():
+        if not _oq_a8_kernels_available() and not snapshot.get(
+            "prefill_helper_node_id"
+        ):
             return (
-                "oQ A8 prefill needs the native Qwen3.5 prefill kernels and a "
-                "Metal device with native INT8 tensor operations."
+                "A8 prefill needs the native prefill kernels and a Metal "
+                "device with native INT8 tensor operations."
             )
         return None
     if name == "moe_expert_offload":
@@ -4006,7 +4377,11 @@ async def _apply_settings_snapshot(
     candidate, conflicts = resolve_vlm_mtp_conflicts(candidate)
     _note_conflict("vlm_mtp", conflicts, skipped)
     candidate, conflicts = resolve_qwen35_prefill_conflicts(candidate)
-    _note_conflict("oq_a8", conflicts, skipped)
+    _note_conflict("a8_prefill", conflicts, skipped)
+    candidate, conflicts = resolve_lora_conflicts(candidate)
+    for name in conflicts:
+        feature = name.removesuffix("_enabled").removesuffix("_node_id")
+        _note_conflict(feature, ["lora_adapter"], skipped)
     try:
         ModelSettings.from_dict(candidate)
         _validate_model_settings(entry, candidate)
@@ -4580,6 +4955,11 @@ def _global_settings_response(global_settings):
                 "gpu_keep_warm_interval",
                 0.5,
             ),
+            "gpu_keep_warm_idle_window": getattr(
+                global_settings.server,
+                "gpu_keep_warm_idle_window",
+                300.0,
+            ),
             "distributed_inference_enabled": getattr(
                 global_settings.server,
                 "distributed_inference_enabled",
@@ -4619,11 +4999,15 @@ def _global_settings_response(global_settings):
             "embedding_batch_size": global_settings.scheduler.embedding_batch_size,
             "chunked_prefill": global_settings.scheduler.chunked_prefill,
             "prefill_priority": global_settings.scheduler.prefill_priority,
+            "concurrent_priority": global_settings.scheduler.concurrent_priority,
             "decode_fairness": global_settings.scheduler.decode_fairness,
         },
         "cache": {
             "enabled": global_settings.cache.enabled,
             "ssd_cache_dir": cache_dir,
+            "ssd_cache_unavailable": (
+                global_settings.cache.is_ssd_cache_dir_unavailable()
+            ),
             "ssd_cache_max_size": global_settings.cache.ssd_cache_max_size,
             "ssd_cache_auto_size_bytes": get_auto_ssd_cache_size(Path(cache_dir)),
             "hot_cache_only": global_settings.cache.hot_cache_only,
@@ -4709,6 +5093,7 @@ def _global_settings_response(global_settings):
             "web_search_content_max_chars": global_settings.integrations.web_search_content_max_chars,
             "splash_path": global_settings.integrations.splash_path,
             "splash_kv_format": global_settings.integrations.splash_kv_format,
+            "splash_activations": global_settings.integrations.splash_activations,
             "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
             "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
             "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
@@ -4734,6 +5119,7 @@ def _global_settings_response(global_settings):
         "ui": {
             "language": global_settings.ui.language,
             "dashboard_layout": global_settings.ui.dashboard_layout,
+            "custom_theme": global_settings.ui.custom_theme,
         },
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
@@ -4767,6 +5153,12 @@ async def update_global_settings(
 
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
+
+    # Infinity would persist and break JSON encoding of the settings response.
+    for name in ("gpu_keep_warm_interval", "gpu_keep_warm_idle_window"):
+        value = getattr(request, name)
+        if value is not None and not math.isfinite(value):
+            raise HTTPException(status_code=400, detail=f"{name} must be finite")
 
     from ..utils.network import (
         is_loopback_bind,
@@ -4902,6 +5294,17 @@ async def update_global_settings(
             keep_warm_pool.configure_gpu_keep_warm(interval)
             keep_warm_pool._ensure_gpu_keep_warm_task()
         runtime_applied.append("gpu_keep_warm_interval")
+    if request.gpu_keep_warm_idle_window is not None:
+        from ..server import _server_state
+
+        window = max(0.0, float(request.gpu_keep_warm_idle_window))
+        global_settings.server.gpu_keep_warm_idle_window = window
+        window_pool = _server_state.engine_pool
+        if window_pool is not None:
+            window_pool.configure_gpu_keep_warm(
+                global_settings.server.gpu_keep_warm_interval, window
+            )
+        runtime_applied.append("gpu_keep_warm_idle_window")
     if request.distributed_inference_enabled is not None:
         # Route exposure and Bonjour publication are fixed at process startup,
         # so this intentionally takes effect after the normal settings restart.
@@ -5138,10 +5541,20 @@ async def update_global_settings(
         runtime_applied.append("prefill_priority")
         logger.info(f"Prefill priority set to '{value}'")
 
-    # Apply decode fairness setting (Live)
-    if request.decode_fairness is not None:
-        enabled = bool(request.decode_fairness)
-        global_settings.scheduler.decode_fairness = enabled
+    # Apply concurrent request priority setting (Live)
+    concurrent_priority = request.concurrent_priority
+    if concurrent_priority is None and request.decode_fairness is not None:
+        current = global_settings.scheduler.concurrent_priority
+        if not request.decode_fairness:
+            concurrent_priority = "prefill"
+        elif current == "prefill":
+            concurrent_priority = "balanced"
+        else:
+            concurrent_priority = current
+    if concurrent_priority is not None:
+        global_settings.scheduler.concurrent_priority = concurrent_priority
+        enabled = concurrent_priority != "prefill"
+        adaptive = concurrent_priority == "balanced"
         from ..server import _server_state
 
         pool = _server_state.engine_pool
@@ -5149,6 +5562,7 @@ async def update_global_settings(
             pool_config = getattr(pool, "_scheduler_config", None)
             if pool_config is not None:
                 pool_config.decode_fairness = enabled
+                pool_config.adaptive_decode_share = adaptive
             for mid, entry in pool._entries.items():
                 if entry is None or entry.engine is None:
                     continue
@@ -5163,13 +5577,13 @@ async def update_global_settings(
                 )
                 if scheduler is not None:
                     scheduler._decode_fairness = enabled
+                    scheduler._adaptive_decode_share = adaptive
                     scheduler._decode_time_owed_s = 0.0
                     if hasattr(scheduler, "config"):
                         scheduler.config.decode_fairness = enabled
-        runtime_applied.append("decode_fairness")
-        logger.info(
-            f"Decode fairness {'enabled' if enabled else 'disabled'}"
-        )
+                        scheduler.config.adaptive_decode_share = adaptive
+        runtime_applied.append("concurrent_priority")
+        logger.info(f"Concurrent request priority set to '{concurrent_priority}'")
 
     if request.hot_cache_max_size is not None:
         try:
@@ -5355,8 +5769,6 @@ async def update_global_settings(
     if cache_changed:
         success, msg = await _apply_cache_settings_runtime(
             request.cache_enabled,
-            request.ssd_cache_dir,
-            request.ssd_cache_max_size,
             global_settings,
             hot_cache_max_size=request.hot_cache_max_size,
         )
@@ -5614,6 +6026,14 @@ async def update_global_settings(
             )
         global_settings.integrations.splash_kv_format = request.splash_kv_format
         integrations_changed = True
+    if "splash_activations" in request.model_fields_set:
+        if request.splash_activations not in SPLASH_ACTIVATIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"splash_activations must be one of {sorted(SPLASH_ACTIVATIONS)}",
+            )
+        global_settings.integrations.splash_activations = request.splash_activations
+        integrations_changed = True
     if "splash_max_memory_gb" in request.model_fields_set:
         memory = request.splash_max_memory_gb
         if memory is not None and memory <= 0:
@@ -5793,6 +6213,14 @@ async def update_global_settings(
             layout.model_dump() if layout is not None else None
         )
         runtime_applied.append("ui_dashboard_layout")
+
+    if "ui_custom_theme" in request.model_fields_set:
+        theme = request.ui_custom_theme
+        global_settings.ui.custom_theme = (
+            theme.model_dump() if theme is not None and (theme.light or theme.dark)
+            else None
+        )
+        runtime_applied.append("ui_custom_theme")
 
     # Apply idle timeout settings (Live)
     # Use model_fields_set to distinguish "explicitly sent as null" (disable)
@@ -6226,9 +6654,9 @@ def _get_engine_info() -> dict:
     packages = {
         "mlx": "https://github.com/ml-explore/mlx",
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
-        "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
+        "mlx-vlm": "https://github.com/Neywa-Labs/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
-        "mlx-audio": "https://github.com/Blaizzy/mlx-audio",
+        "mlx-audio": "https://github.com/Neywa-Labs/mlx-audio",
     }
 
     fallback_commits = _load_fallback_commits(packages)
@@ -6438,10 +6866,11 @@ def _build_runtime_cache_observability(
     cache_cfg = global_settings.cache
     engine_pool = _get_engine_pool()
     auto_size = cache_cfg.ssd_cache_max_size.lower() == "auto"
+    ssd_cache_unavailable = cache_cfg.is_ssd_cache_dir_unavailable()
     try:
         cfg_disk_max = (
             0
-            if auto_size and engine_pool is not None
+            if ssd_cache_unavailable or (auto_size and engine_pool is not None)
             else cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
         )
     except (ValueError, OSError, TypeError) as exc:
@@ -6451,7 +6880,10 @@ def _build_runtime_cache_observability(
     payload = {
         "base_path": str(global_settings.base_path),
         "ssd_cache_dir": str(cache_dir),
-        "response_state_dir": str(cache_dir / "response-state"),
+        "ssd_cache_unavailable": ssd_cache_unavailable,
+        "response_state_dir": (
+            "" if ssd_cache_unavailable else str(cache_dir / "response-state")
+        ),
         "models": [],
         "total_num_files": 0,
         "total_size_bytes": 0,
@@ -6466,6 +6898,8 @@ def _build_runtime_cache_observability(
         return payload
 
     block_sizes = set()
+    live_splash_dirs = set()
+    ssd_files: dict[Path, int] = {}
 
     for model_info in engine_pool.get_status().get("models", []):
         model_id = model_info.get("id")
@@ -6692,14 +7126,23 @@ def _build_runtime_cache_observability(
         if isinstance(splash_cache, dict):
             model_payload["cache_tier"] = "splash"
             model_payload["splash_cache"] = splash_cache
+            if isinstance(entry.engine, SplashEngine) and entry.engine.ssd_cache_dir:
+                live_splash_dirs.add(entry.engine.ssd_cache_dir)
 
         payload["models"].append(model_payload)
-        payload["total_num_files"] += model_payload["num_files"]
-        payload["total_size_bytes"] += model_payload["total_size_bytes"]
+        if ssd_manager is not None and not model_filter:
+            # Managers share one SSD directory and budget, and each also tracks
+            # blocks of unloaded models. Count every tracked file once.
+            ssd_files.update(ssd_manager.get_tracked_files())
+        else:
+            payload["total_num_files"] += model_payload["num_files"]
+            payload["total_size_bytes"] += model_payload["total_size_bytes"]
 
         if isinstance(block_size, int) and block_size > 0:
             block_sizes.add(block_size)
 
+    payload["total_num_files"] += len(ssd_files)
+    payload["total_size_bytes"] += sum(ssd_files.values())
     payload["effective_block_sizes"] = sorted(block_sizes)
 
     # Aggregate hot-cache and disk-max across models. Hot cache max is a single
@@ -6720,7 +7163,12 @@ def _build_runtime_cache_observability(
     payload["hot_cache_max_bytes"] = hot_cache_max
     payload["hot_cache_size_bytes"] = hot_cache_size_total
     payload["hot_cache_entries"] = hot_cache_entries_total
-    if auto_size and not payload["models"] and engine_pool is not None:
+    if (
+        auto_size
+        and not payload["models"]
+        and engine_pool is not None
+        and not ssd_cache_unavailable
+    ):
         try:
             disk_max = cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
         except (ValueError, OSError, TypeError) as exc:
@@ -6733,20 +7181,27 @@ def _build_runtime_cache_observability(
         try:
             num_files = 0
             total_bytes = 0
-            for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
-                for subdir in "0123456789abcdef":
-                    subdir_path = root / subdir
-                    if not subdir_path.exists():
-                        continue
-                    for f in subdir_path.glob("*.safetensors"):
-                        num_files += 1
-                        total_bytes += f.stat().st_size
+            for subdir in "0123456789abcdef":
+                subdir_path = cache_dir / subdir
+                if not subdir_path.exists():
+                    continue
+                for f in subdir_path.glob("*.safetensors"):
+                    num_files += 1
+                    total_bytes += f.stat().st_size
             sidecar_count, sidecar_bytes = _scan_offline_gdn_sidecars(cache_dir)
             payload["total_num_files"] = num_files + sidecar_count
             payload["total_size_bytes"] = total_bytes + sidecar_bytes
         except Exception as exc:
             logger.warning("Failed to scan SSD cache directory: %s", exc)
 
+    try:
+        files, size = scan_splash_ssd_cache(
+            cache_dir / "splash", exclude=live_splash_dirs
+        )
+        payload["total_num_files"] += files
+        payload["total_size_bytes"] += size
+    except OSError as exc:
+        logger.warning("Failed to scan Splash SSD cache: %s", exc)
     return payload
 
 
@@ -6975,8 +7430,13 @@ def _build_active_models_data() -> dict:
             last_activity_age = (
                 max(0.0, now - last_activity_at) if last_activity_at else None
             )
-            tokens_per_second = (
-                generated_tokens / elapsed if elapsed and elapsed > 0 else 0.0
+            # Recent speed, so a row shows a speed change within seconds.
+            tokens_per_second = live_decode_rate(
+                getattr(req, "decode_marks", ()),
+                generated_tokens,
+                last_activity_at,
+                started_at,
+                now,
             )
             generating.append(
                 {
@@ -7097,6 +7557,13 @@ def _build_active_models_data() -> dict:
         if is_loaded and effective_ttl is not None and idle_seconds is not None:
             ttl_remaining_seconds = max(0.0, effective_ttl - idle_seconds)
 
+        # Cluster rows come from rank zero's sample and carry no engine id.
+        request_abort = (
+            entry is not None
+            and callable(getattr(entry.engine, "abort_request", None))
+            and not model_info.get("cluster")
+        )
+
         models.append(
             {
                 "id": model_id,
@@ -7121,6 +7588,7 @@ def _build_active_models_data() -> dict:
                 "activities": activities,
                 "prefilling": prefilling,
                 "generating": generating,
+                "request_abort": request_abort,
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
                 "cluster": (
@@ -7270,6 +7738,26 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     distributed_ranks = 0
     distributed_failures = []
 
+    global_settings = _get_global_settings()
+    if global_settings is not None:
+        cache_root = (
+            global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
+            / "splash"
+        )
+        pool = _get_engine_pool()
+        clear_splash = getattr(pool, "clear_splash_ssd_cache", None)
+        try:
+            if callable(clear_splash):
+                total_deleted += await clear_splash(cache_root)
+            else:
+                total_deleted += scan_splash_ssd_cache(cache_root, clear=True)[0]
+        except ModelBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(
+                status_code=503, detail=f"Could not delete Splash SSD cache: {exc}"
+            ) from exc
+
     for model_id, scheduler, core in _iter_loaded_engine_records():
         distributed_clear = getattr(core, "clear_prompt_caches", None)
         if callable(distributed_clear):
@@ -7304,17 +7792,16 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
         )
         if cache_dir.exists():
             try:
-                for root in (cache_dir, cache_dir / "deepseek_v41_ced_v1"):
-                    for subdir in "0123456789abcdef":
-                        subdir_path = root / subdir
-                        if not subdir_path.exists():
-                            continue
-                        for f in subdir_path.glob("*.safetensors"):
-                            try:
-                                f.unlink()
-                                total_deleted += 1
-                            except OSError:
-                                pass
+                for subdir in "0123456789abcdef":
+                    subdir_path = cache_dir / subdir
+                    if not subdir_path.exists():
+                        continue
+                    for f in subdir_path.glob("*.safetensors"):
+                        try:
+                            f.unlink()
+                            total_deleted += 1
+                        except OSError:
+                            pass
                 sidecar_count, _ = _scan_offline_gdn_sidecars(cache_dir, clear=True)
                 total_deleted += sidecar_count
             except Exception as exc:
@@ -7758,7 +8245,9 @@ async def start_hf_download(
         raise HTTPException(status_code=503, detail="Downloader not initialized")
 
     try:
-        task = await _hf_downloader.start_download(request.repo_id, request.hf_token)
+        task = await _hf_downloader.start_download(
+            request.repo_id, request.hf_token, files=request.files
+        )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -7820,14 +8309,28 @@ async def remove_hf_task(
     return {"success": True}
 
 
+def _hf_model_format(model_format: str | None, mlx_only: bool) -> str:
+    """The downloader's format filter; ``mlx_only`` is the older spelling."""
+    if model_format is None:
+        return "mlx" if mlx_only else "all"
+    if model_format not in MODEL_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"model_format must be one of {', '.join(MODEL_FORMATS)}",
+        )
+    return model_format
+
+
 @router.get("/api/hf/recommended")
 async def get_recommended_models(
     mlx_only: bool = True,
+    model_format: str | None = None,
     is_admin: bool = Depends(require_admin),
 ):
     """Get recommended models filtered by system memory."""
     if _hf_downloader is None:
         raise HTTPException(status_code=503, detail="Downloader not initialized")
+    resolved_format = _hf_model_format(model_format, mlx_only)
 
     memory_info = get_system_memory_info()
     max_memory = memory_info["total_bytes"] or 16 * 1024**3
@@ -7836,7 +8339,9 @@ async def get_recommended_models(
 
     try:
         result = await HFDownloader.get_recommended_models(
-            max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
+            max_memory_bytes=max_memory,
+            result_limit=50,
+            model_format=resolved_format,
         )
         return result
     except TimeoutError:
@@ -7894,6 +8399,7 @@ async def search_hf_models(
     sort: str = "trending",
     limit: int = 100,
     mlx_only: bool = True,
+    model_format: str | None = None,
     # Filtering
     min_params: Optional[int] = None,
     max_params: Optional[int] = None,
@@ -7910,7 +8416,8 @@ async def search_hf_models(
         q: Search query string (required)
         sort: Sort order - trending/downloads/created/updated/most_params/least_params/largest/smallest
         limit: Maximum results (max 100)
-        mlx_only: Restrict to MLX library models
+        mlx_only: Restrict to MLX library models (older spelling of model_format)
+        model_format: mlx, gguf or all
         min_params: Minimum parameter count
         max_params: Maximum parameter count
         min_size: Minimum model size in bytes
@@ -7920,6 +8427,7 @@ async def search_hf_models(
     """
     if not q.strip():
         raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
+    resolved_format = _hf_model_format(model_format, mlx_only)
 
     from .hf_downloader import HFDownloader
 
@@ -7928,7 +8436,7 @@ async def search_hf_models(
             query=q.strip(),
             sort=sort,
             limit=min(limit, 100),
-            mlx_only=mlx_only,
+            model_format=resolved_format,
             min_params=min_params,
             max_params=max_params,
             min_size=min_size,
@@ -7948,10 +8456,14 @@ async def search_hf_models(
 
 @router.get("/api/hf/model-info")
 async def get_hf_model_info(
+    request: Request,
     repo_id: str = "",
     is_admin: bool = Depends(require_admin),
 ):
-    """Get detailed model information from HuggingFace."""
+    """Get detailed model information from HuggingFace.
+
+    An ``X-HF-Token`` header carries a token for a gated or private repo.
+    """
     if not repo_id.strip():
         raise HTTPException(
             status_code=400, detail="Query parameter 'repo_id' is required"
@@ -7961,8 +8473,23 @@ async def get_hf_model_info(
 
     from .hf_downloader import HFDownloader
 
+    repo_id = repo_id.strip()
+    local_dir = None
+    if _hf_downloader is not None and _is_repo_id(repo_id):
+        local_dir = _hf_downloader.model_dir / repo_id
     try:
-        result = await HFDownloader.get_model_info(repo_id=repo_id.strip())
+        result = await HFDownloader.get_model_info(
+            repo_id=repo_id,
+            local_dir=local_dir,
+            token=request.headers.get("x-hf-token") or None,
+        )
+        if _hf_downloader is not None:
+            result["disk_free"] = await asyncio.to_thread(
+                _free_disk_bytes, _hf_downloader.model_dir
+            )
+            # An unfinished download resumes with Retry, not as an update.
+            if _hf_downloader.has_unfinished_download(repo_id):
+                result["update_files"] = []
         return result
     except TimeoutError:
         raise HTTPException(
@@ -7970,11 +8497,21 @@ async def get_hf_model_info(
             detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
         )
     except RepositoryNotFoundError:
-        raise HTTPException(
-            status_code=404, detail=f"Model '{repo_id.strip()}' not found"
-        )
+        raise HTTPException(status_code=404, detail=f"Model '{repo_id}' not found")
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/api/hf/updates")
+async def check_hf_updates(
+    request: HFUpdateCheckRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Report downloaded models whose files changed on HuggingFace."""
+    if _hf_downloader is None:
+        raise HTTPException(status_code=503, detail="Downloader not initialized")
+
+    return await _hf_downloader.check_updates(request.repo_ids, request.hf_token)
 
 
 @router.get("/api/hf/models")
@@ -7985,9 +8522,6 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
         raise HTTPException(status_code=503, detail="Server not initialized")
 
     model_dirs = global_settings.get_effective_model_dirs()
-
-    def _has_model_config(path: Path) -> bool:
-        return (path / "config.json").exists() or (path / "configuration.json").exists()
 
     def _add_model(
         model_path: Path,
@@ -8019,8 +8553,17 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
             }
         )
 
+    def _add_adapter(model_path: Path, model_name: str, **kwargs) -> None:
+        # Listed so it can be deleted; it is applied from a model's settings.
+        count = len(models)
+        _add_model(model_path, model_name, **kwargs)
+        if len(models) > count:
+            models[-1]["model_format"] = "lora"
+
     models = []
     seen_names: set[str] = set()
+    # (folder, row name, source type) of folders of GGUF models.
+    gguf_folders: list[tuple[Path, str, str]] = []
     for model_dir in model_dirs:
         if not model_dir.exists():
             continue
@@ -8028,14 +8571,28 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
 
-            if _has_model_config(subdir):
+            if gguf.is_gguf_folder(subdir):
+                gguf_folders.append((subdir, subdir.name, "local"))
+            elif is_adapter_dir(subdir):
+                _add_adapter(subdir, subdir.name)
+            elif _is_model_dir(subdir):
                 # Level 1: direct model folder
                 _add_model(subdir, subdir.name)
             else:
                 # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
                 hf_resolved = _resolve_hf_cache_entry(subdir)
                 if hf_resolved is not None:
-                    if _is_hf_cache_mlx_compatible(
+                    if gguf.is_gguf_folder(hf_resolved.snapshot_path):
+                        folder, name = hf_resolved.snapshot_path, hf_resolved.model_id
+                        gguf_folders.append((folder, name, "hf_cache"))
+                    elif is_adapter_dir(hf_resolved.snapshot_path):
+                        _add_adapter(
+                            hf_resolved.snapshot_path,
+                            hf_resolved.model_id,
+                            source_repo_id=hf_resolved.source_repo_id,
+                            source_type="hf_cache",
+                        )
+                    elif _is_hf_cache_mlx_compatible(
                         hf_resolved.snapshot_path, hf_resolved.source_repo_id
                     ):
                         _add_model(
@@ -8050,14 +8607,77 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 for child in sorted(subdir.iterdir()):
                     if not child.is_dir() or child.name.startswith("."):
                         continue
-                    if _has_model_config(child):
+                    if gguf.is_gguf_folder(child):
+                        gguf_folders.append((child, child.name, "local"))
+                    elif is_adapter_dir(child):
+                        _add_adapter(
+                            child, child.name, repo_id=f"{subdir.name}/{child.name}"
+                        )
+                    elif _is_model_dir(child):
                         _add_model(
                             child, child.name, repo_id=f"{subdir.name}/{child.name}"
                         )
 
+    # One row per GGUF model, as discovery found them. No repo_id: a repo
+    # holds several GGUFs, so one of them does not make the repo downloaded.
+    try:
+        engine_pool = _get_engine_pool() if _get_engine_pool else None
+    except HTTPException:  # the server has not created the pool yet
+        engine_pool = None
+    registered: set[Path] = set()
+    for info in engine_pool.get_status()["models"] if engine_pool else []:
+        if info.get("model_format") != "gguf" or info["id"] in seen_names:
+            continue
+        seen_names.add(info["id"])
+        source = Path(info.get("source_path") or "")
+        gguf_info = gguf.source_info(info["model_path"]) or {}
+        folder = Path(gguf_info.get("directory") or source.parent)
+        parts = gguf_info.get("source_parts") or []
+        registered.update((folder / name).resolve() for name in parts)
+        models.append(
+            {
+                "name": info["id"],
+                "path": info.get("source_path"),
+                "display_name": _model_display_name(
+                    info["id"],
+                    None,
+                    model_dirs,
+                    source_repo_id=info.get("source_repo_id"),
+                    source_path=info.get("source_path"),
+                ),
+                "size": info.get("estimated_size", 0),
+                "size_formatted": format_size(info.get("estimated_size", 0)),
+                "repo_id": None,
+                "source_type": info.get("source_type", "local"),
+                "model_format": "gguf",
+            }
+        )
+
+    # A folder with GGUFs no model stands for (an unfinished split, an
+    # unreadable file, subfolder copies) is listed whole so it can be deleted.
+    for folder, name, source_type in gguf_folders:
+        stranded = [
+            path
+            for path in folder.rglob("*.gguf")
+            if path.resolve() not in registered
+            and not (path.parent == folder and gguf.file_kind(path.name) != "gguf")
+        ]
+        if stranded and name not in seen_names:
+            _add_model(folder, name, source_type=source_type)
+            models[-1]["model_format"] = "gguf"
+
     # Sort by the UI display name so organization prefixes group together.
     models.sort(key=lambda m: m["display_name"].lower())
     return {"models": models}
+
+
+def _is_listed_model_folder(path: Path) -> bool:
+    """A folder /api/hf/models lists whole: a checkpoint, GGUF or LoRA adapter."""
+    return (
+        _is_model_dir(path)
+        or gguf.is_gguf_folder(path)
+        or is_adapter_dir(path)
+    )
 
 
 @router.delete("/api/hf/models/{model_name}")
@@ -8074,8 +8694,11 @@ async def delete_hf_model(
 
     model_dirs = global_settings.get_effective_model_dirs()
 
-    def _has_model_config(path: Path) -> bool:
-        return (path / "config.json").exists() or (path / "configuration.json").exists()
+    entry = engine_pool.get_entry(model_name) if engine_pool is not None else None
+    if entry is not None and entry.model_format == "gguf":
+        await _delete_gguf_model(entry, model_dirs, engine_pool)
+        _refresh_pool_after_delete(model_name, engine_pool, global_settings)
+        return {"success": True, "message": f"Model '{model_name}' deleted"}
 
     # Search the discovery directories in flat, HF cache and org-folder layouts
     model_path = None
@@ -8084,7 +8707,7 @@ async def delete_hf_model(
         if not model_dir.exists():
             continue
         candidate = model_dir / model_name
-        if candidate.is_dir() and _has_model_config(candidate):
+        if candidate.is_dir() and _is_listed_model_folder(candidate):
             model_path = candidate
             parent_model_dir = model_dir
             break
@@ -8095,15 +8718,19 @@ async def delete_hf_model(
             if hf_resolved is not None:
                 # The repo dir owns the snapshot symlinks and their blobs, so
                 # it is removed as one unit.
-                if hf_resolved.model_id == model_name and _is_hf_cache_mlx_compatible(
-                    hf_resolved.snapshot_path, hf_resolved.source_repo_id
+                if hf_resolved.model_id == model_name and (
+                    _is_hf_cache_mlx_compatible(
+                        hf_resolved.snapshot_path, hf_resolved.source_repo_id
+                    )
+                    or gguf.is_gguf_folder(hf_resolved.snapshot_path)
+                    or is_adapter_dir(hf_resolved.snapshot_path)
                 ):
                     model_path = subdir
                     parent_model_dir = model_dir
                     break
                 continue
             candidate = subdir / model_name
-            if candidate.is_dir() and _has_model_config(candidate):
+            if candidate.is_dir() and _is_listed_model_folder(candidate):
                 model_path = candidate
                 parent_model_dir = model_dir
                 break
@@ -8174,27 +8801,121 @@ async def delete_hf_model(
         except OSError as e:
             logger.debug(f"Could not remove empty org folder {parent}: {e}")
 
-    # Re-discover models
-    if engine_pool is not None:
-        settings_manager = _get_settings_manager()
-        pinned_models = []
-        if settings_manager:
-            pinned_models = settings_manager.get_pinned_model_ids()
-
-        engine_pool._entries.pop(model_name, None)
-        # Release the deleted model's persisted settings (including its alias)
-        # so they can be reused by another model.
-        if settings_manager:
-            settings_manager.delete_settings(model_name)
-        engine_pool.discover_models(
-            [str(d) for d in global_settings.get_effective_model_dirs()],
-            pinned_models,
-        )
-        if settings_manager:
-            engine_pool.apply_settings_overrides(settings_manager)
-        logger.info("Model pool refreshed after deletion")
-
+    _refresh_pool_after_delete(model_name, engine_pool, global_settings)
     return {"success": True, "message": f"Model '{model_name}' deleted"}
+
+
+def _refresh_pool_after_delete(model_name: str, engine_pool, global_settings) -> None:
+    """Forget a deleted model's entry and settings, then re-discover."""
+    if engine_pool is None:
+        return
+    settings_manager = _get_settings_manager()
+    pinned_models = []
+    if settings_manager:
+        pinned_models = settings_manager.get_pinned_model_ids()
+
+    engine_pool._entries.pop(model_name, None)
+    # Release the deleted model's persisted settings (including its alias)
+    # so they can be reused by another model.
+    if settings_manager:
+        settings_manager.delete_settings(model_name)
+    engine_pool.discover_models(
+        [str(d) for d in global_settings.get_effective_model_dirs()],
+        pinned_models,
+    )
+    if settings_manager:
+        engine_pool.apply_settings_overrides(settings_manager)
+    logger.info("Model pool refreshed after deletion")
+
+
+def _unlink_hf_cache_file(link: Path, repo_dir: Path) -> None:
+    """Remove a snapshot link and its blob once no other link uses it."""
+    blob = link.resolve()
+    link.unlink(missing_ok=True)
+    if not blob.is_relative_to(repo_dir / "blobs"):
+        return
+    for other in (repo_dir / "snapshots").rglob("*"):
+        if other.is_symlink() and other.resolve() == blob:
+            return
+    blob.unlink(missing_ok=True)
+
+
+async def _delete_gguf_model(entry, model_dirs: list[Path], engine_pool) -> None:
+    """Delete one GGUF model's files; its folder goes with its last GGUF.
+
+    Vision projectors stay while another GGUF in the folder pairs with them.
+    """
+    info = gguf.source_info(entry.model_path) or {}
+    folder = Path(info.get("directory") or Path(entry.source_path).parent)
+    if not any(
+        folder.resolve().is_relative_to(model_dir.resolve())
+        for model_dir in model_dirs
+    ):
+        raise HTTPException(status_code=400, detail="Invalid model name")
+    names = info.get("source_parts") or [Path(entry.source_path).name]
+    parts = [folder / name for name in names]
+
+    hf_cache = entry.source_type == "hf_cache"
+    # snapshots/<revision>/ inside models--Org--Name/
+    repo_dir = folder.parent.parent if hf_cache else folder
+    remaining = [
+        model
+        for model in gguf.find_models(folder)
+        if model.path not in parts and model.model_id != entry.model_id
+    ]
+    if _hf_downloader is not None and not hf_cache:
+        # The folder goes with its last GGUF, and with it every download
+        # into it; otherwise only a download of these files stops.
+        await _hf_downloader.cancel_download_for_dir(
+            folder,
+            (
+                [part.relative_to(folder).as_posix() for part in parts]
+                if remaining
+                else None
+            ),
+        )
+    if entry.model_id in engine_pool.get_loaded_model_ids():
+        try:
+            await engine_pool._unload_engine(entry.model_id)
+            logger.info(f"Unloaded model '{entry.model_id}' before deletion")
+        except Exception as e:
+            logger.warning(f"Failed to unload model '{entry.model_id}': {e}")
+
+    try:
+        if hf_cache and not remaining:
+            shutil.rmtree(repo_dir)
+        elif hf_cache:
+            for part in parts:
+                _unlink_hf_cache_file(part, repo_dir)
+        else:
+            for part in parts:
+                part.unlink(missing_ok=True)
+            if not remaining:
+                for projector in folder.glob("*.gguf"):
+                    if gguf.file_kind(projector.name) == "mmproj":
+                        projector.unlink(missing_ok=True)
+                is_model_dir = any(
+                    folder.resolve() == model_dir.resolve() for model_dir in model_dirs
+                )
+                if (
+                    not is_model_dir
+                    and not gguf.holds_checkpoint(folder)
+                    and not any(folder.rglob("*.gguf"))
+                ):
+                    shutil.rmtree(folder)
+                    parent = folder.parent
+                    if (
+                        all(parent.resolve() != d.resolve() for d in model_dirs)
+                        and parent.exists()
+                        and not any(parent.iterdir())
+                    ):
+                        parent.rmdir()
+        deleted = ", ".join(map(str, parts))
+        logger.info(f"Deleted GGUF model {entry.model_id}: {deleted}")
+    except OSError as e:
+        logger.error(f"Failed to delete GGUF model {entry.model_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
+    shutil.rmtree(entry.model_path, ignore_errors=True)
 
 
 # =============================================================================
@@ -8389,6 +9110,15 @@ async def get_ms_model_info(
 # =============================================================================
 
 
+def _drop_idle_gpu_power_cap() -> None:
+    # Benchmarks never take a GPU power cap. One still held for the release
+    # delay after a capped request would throttle the start of the run.
+    state = _get_server_state() if _get_server_state is not None else None
+    limiter = getattr(state, "gpu_power_limiter", None)
+    if limiter is not None:
+        limiter.drop_idle_cap()
+
+
 @router.post("/api/bench/accuracy/queue/add")
 async def add_to_accuracy_queue(
     request: Request,
@@ -8459,6 +9189,7 @@ async def add_to_accuracy_queue(
     )
 
     # Start processing if not already running (synchronous — sets bench_id immediately)
+    _drop_idle_gpu_power_cap()
     start_next_from_queue(engine_pool)
 
     return get_queue_status()
@@ -8654,10 +9385,17 @@ async def start_ane_tuning(
             status_code=400,
             detail=f"Model {tuning_request.model_id} is not a supported language model",
         )
+    manager = _get_settings_manager()
+    if manager is not None and manager.get_settings(tuning_request.model_id).lora_adapter:
+        raise HTTPException(
+            status_code=400,
+            detail="ANE prefill cannot run with a LoRA adapter; remove the adapter to tune.",
+        )
 
     tuning_request.backend = "k2" if entry.config_model_type == "k2_horizon" else "qwen"
     cleanup_old_runs()
     run = create_run(tuning_request)
+    _drop_idle_gpu_power_cap()
     run.task = asyncio.create_task(run_tuning(run, engine_pool))
     return {"tuning_id": run.tuning_id, "status": "started", "total": run.total}
 
@@ -8826,6 +9564,7 @@ async def start_context_benchmark(
 
     cleanup_old_runs()
     run = create_run(bench_request)
+    _drop_idle_gpu_power_cap()
     run.task = asyncio.create_task(run_context_benchmark(run, engine_pool))
 
     logger.info(
@@ -9073,6 +9812,7 @@ async def start_benchmark(
     run = create_run(bench_request)
     total_tests = len(bench_request.prompt_lengths) + len(bench_request.batch_sizes) * 2
 
+    _drop_idle_gpu_power_cap()
     run.task = asyncio.create_task(run_benchmark(run, engine_pool))
 
     logger.info(
@@ -9268,22 +10008,29 @@ async def check_update(
         # Use the releases list (not /releases/latest) and filter by the
         # user's update channel. GitHub's prerelease flag has historically
         # been unreliable for rc/dev tags, so release_check validates tags too.
-        resp = await asyncio.to_thread(
-            requests.get,
-            "https://api.github.com/repos/jundot/omlx/releases",
-            params={"per_page": 20},
-            timeout=5,
-        )
-        if resp.status_code != 200:
-            _update_cache[channel] = no_update
-            _update_cache_time[channel] = now
-            return _update_cache[channel]
+        page_size = 20
+        page = 1
+        while True:
+            resp = await asyncio.to_thread(
+                requests.get,
+                "https://api.github.com/repos/jundot/omlx/releases",
+                params={"per_page": page_size, "page": page},
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                _update_cache[channel] = no_update
+                _update_cache_time[channel] = now
+                return _update_cache[channel]
 
-        data = select_latest_release(resp.json(), channel=channel)
-        if data is None:
-            _update_cache[channel] = no_update
-            _update_cache_time[channel] = now
-            return _update_cache[channel]
+            releases = resp.json()
+            data = select_latest_release(releases, channel=channel)
+            if data is not None:
+                break
+            if len(releases) < page_size:
+                _update_cache[channel] = no_update
+                _update_cache_time[channel] = now
+                return _update_cache[channel]
+            page += 1
 
         latest = data["tag_name"].lstrip("v")
 
@@ -9331,6 +10078,7 @@ async def estimate_oq(
     model_path: str,
     oq_level: float,
     preserve_mtp: bool = False,
+    preserve_ngram_table: bool = False,
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -9343,6 +10091,7 @@ async def estimate_oq(
             oq_level,
             64,  # group_size (default)
             preserve_mtp,
+            preserve_ngram_table,
         )
         return result
     except Exception as e:
@@ -9406,6 +10155,8 @@ async def start_oq_quantization(
             imatrix_num_samples=request.imatrix_num_samples,
             imatrix_seq_length=request.imatrix_seq_length,
             mtp_assistant_model_path=request.mtp_assistant_model_path,
+            preserve_ngram_table=request.preserve_ngram_table,
+            hadamard=request.hadamard,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

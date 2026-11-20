@@ -15,6 +15,66 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 if TYPE_CHECKING:
     from .cache.paged_cache import BlockTable
 
+# The live decode rate covers this much recent wall time.
+DECODE_RATE_WINDOW_S = 3.0
+_DECODE_MARK_INTERVAL_S = 0.5
+
+DecodeMarks = tuple[tuple[float, int], ...]
+
+
+def add_decode_mark(
+    marks: DecodeMarks, tokens: int, last_at: float | None, now: float
+) -> DecodeMarks:
+    """Return ``marks`` with a (time, tokens) checkpoint for ``now``.
+
+    ``tokens`` is the count before the tokens that arrive at ``now``, and
+    ``last_at`` is when the previous ones arrived. The result is a new tuple,
+    so a reader on another thread never sees a partial update.
+    """
+    if marks and now - marks[-1][0] < _DECODE_MARK_INTERVAL_S:
+        return marks
+    fresh: DecodeMarks = ((now, tokens),)
+    if marks and last_at is not None and now - last_at >= _DECODE_MARK_INTERVAL_S:
+        # No token since ``last_at``: pin the count at both ends of the gap.
+        fresh = ((last_at, tokens), (now, tokens))
+    keep = 0
+    while keep + 1 < len(marks) and now - marks[keep + 1][0] >= DECODE_RATE_WINDOW_S:
+        keep += 1
+    return marks[keep:] + fresh
+
+
+def live_decode_rate(
+    marks: DecodeMarks,
+    tokens: int,
+    last_at: float | None,
+    started_at: float | None,
+    now: float,
+) -> float:
+    """Output tokens per second over about the last DECODE_RATE_WINDOW_S.
+
+    A decoding row is measured from the window start to its newest mark. A
+    row with no token for a mark interval is measured up to ``now``, so its
+    rate falls to zero within one window. A row younger than the window
+    reports its average since ``started_at``.
+    """
+    start = now - DECODE_RATE_WINDOW_S
+    if marks and marks[0][0] <= start:
+        points = marks
+        if last_at is None or now - last_at >= _DECODE_MARK_INTERVAL_S:
+            idle_since = max(last_at or 0.0, marks[-1][0])
+            points = (*marks, (idle_since, tokens), (now, tokens))
+        end = points[-1]
+        before = points[0]
+        for point in points[1:]:
+            if point[0] > start:
+                span = point[0] - before[0]
+                share = (start - before[0]) / span if span > 0 else 0.0
+                at_start = before[1] + (point[1] - before[1]) * share
+                return max(0.0, end[1] - at_start) / (end[0] - start)
+            before = point
+    elapsed = now - started_at if started_at else 0.0
+    return tokens / elapsed if elapsed > 0 else 0.0
+
 
 class RequestStatus(enum.IntEnum):
     """Status of a request in the scheduling system."""
@@ -73,6 +133,11 @@ class SamplingParams:
     frequency_penalty: float = 0.0
     stop: Optional[List[str]] = None
     stop_token_ids: Optional[List[int]] = None
+    # Forced-length generation (benchmark use): when True the model's own
+    # EOS/EOT/generation_config stop tokens do not end generation — only
+    # max_tokens does. Request-level stop strings / stop_token_ids still
+    # stop as usual.
+    ignore_eos: bool = False
 
     # Logprobs settings (memory optimization: disabled by default)
     logprobs: bool = False  # Whether to return logprobs
@@ -140,6 +205,8 @@ class Request:
     generation_started_at: Optional[float] = None
     prefill_started_at: Optional[float] = None
     last_activity_at: Optional[float] = None
+    # (time, output tokens) checkpoints for the live decode rate, oldest first.
+    decode_marks: DecodeMarks = ()
 
     # For BatchGenerator integration
     batch_uid: Optional[int] = None  # UID assigned by BatchGenerator
@@ -153,6 +220,8 @@ class Request:
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
+    # Ordinary prefix reuse awaiting scheduling validation; None once recorded.
+    pending_prefix_cache_tokens: int | None = None
 
     # Memory-pressure requeue. The first ``requeued_output_tokens`` outputs
     # are folded into ``prompt_token_ids`` so re-admission prefills them;
@@ -253,6 +322,11 @@ class Request:
     generation_prompt_start: int = 0  # Token index where the generation prompt starts
     generation_prompt_persists: bool = False  # History keeps the generation prompt
 
+    # Rendered leading system block; a shared tail snapshot ends where it does.
+    system_prefix_ids: Optional[List[int]] = None
+    system_prefix_end: int = 0  # Token index where the shared system prefix ends
+    junction_end: int = 0  # Where this prompt branches off a recent stored sequence
+
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter
     generation_overflow_retries: int = 0  # Per-request __next_prime retry counter
@@ -262,6 +336,7 @@ class Request:
     prefill_eviction_retries: int = (
         0  # Per-request prefill-headroom eviction phase counter
     )
+    prefill_offload_pauses: int = 0  # Pauses that released MoE offload slots
     packed_prefill_excluded: bool = False  # Retries alone after a failed pack
 
     # Request-scoped tool schemas used by protocol output parsers.
@@ -281,6 +356,12 @@ class Request:
     def max_tokens(self) -> int:
         """Maximum output tokens for this request."""
         return self.sampling_params.max_tokens
+
+    def mark_decode_progress(self, now: float) -> None:
+        """Checkpoint the output token count before this step's tokens land."""
+        self.decode_marks = add_decode_mark(
+            self.decode_marks, self.num_output_tokens, self.last_activity_at, now
+        )
 
     def is_finished(self) -> bool:
         """Check if request has finished."""
@@ -318,6 +399,17 @@ class Request:
 
 
 @dataclass
+class TokenLogprob:
+    """Log probability of one generated token or of one alternative to it."""
+
+    token_id: int
+    text: str
+    token_bytes: List[int]
+    logprob: float
+    top: List["TokenLogprob"] = field(default_factory=list)
+
+
+@dataclass
 class RequestOutput:
     """
     Output for a single request after a generation step.
@@ -351,6 +443,8 @@ class RequestOutput:
 
     # Tool calls (for Harmony and other models with tool calling support)
     tool_calls: Optional[List[Dict[str, str]]] = None
+    # One entry per token in new_token_ids when the request asked for logprobs.
+    logprobs: Optional[List[TokenLogprob]] = None
     # Prefix cache stats
     cached_tokens: int = 0
     # Error message (set when engine encounters an unrecoverable error)

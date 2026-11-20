@@ -1,8 +1,8 @@
 class Omlx < Formula
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.7.1rc1.tar.gz"
-  sha256 "dc55b7a83054bf0cfc4e635ae1906414c7d1eeb10fec25248abe9000da3c263a"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.8.0.tar.gz"
+  sha256 "8060f368a5b2eec46c75c1d7431d941a1b15ecb59a2409aab89ffb51392ea826"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
@@ -21,13 +21,6 @@ class Omlx < Formula
   # the venv so it never runs `strip` on the compiled dylibs.
   on_macos do
     skip_clean "libexec" if MacOS.version >= "27"
-  end
-
-  # mlx-audio pins mlx-lm==0.31.1 which conflicts with omlx's git-pinned
-  # mlx-lm. Fetch source separately so we can patch the pin before install.
-  resource "mlx-audio" do
-    url "https://github.com/Blaizzy/mlx-audio.git",
-      revision: "51753266e0a4f766fd5e6fbc46652224efc23981"
   end
 
   # Kokoro's English G2P path uses misaki + spaCy. Bundle the spaCy
@@ -81,8 +74,8 @@ class Omlx < Formula
     end
 
     # Every pip step must share these flags; a later step without --no-binary
-    # (e.g. mlx-audio) can clobber a source-built package with a prebuilt
-    # wheel that fails dlopen on macOS 27 (#2110).
+    # can clobber a source-built package with a prebuilt wheel that fails
+    # dlopen on macOS 27 (#2110).
     pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
@@ -122,8 +115,11 @@ class Omlx < Formula
       ENV.append "CMAKE_ARGS", "-DPython_EXECUTABLE=#{libexec}/bin/python"
     end
 
-    # Install omlx (with optional grammar extra for structured output)
-    install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
+    # [audio] is the only source of mlx-audio and of the Kokoro G2P stack
+    # (misaki, spaCy) that the spaCy model check below needs. [cluster] adds
+    # zeroconf, the only way the Cluster tab finds NVIDIA prefill helpers.
+    extras = build.with?("grammar") ? "audio,cluster,grammar" : "audio,cluster"
+    install_spec = "#{buildpath}[#{extras}]"
     system(*pip_install, install_spec)
 
     if build.with?("custom-kernel")
@@ -132,12 +128,6 @@ class Omlx < Formula
       Dir.chdir(libexec) do
         verify_custom_kernels(libexec/"bin/python")
       end
-    end
-
-    # Install mlx-audio with patched mlx-lm pin to avoid version conflict
-    resource("mlx-audio").stage do
-      inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
-      system(*pip_install, ".[all]")
     end
 
     # Install the spaCy English model required by misaki for Kokoro TTS.
@@ -149,9 +139,6 @@ class Omlx < Formula
            spacy_model_wheel
     system libexec/"bin/python", "-c",
            "import spacy; spacy.load('en_core_web_sm')"
-
-    # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
-    system(*pip_install, "python-multipart>=0.0.5")
 
     bin.install_symlink Dir[libexec/"bin/omlx"]
   end

@@ -41,6 +41,7 @@ def _custom_kernel_build_kwargs() -> dict:
     shared = f"{root}/include"
     attention = f"{root}/attention/csrc"
     lowbit = f"{root}/lowbit/csrc"
+    oqh = f"{root}/oqh/csrc"
     quant = f"{root}/quant_matmul/csrc"
     sparse = f"{root}/sparse_index/csrc"
 
@@ -83,6 +84,7 @@ def _custom_kernel_build_kwargs() -> dict:
                     f"{attention}/block_mask_attention.cpp",
                     f"{attention}/compressed_sparse_attention.cpp",
                     f"{attention}/fa256_attention.cpp",
+                    f"{attention}/kv_roll.cpp",
                     f"{attention}/packed_sparse_attention.cpp",
                     f"{attention}/sdpa_decode.cpp",
                     f"{attention}/sparse_gqa_attention.cpp",
@@ -97,6 +99,7 @@ def _custom_kernel_build_kwargs() -> dict:
                             f"{attention}/block_mask_attention.metal",
                             f"{attention}/compressed_sparse_attention.metal",
                             f"{attention}/fa256_attention.metal",
+                            f"{attention}/kv_roll.metal",
                             f"{attention}/packed_sparse_attention.metal",
                             f"{attention}/sdpa_decode.metal",
                             f"{attention}/sparse_gqa_attention.metal",
@@ -116,6 +119,17 @@ def _custom_kernel_build_kwargs() -> dict:
                         sources=[
                             f"{lowbit}/lowbit_qmv.metal",
                         ],
+                    ),
+                ],
+            ),
+            extension.MetalExtension(
+                "omlx.custom_kernels.oqh._ext",
+                sources=[f"{oqh}/bindings.cpp", f"{oqh}/oqh.cpp"],
+                include_dirs=[oqh, shared],
+                metal_libraries=[
+                    extension.MetalLibrary(
+                        "omlx_oqh_kernels",
+                        sources=[f"{oqh}/oqh.metal"],
                     ),
                 ],
             ),

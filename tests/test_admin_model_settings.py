@@ -4,8 +4,11 @@
 import asyncio
 import copy
 import json
+import shutil
+import struct
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pydantic
 import pytest
 from fastapi import HTTPException
 
@@ -51,6 +54,18 @@ def _write_qwen4_mtp_checkpoint(tmp_path, *, embedded_mtp: bool) -> None:
     )
 
 
+def _write_minimax_m3_checkpoint(tmp_path, *, dspark: bool) -> None:
+    config = {"model_type": "minimax_m3_vl", "text_config": {"num_hidden_layers": 60}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    if dspark:
+        draft = tmp_path / "dspark"
+        draft.mkdir()
+        (draft / "config.json").write_text(
+            json.dumps({"architectures": ["DSparkMiniMaxDraftModel"]})
+        )
+        (draft / "model-dspark-00001.safetensors").write_bytes(b"")
+
+
 async def _update_settings(
     pool: EnginePool,
     settings: ModelSettings,
@@ -74,6 +89,80 @@ async def _update_settings(
 
     manager.set_settings.assert_called_once_with("ling", settings)
     return result
+
+
+def _write_lora_adapter(path):
+    """An mlx-format adapter; only its config and safetensors header are read."""
+    path.mkdir()
+    (path / "adapter_config.json").write_text(
+        json.dumps({"lora_parameters": {"rank": 1, "scale": 1.0}})
+    )
+    header = {
+        f"model.layers.0.self_attn.q_proj.lora_{name}": {
+            "dtype": "F32",
+            "shape": shape,
+            "data_offsets": offsets,
+        }
+        for name, shape, offsets in (("a", [2, 1], [0, 8]), ("b", [1, 2], [8, 16]))
+    }
+    raw = json.dumps(header).encode()
+    (path / "adapters.safetensors").write_bytes(
+        struct.pack("<Q", len(raw)) + raw + bytes(16)
+    )
+    return path
+
+
+@pytest.mark.asyncio
+async def test_lora_adapter_is_checked_when_it_changes(tmp_path):
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    config = {"num_hidden_layers": 1, "hidden_size": 4}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    settings = ModelSettings()
+
+    with pytest.raises(HTTPException) as missing:
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(lora_adapter=str(tmp_path / "none")),
+        )
+    assert missing.value.status_code == 422
+
+    adapter = _write_lora_adapter(tmp_path / "adapter")
+    request = admin_routes.ModelSettingsRequest(lora_adapter=str(adapter))
+    with pytest.raises(HTTPException, match="model width 4") as misfit:
+        await _update_settings(pool, settings, request)
+    assert misfit.value.status_code == 422
+
+    (tmp_path / "config.json").write_text(json.dumps({**config, "hidden_size": 2}))
+    await _update_settings(pool, settings, request)
+    assert settings.lora_adapter == str(adapter)
+    # A new adapter is a new load-time variant.
+    assert entry.load_failed is False
+
+    # Whole-payload saves resend the path; a removed folder must not block them.
+    shutil.rmtree(adapter)
+    request = admin_routes.ModelSettingsRequest(lora_adapter=str(adapter), top_k=20)
+    await _update_settings(pool, settings, request)
+    assert settings.top_k == 20
+
+    with pytest.raises(HTTPException) as conflict:
+        admin_routes._validate_model_settings(
+            entry, {"lora_adapter": str(adapter), "dflash_enabled": True}
+        )
+    assert conflict.value.status_code == 400
+
+    # The picker still lists the saved adapter, with why it cannot load.
+    manager = MagicMock()
+    manager.get_settings.return_value = settings
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_settings_manager", return_value=manager),
+    ):
+        listed = await admin_routes.list_lora_adapters("ling", is_admin=True)
+    assert [(a["path"], a["problem"]) for a in listed["adapters"]] == [
+        (str(adapter), "the adapter folder was not found")
+    ]
 
 
 @pytest.mark.asyncio
@@ -273,6 +362,31 @@ def _idle_engine() -> MagicMock:
 
 
 @pytest.mark.asyncio
+async def test_gpu_power_limit_saves_without_reload():
+    pool, entry = _failed_pool()
+    entry.engine = _idle_engine()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+    settings = ModelSettings()
+
+    def request(watts):
+        return admin_routes.ModelSettingsRequest(gpu_power_limit_w=watts)
+
+    result = await _update_settings(pool, settings, request(10))
+    assert settings.gpu_power_limit_w == 10
+    assert result["requires_reload"] is False
+    pool._unload_engine.assert_not_awaited()
+
+    await _update_settings(pool, settings, request(0))
+    assert settings.gpu_power_limit_w is None
+
+    # Profiles and templates go through the same request model.
+    with pytest.raises(pydantic.ValidationError):
+        request(1)
+    assert admin_routes._normalize_profile_settings({"gpu_power_limit_w": 0}) == {}
+
+
+@pytest.mark.asyncio
 async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
@@ -342,9 +456,9 @@ async def test_qwen_ane_prefill_accepts_qwen38_config_type():
 @pytest.mark.parametrize(
     "initial, update",
     [
-        ({"qwen35_ane_prefill_enabled": True}, {"qwen35_oq_a8_enabled": True}),
-        ({"qwen35_oq_a8_enabled": True}, {"qwen35_ane_prefill_enabled": True}),
-        ({}, {"qwen35_oq_a8_enabled": True, "qwen35_ane_prefill_enabled": True}),
+        ({"qwen35_ane_prefill_enabled": True}, {"a8_prefill_enabled": True}),
+        ({"a8_prefill_enabled": True}, {"qwen35_ane_prefill_enabled": True}),
+        ({}, {"a8_prefill_enabled": True, "qwen35_ane_prefill_enabled": True}),
     ],
 )
 async def test_oq_a8_is_refused_while_ane_prefill_is_on(tmp_path, initial, update):
@@ -382,12 +496,12 @@ async def test_oq_a8_alone_is_persisted():
             pool,
             settings,
             admin_routes.ModelSettingsRequest(
-                qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=256
+                a8_prefill_enabled=True, a8_prefill_min_tokens=256
             ),
         )
 
-    assert settings.qwen35_oq_a8_enabled is True
-    assert settings.qwen35_oq_a8_min_tokens == 256
+    assert settings.a8_prefill_enabled is True
+    assert settings.a8_prefill_min_tokens == 256
 
 
 @pytest.mark.asyncio
@@ -402,12 +516,12 @@ async def test_oq_a8_is_accepted_for_qwen4_exp_and_keeps_min_tokens():
             pool,
             settings,
             admin_routes.ModelSettingsRequest(
-                qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=512
+                a8_prefill_enabled=True, a8_prefill_min_tokens=512
             ),
         )
 
-    assert settings.qwen35_oq_a8_enabled is True
-    assert settings.qwen35_oq_a8_min_tokens == 512
+    assert settings.a8_prefill_enabled is True
+    assert settings.a8_prefill_min_tokens == 512
 
 
 @pytest.mark.asyncio
@@ -425,12 +539,12 @@ async def test_oq_a8_is_refused_outside_validated_families(config_type):
             await _update_settings(
                 pool,
                 settings,
-                admin_routes.ModelSettingsRequest(qwen35_oq_a8_enabled=True),
+                admin_routes.ModelSettingsRequest(a8_prefill_enabled=True),
             )
 
     assert excinfo.value.status_code == 400
     assert "Flash-Next" in excinfo.value.detail
-    assert settings.qwen35_oq_a8_enabled is False
+    assert settings.a8_prefill_enabled is None
 
 
 @pytest.mark.asyncio
@@ -452,7 +566,7 @@ async def test_oq_a8_for_qwen4_exp_still_conflicts_with_ane_prefill(tmp_path):
         await admin_routes.update_model_settings(
             "ling",
             admin_routes.ModelSettingsRequest(
-                qwen35_oq_a8_enabled=True, qwen35_ane_prefill_enabled=True
+                a8_prefill_enabled=True, qwen35_ane_prefill_enabled=True
             ),
             is_admin=True,
         )
@@ -471,6 +585,11 @@ async def test_oq_a8_for_qwen4_exp_still_conflicts_with_ane_prefill(tmp_path):
         ("Qwen4-Exp", True),
         ("qwen4", False),
         ("qwen4_exp_x", False),
+        ("deepseek_v41", True),
+        ("deepseek_v4", False),
+        ("minimax_m3_vl", True),
+        ("MiniMax-M3", True),
+        ("minimax_m2", False),
         ("llama", False),
         (None, False),
     ],
@@ -486,28 +605,72 @@ def test_oq_a8_model_supported(config_type, expected):
 def test_model_options_report_oq_a8_support(config_type, kernels, expected):
     with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=kernels):
         options = admin_routes._model_options({"config_model_type": config_type}, None)
-    assert options["qwen35_oq_a8_supported"] is expected
+    assert options["a8_prefill_supported"] is expected
 
 
 @pytest.mark.asyncio
-async def test_oq_a8_needs_native_int8_kernels():
-    """Nothing on this hardware would run faster, so the setting is refused
-    rather than accepted and silently ignored at load."""
+@pytest.mark.parametrize("field", ["a8_prefill_enabled", "qwen35_ane_prefill_enabled"])
+async def test_oqh_checkpoint_refuses_a8_and_ane_prefill(tmp_path, field):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "omlx_oqh": {"version": 1}})
+    )
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
+    entry.model_path = str(tmp_path)
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        options = admin_routes._model_options(
+            {"config_model_type": "qwen3_5", "model_path": str(tmp_path)}, None
+        )
+        with pytest.raises(admin_routes.HTTPException) as excinfo:
+            await _update_settings(
+                pool, settings, admin_routes.ModelSettingsRequest(**{field: True})
+            )
+
+    assert options["a8_prefill_supported"] is False
+    assert options["ane_prefill_backend"] is None
+    assert excinfo.value.status_code == 400
+    assert "oQh" in excinfo.value.detail
+    assert getattr(settings, field) in (None, False)
+
+
+@pytest.mark.asyncio
+async def test_oq_a8_choice_is_kept_without_native_int8_kernels():
+    """Without the kernels, A8 reaches only a Prefill Accelerator Mac's
+    layers. The saved choice is kept, and changing the helper does not write
+    one."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
     settings = ModelSettings()
 
     with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=False):
-        with pytest.raises(admin_routes.HTTPException) as excinfo:
-            await _update_settings(
-                pool,
-                settings,
-                admin_routes.ModelSettingsRequest(qwen35_oq_a8_enabled=True),
-            )
+        await _update_settings(
+            pool, settings, admin_routes.ModelSettingsRequest(a8_prefill_enabled=False)
+        )
+        assert settings.a8_prefill_enabled is False
+        await _update_settings(
+            pool, settings, admin_routes.ModelSettingsRequest(prefill_helper_node_id="m5")
+        )
+        await _update_settings(
+            pool, settings, admin_routes.ModelSettingsRequest(prefill_helper_node_id=None)
+        )
+    assert settings.a8_prefill_enabled is False
 
-    assert excinfo.value.status_code == 400
-    assert "M5-series or newer" in excinfo.value.detail
-    assert settings.qwen35_oq_a8_enabled is False
+
+@pytest.mark.asyncio
+async def test_prefill_helper_choice_needs_a_model_that_gets_a_helper():
+    """A text-only qwen3_5 conversion runs on an engine without a helper."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    settings = ModelSettings()
+    request = admin_routes.ModelSettingsRequest(prefill_helper_node_id="m5")
+    with patch.object(admin_routes, "prepare_prefill_helper"):
+        await _update_settings(pool, settings, request)
+        assert settings.prefill_helper_node_id is None
+        entry.engine_type = "vlm"
+        await _update_settings(pool, settings, request)
+    assert settings.prefill_helper_node_id == "m5"
 
 
 @pytest.mark.asyncio
@@ -620,6 +783,43 @@ async def test_qwen4_mtp_setting_rejects_nextn_only_layout(tmp_path):
 
     assert exc_info.value.status_code == 400
     assert "native nextn layers are not supported" in exc_info.value.detail
+    assert settings.mtp_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_minimax_m3_mtp_setting_accepts_bundled_dspark(tmp_path):
+    _write_minimax_m3_checkpoint(tmp_path, dspark=True)
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "minimax_m3_vl"
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(mtp_enabled=True),
+    )
+
+    assert settings.mtp_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_minimax_m3_mtp_setting_rejects_missing_dspark(tmp_path):
+    _write_minimax_m3_checkpoint(tmp_path, dspark=False)
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "minimax_m3_vl"
+    settings = ModelSettings()
+
+    with pytest.raises(admin_routes.HTTPException) as exc_info:
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(mtp_enabled=True),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "no bundled dspark/ draft" in exc_info.value.detail
     assert settings.mtp_enabled is False
 
 
@@ -776,6 +976,15 @@ async def test_mtp_depth_rejects_out_of_range_values(field, value):
         )
 
 
+@pytest.mark.parametrize("value", [0, -5])
+def test_output_token_caps_below_one_are_rejected(value):
+    # The global route applies the runtime copy before validate().
+    with pytest.raises(pydantic.ValidationError, match="max_tokens"):
+        admin_routes.ModelSettingsRequest(max_tokens=value)
+    with pytest.raises(pydantic.ValidationError, match="sampling_max_tokens"):
+        admin_routes.GlobalSettingsRequest(sampling_max_tokens=value)
+
+
 def test_unknown_settings_fields_are_rejected_loudly():
     """Unknown keys must 422 instead of silently returning success:true."""
     import pydantic
@@ -903,3 +1112,28 @@ async def test_enabling_dflash_over_a_deleted_draft_path_is_rejected(tmp_path):
             assert exc.value.status_code == 422
 
     manager.set_settings.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_type,accepted", [("qwen3_5", True), ("gemma4", False)])
+async def test_paroquant_dflash_allows_only_qwen_targets(
+    tmp_path, model_type, accepted
+):
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = model_type
+    entry.engine_type = "vlm"
+    (tmp_path / "config.json").write_text(
+        json.dumps({"quantization_config": {"quant_method": "paroquant"}})
+    )
+    settings = ModelSettings()
+    request = admin_routes.ModelSettingsRequest(dflash_enabled=True)
+
+    if accepted:
+        await _update_settings(pool, settings, request)
+        assert settings.dflash_enabled is True
+    else:
+        with pytest.raises(HTTPException) as exc:
+            await _update_settings(pool, settings, request)
+        assert exc.value.status_code == 400
+        assert exc.value.detail == admin_routes._PAROQUANT_REASON

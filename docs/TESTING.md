@@ -1,6 +1,25 @@
 # Test layout
 
-Server tests live in `tests/` and must not depend on `apps/`: after the full run, CI deletes `apps/`, collects the server tests again, and starts `omlx serve` to check the API-only fallback. Web UI tests live in `apps/omlx-web/tests/` and the macOS app's Python tests in `apps/omlx-mac/Tests/python/`. A plain `pytest` runs all three through `testpaths`. The standalone dashboard script tests are the `apps/omlx-web/tests/*.test.cjs` files except `network_auth_ui.test.cjs`, which `test_admin_network_auth_ui.py` runs with its input.
+Server tests live in `tests/` and must not depend on `apps/`: after the full run, CI deletes `apps/`, collects the server tests again, and starts `omlx serve` to check the API-only fallback. Web UI tests live in `apps/omlx-web/tests/` and the macOS app's Python tests in `apps/omlx-mac/Tests/python/`. A plain `pytest` runs all three through `testpaths`.
+
+Run `node --test` from `apps/omlx-web/tests/` to discover the standalone dashboard script tests. `test_admin_network_auth_ui.py` runs `network_auth_ui_runner.cjs` with backend-generated cases on stdin.
+
+# Qwen3.5 text-only checkpoint tests
+
+Run `python -m pytest -q tests/test_oq.py -k Qwen35TextCheckpoint` to check
+loading, oQe calibration, and sensitivity proxies for text-only Qwen3.5
+checkpoints. Small local dense and MoE models, with and without an MTP head,
+cover the Hugging Face `_text` names and the existing mlx-lm name, including
+strict loading of quantized output.
+No model download is required.
+
+# oQh tests
+
+Run `python -m pytest -q tests/test_oqh.py` after `make kernels` to check the oQh format. It compares the GEMV, gather GEMV and stock-path matmuls with the dequantized weight at every width, the paired gate | up GEMVs with two single calls, the norm (bit for bit with MLX `rms_norm`) and activation kernels with their references, the memo that lives only as long as its input, the quantizer against plain rounding, the TP-sized blocks of row-parallel linears, and the planner keeping the affine size while it raises the narrowest tensors first. Tiny dense and MoE Qwen3.5 checkpoints check that the load hook builds oQh modules with norm fusion, that prefill, decode and direct submodule calls match a dequantized float twin, and that MTP verify rows match one-token decode. Tiny Qwen3.8-Flash-Next, GLM-5.3 and DeepSeek V4.1 checkpoints check the experts-only exports, the GLM fused decode kernels on oQh experts, and the tensor-parallel split of row scales and signs; `test_deepseek_v41_fused_decode.py` runs its fused-decode cases with oQh routed experts too. The kernel cases skip when the oQh extension is not built. The Splash refusal of oQh checkpoints is in `test_splash_engine.py`; `test_prefill_helper.py` checks that oQh models keep their helper adapter and that a CUDA helper must list the model's oQh format version for its family. No model download is required.
+
+# LFM3-Omni oQ tests
+
+Run `python -m pytest -q tests/test_oq.py -k 'Lfm3OmniSanitize or lfm3_omni_copies_codec'` to check that oQ writes LFM3-Omni weights under the names mlx-vlm loads (eager sanitize and streaming discovery), keeps the speech modules in floating point, copies the speech codec, and walks the conv layers with the native mask. They use a small config and need no model download.
 
 # Qwen3-ASR audio quantization tests
 
@@ -16,6 +35,10 @@ The audio model-list smoke test checks that app startup publishes its shim insid
 
 Run `xcodebuild -project apps/omlx-mac/oMLX.xcodeproj -scheme oMLX -destination 'platform=macOS' -only-testing:oMLXTests/ThemeTests test` to check theme colors. The readability case renders a probe through `.omlxThemed()` with isolated saved preferences, checking disabled and enabled colors in light and dark appearances. It covers the shared theme path used by popovers, not app relaunch or full-screen layout.
 
+# macOS server restart health tests
+
+Run `python -m pytest -q apps/omlx-mac/Tests/python/test_server_process_health.py` on macOS with the Xcode Command Line Tools to check `ServerProcess` restart health. It compiles the production `ServerProcess.swift` with stubbed app dependencies and short-lived `/bin/sleep` children, so no app, Python server or model is needed.
+
 # Text-only VLM loading tests
 
 Run `python -m pytest -q tests/test_vlm_vision_fallback.py` to check strict loading and logits with a small quantized DiffusionGemma checkpoint, unchanged loaders for unreadable shards or retained vision, and patch restoration after loading errors. No model download is required.
@@ -26,8 +49,8 @@ CI runs all default tests on Python 3.11 for PRs and pushes to `main`. A daily s
 
 The automatic Qwen FP16/BF16 decode route has numerical, cache-state and
 fallback tests in `tests/test_qwen35_fp16_decode.py`. Run it with
-`tests/test_qwen35_gdn_prework.py` to check that the existing BF16 Qwen4 and
-speculative routes remain intact.
+`tests/test_qwen35_gdn_prework.py` to check that the BF16 and FP16 Qwen4 fused
+GDN routes match the stock arithmetic and the speculative routes remain intact.
 
 # First-token burst release
 
@@ -64,9 +87,17 @@ Run `python -m pytest -q tests/test_cli.py tests/test_integrations.py` to check 
 
 Run `python -m pytest -q tests/test_modernbert_attention.py tests/test_embedding.py tests/test_mlx_embeddings_compat.py` to check finite padded attention, single-input equivalence, local-window masking, and embedding integration. The attention regression covers fp16, bf16, and fp32 at lengths around the affected SDPA tile boundaries.
 
+# GGUF model tests
+
+Run `python -m pytest -q tests/test_model_discovery.py tests/test_splash_engine.py tests/test_hf_downloader.py -k "gguf or Gguf or nvfp4 or FileSelection or splash_package"` for GGUF models, Splash's checkpoint checks and file-selection downloads. The `write_gguf` fixture in `tests/conftest.py` writes a GGUF header with given metadata, so discovery, the generated model folder and its derived tokenizer, Splash's checks, and per-file deletion run without a model download.
+
+Run `python -m pytest -q tests/test_splash_engine.py -k "122b or flint or pruned"` for the families Splash 1.4.1 adds and pruned MoE GGUFs.
+
+Run `python -m pytest -q tests/test_splash_engine.py -k TestDiskCache` and `node --test apps/omlx-web/tests/ssd_cache_clear_ui.test.cjs` for Splash SSD-cache deletion. These cover idle unload before deletion, busy requests, native file locks, symlink targets, sparse-file disk usage, and cache left by unloaded models. The lock file stays in place so another Splash process cannot bypass it while cache data is being removed.
+
 # Decision model tests
 
-Run `python -m pytest -q tests/test_systemone.py` to check the `/v1/systemone` decision models. Clef cases cover the prompt layout and question/option spans, state truncation, answer formatting, the joint head parameter names against the released checkpoint layout, and one logit per option for each question. OpenJev cases cover the text and screenshot prompt layouts, image sources, the two-stage readout for more than 52 options, and the calibration and confidence formulas. Decision 3.0 (d3) cases cover the release prompt text, question validation, answer formatting and confidence, 3D RoPE positions for image and video prompts, video frame sampling and timestamps, and media placeholder expansion. A tiny random Qwen3.5 backbone checks that chunked prefill matches a single pass, that a copied prefix cache gives the same readout as a full prefill, and that the d3 layer-step encode matches the model's own forward without a causal mask. Base-model checkpoints are covered too: a non-periodic `layer_types` schedule, a missing LM head, and `language_model.*` / `visual.*` weight names that sanitize once. Detection, pool dispatch, the endpoint and the oQ head and readout passthrough are tested in `test_model_discovery.py`, `test_engine_pool.py`, `integration/test_server_endpoints.py` and `test_oq.py`. No model download is required.
+Run `python -m pytest -q tests/test_systemone.py` to check the `/v1/systemone` decision models. Clef cases cover the prompt layout and question/option spans, state truncation, answer formatting, the joint head parameter names against the released checkpoint layout, and one logit per option for each question. OpenJev cases cover the text and screenshot prompt layouts, image sources, the two-stage readout for more than 52 options, and the calibration and confidence formulas. Decision 3.0 (d3) cases cover the release prompt text, question validation, answer formatting and confidence, 3D RoPE positions for image and video prompts, video frame sampling and timestamps, and media placeholder expansion. LiquidAI d1 cases check that the layer-step forward on a tiny random LFM3-VL d1 model matches mlx-vlm's set-attention forward, and that media instructions and videos are rejected. A tiny random Qwen3.5 backbone checks that chunked prefill matches a single pass, that a copied prefix cache gives the same readout as a full prefill, and that the d3 layer-step encode matches the model's own forward without a causal mask. Base-model checkpoints are covered too: a non-periodic `layer_types` schedule, a missing LM head, and `language_model.*` / `visual.*` weight names that sanitize once. Detection, pool dispatch, the endpoint and the oQ head and readout passthrough are tested in `test_model_discovery.py`, `test_engine_pool.py`, `integration/test_server_endpoints.py` and `test_oq.py`. No model download is required.
 
 # QSA reservation tests
 
@@ -94,6 +125,10 @@ Run `python -m pytest -q tests/test_prefill_transient_tracker.py tests/test_pref
 
 Run `python -m pytest -q tests/test_scheduler.py tests/test_scheduler_boundary_completion.py tests/test_prefix_cache_gdn_split.py` to check cache-freshness admission and completed boundary recovery. The completion tests use a small initialized Qwen3.5 hybrid model and the real BatchGenerator, then compare restored-prefix logits with a fresh forward pass. They cover embedded snapshots, GDN sidecars, exact SpecPrefill static-prefix sidecars, off-boundary completion, and unknown or inconsistent cache positions.
 
+# Prefix cache serving statistics
+
+Run `python -m pytest -q tests/test_prefix_cache_restore_stats.py tests/test_cache_observability.py tests/test_runtime_cache_observability.py` to check serving cache hit rates and saved-token counters. Serving lookups count only KV retained after reconstruction, prefix/kickoff guards, scheduling validation and sparse-prefill fallback. A stale index match with no restored KV is a miss; a partial restore counts only its reusable tokens. Deferred admissions count once, and memory requeues do not count the same external request again. These tests use real paged metadata, hot-cache tensor storage and KV/ArraysCache reconstruction with small arrays, without a model download.
+
 # Batch KV capacity tests
 
 Run `python -m pytest -q tests/test_vlm_batch_kv_capacity.py` after changing `omlx/patches/vlm_batch_kv_capacity.py` or bumping the mlx-lm or mlx-vlm pin. The tests load the installed, unpatched cache module next to the patched one and compare cache state and attention output bit for bit through random appends, trims, rollbacks, merges, joins, filters and restores. They cover the mlx-vlm class, the mlx-lm class that prefix restore builds, and a batch that mixes both.
@@ -106,13 +141,15 @@ For a two-Mac smoke test, start isolated servers with separate base paths. Reque
 
 # DeepSeek V4.1 offline tests
 
-CED scheduler prefill, short suffix positions, full-logit scoring, and DSpark
-continuity: `python -m pytest tests/test_deepseek_v41_ced.py tests/test_deepseek_v41_ssd.py -q`.
+CED scheduler prefill, short suffix positions, full-logit scoring, DSpark
+continuity, and CED/full prefill SSD blocks that never hit across modes but share one SSD budget: `python -m pytest tests/test_deepseek_v41_ced.py tests/test_deepseek_v41_ssd.py -q`.
 Replay is approximate; cache restoration is compared with the same chunk boundaries.
 
 Run `python -m pytest -q tests/test_deepseek_v41.py` for the text/vision port. Synthetic weights and small recorded official outputs cover prefill/decode, DSpark, Engram and vision numerics without a checkpoint download or vendored reference implementation. See `tests/fixtures/deepseek_v41_expected.md` for provenance and reference corrections. PyTorch is optional for the independent FP8/FP4 arithmetic checks. Other cases cover BatchGenerator admission, cache restoration, DSML and VLM engine execution.
 
-FP8 activation boundary and layout checks: `python -m pytest tests/test_deepseek_v41_activation.py -q`. These compare fused FP8 and weighted SwiGLU kernels against reference arithmetic across rounding ties, scale transitions, clipping, intermediate casts and floating-point dtypes.
+FP8 activation boundary and layout checks: `python -m pytest tests/test_deepseek_v41_activation.py -q`. These compare fused FP8 and weighted SwiGLU kernels against reference arithmetic across rounding ties, scale transitions, clipping, intermediate casts and floating-point dtypes, and the one-pass RoPE kernel (with its fused act_quant and heads-major input) against the reference rotation.
+
+Fused decode kernels: `python -m pytest tests/test_deepseek_v41_fused_decode.py -q`. A five-layer random model with MXFP or oQ2-oQ3 affine layouts (2-8 bits) runs each decode layer against the unfused block, batched and MTP verify blocks are checked bitwise against single-token decode (including the matrix-tile kernels an MTP-enabled model uses), and DSpark generation must reproduce greedy decoding.
 
 MoE activation reuse and per-expert reference checks: `python -m pytest tests/test_deepseek_v41_moe.py -q`. These cover sorted prefill, decode, independent routed/shared activation policies, and repeated outputs with small quantized weights.
 
@@ -171,9 +208,17 @@ Run `python -m pytest tests/test_mtp_xtc_sampling.py -q` for request sampler cha
 
 Run `python -m pytest -q tests/test_mlx_lm_mtp_patch.py -k "spec_command_buffers or spec_caps"` for target selection and restoration after a speculative step. These cases mock GPU detection and the native setter; they do not load a model or measure throughput.
 
+### Ling Lightning MTP
+
+Run `python -m pytest -q tests/test_bailing_hybrid_patch.py -k mtp` for the Ling (`bailing_hybrid`) MTP head. Tiny random-weight models check that a partial rollback equals decoding only the accepted tokens, that the nextn layer loads as `mtp.0.*` (and loads with MTP off when an export drops it), that greedy BatchGenerator output matches plain decode, and that oQ with Preserve MTP keeps the head. Draft acceptance and speed need a real Ling checkpoint.
+
 ### Batched DFlash drafter
 
 Run `python -m pytest tests/test_dflash_batched.py tests/test_mlx_lm_mtp_patch.py -q -k "dflash or block_drafter or drafter"`. `test_dflash_batched.py` builds tiny DFlash2, Laguna and Muse Glimmer drafters with random weights and checks that the batched forward matches each family's mlx-vlm `draft_block` (MiMo's value scale and trained mask embedding against a v1 reference with scaled `v_proj` weights and a replaced mask-token row), that rows drafted together match the same rows drafted alone across ring wrap-around, ragged context segments and cohort changes, and covers prefill seed window slicing, prefix-hit context restore, block-size clamping and verify-mode parsing. The `block_drafter` cases in `test_mlx_lm_mtp_patch.py` drive the Lightning MTP verify path with a table drafter on the CountingModel harness and require token parity with standard decoding, one context entry per committed position (including late joins) and release of finished rows; the drafter-target cases check layer captures on Qwen3 and Qwen3.5 text targets and require greedy parity with plain decode for tiny Qwen3 and Laguna targets, including Laguna's sliding window wrapping; on NAX hosts `test_mimo_v2_patch.py` also checks that MiMo's fused decode loop reports the same layer captures as the reference loop. Real drafter acceptance and throughput need a target checkpoint with its DFlash draft and are measured against the standard batched engine.
+
+### LoRA adapters
+
+Run `python -m pytest -q tests/test_lora_adapters.py tests/test_oqh.py -k "lora or adapter"` after `make kernels`, plus `tests/test_admin_model_settings.py tests/test_model_settings.py tests/test_model_discovery.py tests/test_accuracy_upload.py -k "lora or adapter"`. Tiny models check that PEFT and mlx-format adapters add the scaled update (per-module `alpha_pattern` included) on dense and quantized projections, that a refused adapter leaves the model unchanged, which PEFT options and targets are refused, and that the SSD cache numerics change with the adapter. The oQh case wraps the MLP projections of a tiny oQh Qwen3.5 checkpoint and requires the fused MLP to be released and the output to match the float twin with the same adapter. The settings cases cover the conflicting accelerators, profile merges that drop them, and a save path that checks the adapter only when it changes. Real adapters need a local checkpoint: compare each wrapped projection with the PEFT tensors read by key, then compare base and adapter logprobs through the API.
 
 # VLM cache boundary tests
 
@@ -196,7 +241,7 @@ For a real-server check, request a small `write(content: string)` call with thin
 
 # Streamed oQ calibration tests
 
-Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed calibration. The small BF16 Qwen4 fixture exercises GDN, sparse attention, mmap PLE and the MTP head. It compares imatrix statistics and fused sensitivity with resident collection, verifies cache reuse with and without MTP, and converts and reloads the artifact with its shared PLE scale intact. A small MiniMax decoder fixture also compares dense and MoE collection. These cases replace the separate streaming test modules and need no external checkpoint.
+Run `python -m pytest tests/test_oq.py -k TestStreamedCalibration` for streamed calibration. The small BF16 Qwen4 fixture exercises GDN, sparse attention, mmap PLE and the MTP head. It compares imatrix statistics and fused sensitivity with resident collection, verifies cache reuse with and without MTP, and converts and reloads the artifact with its shared PLE scale intact. A small MiniMax decoder fixture also compares dense and MoE collection. Small Qwen3.5 checkpoints (dense and MoE, VLM and text-only) compare streamed and resident statistics and sensitivity, and check that the VLM MTP head keeps each batch row on its own MRoPE positions. These cases replace the separate streaming test modules and need no external checkpoint.
 
 # Fused routed-expert decode tests
 
@@ -228,3 +273,13 @@ Run `python -m pytest -q tests/integration/test_server_endpoints.py -k structure
 Run `python -m pytest -q tests/test_qwen4_qsa_decode_gather.py -k "batch_bank or batch_gather"` to check the batched QSA paths. The row-bank cases drive one attention layer through right-padded chunked prompt prefill, decode, verify windows, ragged vector rollback, reorder and drop filters, extend, trim and state restore, and require layer outputs and cache state to be bit-identical with fresh per-row indexer caches. The gathered cases compare batched decode steps and verify windows with the dense masked path: outputs allclose, cache state identical, every query bounded to the QSA budget plus its tail, and each fail-closed case kept on the dense path. Both groups include the served ratio 4 / top-k 512 geometry.
 
 For a real-server comparison, use the same model, prompts and cache state on main and the branch, with sessions of different lengths well past the QSA crossover (e.g. a 100K shared prompt plus 2K unshared tokens per session). Report aggregate decode while every stream is decoding, per batch size, with Lightning MTP on and off, and check a temperature-0 cold/warm identity and a multi-session codeword fan-out with prompts of different lengths.
+
+# GPU power limit tests
+
+Run `python -m pytest -q tests/test_gpu_power.py` to check the GPU power limiter with a fake registry entry: the lowest active cap applies, the cap is removed after the release delay unless a new request arrives first, a raised or removed cap is rewritten on a 1, 1, 2, 3 check-interval backoff while a stricter thermal limit stays, a marker left by a dead server removes the cap on the next start (a live owner's marker is kept), a benchmark start drops a cap that only waits out the release delay, and a GPU that rejects the cap leaves requests uncapped. No GPU cap is written.
+
+# Prefill Accelerator helper tests
+
+Run `python -m pytest -q tests/test_prefill_helper.py` for the host side: splits against an unsplit prefill on small models of each family, the SSH and control-channel transports with fake helpers, GPU budgets, and the link-aware layer choice. `test_payload_matches_the_contract_fixture` compares each family's boundary, state and prefix arrays with the recorded fixture in `tests/fixtures/prefill_contract/<family>/`. When it fails because the arrays changed on purpose, raise the adapter's `contract` and record again with `python tests/fixtures/record_prefill_contract.py <family> --force`; a Linux helper is then refused for the family until its own contract is raised too.
+
+Run `python -m pytest -q apps/omlx-cuda-helper/tests` for the Linux helper. `test_protocol.py` pairs the helper with a real `PairingManager` and drives its control channel with the host's `agent` module, `test_chain.py` runs two stage processes with a fake family, and the per-family files replay the same contract fixtures through the helper's own implementation. On CUDA, `test_qwen3_5.py` also checks that an oQh linear equals its weight rotated back and that the rotation has the host's bits, `test_qwen4_exp.py` checks the oQh expert kernel against the experts rebuilt dense, and `test_glm5_next.py` runs GLM-5.3 oQh experts through it. They need no NVIDIA GPU: on a Mac the stages run on Metal, and on the helper machine the same files run on CUDA. CI does not run this folder.

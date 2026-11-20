@@ -7,31 +7,46 @@ Batch rows are evaluated independently so late admission cannot share history.
 """
 
 import math
-from contextlib import nullcontext
+import threading
+from contextlib import contextmanager, nullcontext
 from functools import cache, lru_cache
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx_lm.models.pipeline import PipelineMixin
 from mlx_lm.models.switch_layers import SwitchLinear
 
 from omlx.custom_kernels.attention import fast as attention_fast
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
+from omlx.utils.hardware import get_max_working_set_bytes
 
 from ..deepseek_v4.switch_layers import _block_config, _build_mxfp4_blocks
 from . import decode_fused, growth
-from .activation import quantize_paired_swiglu_activation, quantize_swiglu_activation
+from .a8 import dense_a8_pair, routed_experts_a8, shared_expert_a8
+from .activation import (
+    quantize_paired_swiglu_activation,
+    quantize_swiglu_activation,
+    rope_activation,
+)
 from .cache import DeepseekV41Cache
 from .engram import Engram, NgramHash, build_compressed_token_map
 from .head import project_logits
 from .hyper_connection import (
+    PROJECTION_WIDTH_MULTIPLE,
     fused_hc_post,
     fused_hc_pre_norm,
     fused_hc_projection,
     sinkhorn,
 )
-from .kernels import packed_index_scores, packed_index_topk, packed_sparse_attention
+from .kernels import (
+    index_select,
+    packed_index_scores,
+    packed_index_topk,
+    packed_sparse_attention,
+)
 from .mtp import DSparkMixin
+from .packed_attention import nax_packed_sparse_attention
 from .quantization import QuantizedProjection, pack_activation, quantize_activation
 from .routing import combine_sorted_experts
 
@@ -135,7 +150,9 @@ def _rope_apply(x, cos, sin, inverse):
     return mx.concatenate([x[..., :-d], rotated.reshape(*x.shape[:-1], d).astype(x.dtype)], -1)
 
 
-def rope(x, positions, config, compressed, inverse=False):
+def rope(x, positions, config, compressed, inverse=False, quantize=False, heads_major=False):
+    """RoPE of x [B, L, ..., D] at positions; quantize: act_quant of the result; heads_major:
+    x is [B, H, L, D] and the result [B, L, H, D]."""
     params = (
         config.rope_head_dim,
         config.compress_rope_theta if compressed else config.rope_theta,
@@ -145,7 +162,20 @@ def rope(x, positions, config, compressed, inverse=False):
         config.beta_slow,
     )
     cos, sin = _rope_table(params, _rope_positions(positions))
-    return _rope_apply(x, cos, sin, inverse)
+    if (
+        mx.default_device() == mx.gpu
+        and x.size
+        and x.ndim >= 3
+        and (x.ndim == 4 or not heads_major)
+        and x.shape[-1] % 32 == 0
+        and x.dtype in (mx.bfloat16, mx.float16, mx.float32)
+        and cos.shape[0] == x.shape[2 if heads_major else 1]
+    ):
+        return rope_activation(x, cos, sin, inverse, quantize, heads_major)
+    if heads_major:
+        x = x.transpose(0, 2, 1, 3)
+    out = _rope_apply(x, cos, sin, inverse)
+    return quantize_activation(out) if quantize else out
 
 
 def candidate_block_ids(scores, lengths, count, block):
@@ -288,6 +318,8 @@ class Indexer(nn.Module):
             return idx
         scores = packed_index_scores(q, key, weights, start, ratio, candidates)
         count = min(c.index_topk, scores.shape[-1])
+        if x.shape[1] <= 8:
+            return index_select(scores, count, candidates)
         order = mx.argsort(-scores, axis=-1)[..., :count].astype(mx.int32)
         valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
         idx = mx.take_along_axis(candidates, order, -1)
@@ -315,6 +347,9 @@ class Attention(nn.Module):
             self.indexer = Indexer(c, layer)
 
     def _input_projections(self, x):
+        pair = dense_a8_pair(self.wq_a, self.wkv, x)
+        if pair is not None:
+            return pair
         if all(
             isinstance(p, QuantizedProjection) and p.quantize_input
             for p in (self.wq_a, self.wkv)
@@ -392,7 +427,20 @@ class Attention(nn.Module):
                     cache, 2, shared["kv"], compressed, kv_start // ratio
                 )
             ci, pooled = shared["idx"], shared["kv"]
-        if (
+        out = nax_packed_sparse_attention(
+            q,
+            kv,
+            pooled,
+            ci,
+            self.attn_sink,
+            c.head_dim**-0.5,
+            start,
+            ratio,
+            c.window_size,
+        )
+        if out is not None:
+            heads_major = True
+        elif (
             length > 8
             and c.n_heads == 64
             and c.head_dim == 512
@@ -409,16 +457,20 @@ class Attention(nn.Module):
                 start,
                 max(ratio, 1),
                 c.window_size,
-            ).transpose(0, 2, 1, 3)
+            )
+            heads_major = True
         else:
             out = packed_sparse_attention(
                 q, kv, pooled, idx, ci, self.attn_sink, c.head_dim**-0.5
             )
-        out = rope(out, rope_positions, c, bool(ratio), inverse=True)
+            heads_major = False
         # DeepSeek-V4.1-Flash model.py Attention.forward (1017, and the current Flash repo):
         # "quantize/dequantize o before einsum", act_quant(o, 32, ue8m0, inplace=True) over
         # each group's values. At df42c109 it fed bf16 o to wo_a directly, as upstream oMLX did.
-        grouped = quantize_activation(out.reshape(1, length, c.o_groups, -1))
+        # The 32-groups of a head's o equal those of o.reshape(1, length, o_groups, -1).
+        grouped = rope(
+            out, rope_positions, c, bool(ratio), inverse=True, quantize=True, heads_major=heads_major
+        ).reshape(1, length, c.o_groups, -1)
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
         return self.wo_b(mx.einsum("bsgd,grd->bsgr", grouped, weight).flatten(-2))
 
@@ -677,6 +729,7 @@ class MoE(nn.Module):
             Expert(c, True),
             Expert(c),
         )
+        self._a8_min_tokens = c.a8_prefill_min_tokens if c.a8_prefill else None
 
     def __call__(self, x, image_mask):
         idx, weights = self.gate(x, image_mask)
@@ -692,19 +745,31 @@ class MoE(nn.Module):
             flat = idx.reshape(-1)
             order = mx.argsort(flat)
             inverse = mx.argsort(order)
-            selected = routed_input.reshape(-1, x.shape[-1])[order // shape[-1]][
-                :, None, :
-            ]
-            routed = self.experts(
-                selected,
-                flat[order],
-                weights.reshape(-1)[order],
-                sorted_indices=True,
-                input_quantized=routed_quantized,
+            a8 = self._a8_min_tokens is not None
+            routed = (
+                routed_experts_a8(
+                    self.experts, x, flat, order, weights, self._a8_min_tokens
+                )
+                if a8
+                else None
             )
-            shared = self.shared_experts(
-                quantized if shared_quantized else x, input_quantized=shared_quantized
-            )
+            if routed is None:
+                selected = routed_input.reshape(-1, x.shape[-1])[order // shape[-1]][
+                    :, None, :
+                ]
+                routed = self.experts(
+                    selected,
+                    flat[order],
+                    weights.reshape(-1)[order],
+                    sorted_indices=True,
+                    input_quantized=routed_quantized,
+                )
+            shared = shared_expert_a8(self.shared_experts, x) if a8 else None
+            if shared is None:
+                shared = self.shared_experts(
+                    quantized if shared_quantized else x,
+                    input_quantized=shared_quantized,
+                )
             combined = combine_sorted_experts(routed, inverse, shared)
             if combined is not None:
                 return combined
@@ -722,6 +787,69 @@ class MoE(nn.Module):
         return (routed.astype(mx.float32).sum(-2) + shared.astype(mx.float32)).astype(
             x.dtype
         )
+
+
+# Each cross-rank transfer finishes on the host before GPU work reads it. A
+# GPU command buffer that waits for a slower rank fails after about 5 s, and
+# this model's stages are uneven by design. It also fixes the order in which
+# rows pair their transfers across ranks.
+
+
+def _receive_stage(h, pre, source):
+    """(h, pre) from the rank holding the preceding layers; h keeps its dtype."""
+    payload = mx.distributed.recv_like(
+        mx.zeros((*h.shape[:-1], h.shape[-1] + 1), mx.float32), source
+    )
+    mx.eval(payload)
+    return payload[..., :-1].astype(h.dtype), payload[..., -1]
+
+
+def _send_stage(h, pre, destination):
+    """One transfer: pre must stay fp32, and bf16 h widens without loss."""
+    payload = mx.concatenate([h.astype(mx.float32), pre[..., None]], axis=-1)
+    mx.eval(mx.distributed.send(payload, destination))
+
+
+def _gather_stage(x):
+    """Rank 0's rows of ``x``: it holds the last layers."""
+    gathered = mx.distributed.all_gather(x)
+    mx.eval(gathered)
+    return gathered[: x.shape[0]]
+
+
+# The server pins the cache limit to total memory (#300). Wide prefill bounds
+# the pool instead, so odd-size buffers do not pile up through a chunk.
+_PREFILL_CACHE_CAP = 8 << 30
+_PREFILL_CACHE_SHARE = 16
+
+
+@cache
+def _prefill_cache_limit():
+    return min(_PREFILL_CACHE_CAP, get_max_working_set_bytes() // _PREFILL_CACHE_SHARE)
+
+
+# The cache limit is process-global and each engine runs on its own thread, so
+# scopes can exit out of order. Only the last scope to exit restores the limit.
+_prefill_cache_scope_lock = threading.Lock()
+_prefill_cache_scope_depth = 0
+_prefill_cache_scope_saved = None
+
+
+@contextmanager
+def _prefill_cache_scope():
+    """Bound the allocator pool for one wide-prefill layer loop."""
+    global _prefill_cache_scope_depth, _prefill_cache_scope_saved
+    with _prefill_cache_scope_lock:
+        if _prefill_cache_scope_depth == 0:
+            _prefill_cache_scope_saved = mx.set_cache_limit(_prefill_cache_limit())
+        _prefill_cache_scope_depth += 1
+    try:
+        yield
+    finally:
+        with _prefill_cache_scope_lock:
+            _prefill_cache_scope_depth -= 1
+            if _prefill_cache_scope_depth == 0:
+                mx.set_cache_limit(_prefill_cache_scope_saved)
 
 
 @mx.compile
@@ -743,14 +871,16 @@ def _hc_mixes(x, fn, scale, base, n, norm_eps, hc_eps, iters):
 
 
 def hc_mixes(x, fn, scale, base, c):
+    # One row keeps the FP32 GEMV. Multi-row MLX matmuls run at TF32 on M5.
     if (
         x.ndim == 4
-        and x.shape[1] >= 256
+        and x.shape[1] >= 2
         and x.shape[-2] == c.hc_mult == 4
         and x.shape[-1] > 0
         and x.dtype == mx.bfloat16
         and fn.dtype == mx.float32
         and fn.shape == (24, 4 * x.shape[-1])
+        and (4 * x.shape[-1]) % PROJECTION_WIDTH_MULTIPLE == 0
         and mx.default_device() == mx.gpu
     ):
         mixes = fused_hc_projection(x, fn, c.norm_eps)
@@ -810,6 +940,9 @@ def hc_post(x, residual, post, comb):
 
 
 class Block(nn.Module):
+    # Set on tensor-parallel ranks, whose sublayers return partial sums.
+    _tensor_group = None
+
     def __init__(self, c, layer):
         super().__init__()
         self._config = c
@@ -825,6 +958,10 @@ class Block(nn.Module):
             self[f"hc_{kind}_scale"] = mx.ones((3,))
         if layer in c.engram_layer_ids:
             self.engram = Engram(c, list(c.engram_layer_ids).index(layer))
+
+    def sum_ranks(self, x):
+        group = self._tensor_group
+        return x if group is None else mx.distributed.all_sum(x, group=group)
 
     def __call__(self, h, pre, cache, shared, start, image_mask, ced_tail=None):
         if (
@@ -888,7 +1025,11 @@ class Block(nn.Module):
             )
             x = hc_pre_norm(h, pre, self.attn_norm.weight, self.attn_norm.eps)
         h = hc_post(
-            self.attn(x, cache, shared, start, ced_kv=ced_kv, ced_kv_start=ced_kv_start),
+            self.sum_ranks(
+                self.attn(
+                    x, cache, shared, start, ced_kv=ced_kv, ced_kv_start=ced_kv_start
+                )
+            ),
             h,
             ao,
             ac,
@@ -897,8 +1038,11 @@ class Block(nn.Module):
             h, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self._config
         )
         h = hc_post(
-            self.ffn(
-                hc_pre_norm(h, ap, self.ffn_norm.weight, self.ffn_norm.eps), image_mask
+            self.sum_ranks(
+                self.ffn(
+                    hc_pre_norm(h, ap, self.ffn_norm.weight, self.ffn_norm.eps),
+                    image_mask,
+                )
             ),
             h,
             fo,
@@ -907,7 +1051,7 @@ class Block(nn.Module):
         return h, fp
 
 
-class LanguageModel(DSparkMixin, nn.Module):
+class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
     def __init__(self, config):
         super().__init__()
         self._config = config
@@ -953,29 +1097,166 @@ class LanguageModel(DSparkMixin, nn.Module):
                 if i in self._config.kv_source_layers
                 else 0
             )
-            for i in range(len(self.layers))
+            for i in range(self.start_idx, self.start_idx + len(self.pipeline_layers))
         ]
 
+    def _stage(self):
+        """(global layer id, block) for the layers this rank holds."""
+        return list(enumerate(self.pipeline_layers, self.start_idx))
+
+    def _next_engram(self, stage, layer_id):
+        """The first Engram block after ``layer_id`` in this stage, or None."""
+        return next(
+            (i for i, layer in stage if i > layer_id and "engram" in layer), None
+        )
+
+    def prefetch_engram(self, next_ids, current_ids, cache=None):
+        """Start the next prefill chunk's first Engram table while this chunk runs.
+
+        Table 0 is consumed immediately after layer 0; the next chunk's read
+        otherwise starts only at its first Engram layer. Hashes and history are
+        already known at the chunk boundary, so a byte-bounded worker can finish
+        the read during this chunk's GPU work. The carry stays in a separate
+        manager until the next forward activates it; the current forward's drain
+        cannot discard it.
+        """
+        hasher = getattr(self, "_hasher", None)
+        current = getattr(self, "_engram_prefetch", None)
+        following = getattr(self, "_engram_next_prefetch", None)
+        if hasher is None or current is None or following is None:
+            return
+        current_ids = np.asarray(current_ids, dtype=np.int64)
+        next_ids = np.asarray(next_ids, dtype=np.int64)
+        if current_ids.ndim != 2 or next_ids.ndim != 2:
+            return
+        if current_ids.shape[1] == 0:
+            # A new request's first chunk starts with no active rows; discard
+            # any stale carry left by a different request before installing the
+            # current table read.
+            following.drain()
+            current_ids_are_empty = True
+        else:
+            current_ids_are_empty = False
+            if following.has_pending():
+                # Activate the carry that belongs to this chunk. A carry from
+                # another request can still be installed; its requested IDs
+                # will mismatch at the layer and fall back to a synchronous read.
+                self._engram_prefetch, self._engram_next_prefetch = (
+                    following,
+                    current,
+                )
+                current, following = following, current
+                current.activate()
+        if next_ids.shape[1] == 0:
+            return
+        stage = self._stage()
+        first = self._next_engram(stage, -1)
+        if first is None:
+            return
+        engram_ids = list(self._config.engram_layer_ids)
+        ix = engram_ids.index(first)
+        depth = self._config.engram_max_ngram_size - 1
+        history = None
+        if cache:
+            try:
+                history = np.asarray(cache[0][6], dtype=np.int64)
+            except (IndexError, TypeError, ValueError):
+                history = None
+        batch = int(next_ids.shape[0])
+        if history is None or history.ndim != 2 or history.shape[0] != batch:
+            history = np.full((batch, depth), -1, dtype=np.int64)
+        elif history.shape[1] != depth:
+            history = np.full((batch, depth), -1, dtype=np.int64)
+        if not current_ids_are_empty:
+            if current_ids.shape[0] != batch:
+                history = np.full((batch, depth), -1, dtype=np.int64)
+            else:
+                tokens = hasher.token_map[current_ids]
+                history = np.concatenate([history, tokens], axis=1)[:, -depth:]
+        hashes, _ = hasher(next_ids, history)
+        ids = hashes[:, :, ix]
+        embed = self.layers[first].engram.embed
+        if current_ids_are_empty:
+            current.submit(embed, ids)
+        else:
+            following.submit_carry(embed, ids)
+
+    def _stage_output(self, h, pre, skip_logits):
+        """Hand the stage to the next rank, then logits from rank 0's hidden."""
+        if self.pipeline_rank != 0:
+            _send_stage(h, pre, self.pipeline_rank - 1)
+        x = self.norm(hc_pre(h, pre))
+        if self.pipeline_size > 1:
+            x = _gather_stage(x)
+        return x if skip_logits else project_logits(x, self.head.weight)
+
     def _batched_decode_ok(self, input_ids, cache, masks, inputs_embeds, capture, kwargs):
-        """One token for each of 2..MAX_BATCH requests, all at a valid position, through
-        layers the fused decode supports: run the layers once for the whole batch."""
+        """One token per request at a valid position, through supported fused layers.
+
+        Batches wider than the fused kernels are split into MAX_BATCH-row chunks.
+        """
         b_n = input_ids.shape[0]
         if not (
             input_ids.shape[1] == 1
-            and 2 <= b_n <= decode_fused.MAX_BATCH
+            and b_n >= 2
             and inputs_embeds is None
             and not capture
             and kwargs.get("mtp_verify_states") is None
             and not kwargs.get("_ced_prefill", False)
-            and all(decode_fused.supported(layer, self._config) for layer in self.layers)
         ):
             return False
         if masks is not None and not bool(np.all(np.asarray(masks))):
             return False
-        return all(not item.empty() for item in cache)
+        # A pending decoder replay runs on its row in the per-row path.
+        if any(item.has_pending() for item in cache):
+            return False
+        return all(not item.empty() for item in cache) and self._stages_decode_fused()
 
-    def _forward_decode_batched(self, input_ids, cache):
-        """_forward for B single-token requests with the weights read once per step.
+    def _replay_decoder(self, rc, stage, mid, capture=False):
+        """Run the decoder layers on the window a CED chunk skipped, so their
+        window caches match a chunk that ran them. With ``capture``, returns the
+        DSpark target-layer hidden of that window."""
+        h, pre, idx, candidates = rc[mid].pending()
+        start = rc[mid].size() - h.shape[1]
+        shared = {
+            "kv": rc[mid][2],
+            "index_k": rc[mid][3],
+            "idx": idx,
+            "candidates": candidates,
+        }
+        captured = {}
+        for j in range(mid + 1, len(stage)):
+            i, layer = stage[j]
+            if capture and i in self._config.dspark_target_layer_ids:
+                captured[i] = mx.mean(h, axis=2)
+            h, pre = layer(h, pre, rc[j], shared, start, None, ced_tail=h.shape[1])
+            mx.async_eval(h, pre)
+        rc[mid].set_pending(None)
+        return captured
+
+    def _stages_decode_fused(self):
+        """Whether the fused decode supports the layers of every stage.
+
+        The batched path changes the stage transfers, so the stages agree once.
+        Each rank asks at the same forward: the checks before it read only the
+        requests, which every stage shares.
+        """
+        agreed = getattr(self, "_fused_stages", None)
+        if agreed is None:
+            agreed = all(
+                decode_fused.supported(layer, self._config)
+                for layer in self.pipeline_layers
+            )
+            if self.pipeline_size > 1:
+                # On the CPU stream: no GPU command buffer waits for a peer.
+                votes = mx.distributed.all_sum(mx.array(int(agreed)), stream=mx.cpu)
+                mx.eval(votes)
+                agreed = votes.item() == self.pipeline_size
+            self._fused_stages = agreed
+        return agreed
+
+    def _forward_decode_batched(self, input_ids, cache, skip_logits=False):
+        """_forward for B single-token requests with weights shared within each chunk.
 
         Same per-request semantics as the row loop below (positions, caches, Engram history,
         cache bookkeeping). decode_fused.decode_block_nb, Engram (each request's row projected
@@ -985,6 +1266,21 @@ class LanguageModel(DSparkMixin, nn.Module):
         """
         c = self._config
         b_n = input_ids.shape[0]
+        if b_n > decode_fused.MAX_BATCH:
+            results, rows = [], [[] for _ in cache]
+            for start in range(0, b_n, decode_fused.MAX_BATCH):
+                end = min(start + decode_fused.MAX_BATCH, b_n)
+                chunk = [
+                    DeepseekV41Cache.merge([item.extract(r) for r in range(start, end)])
+                    for item in cache
+                ]
+                results.append(self._forward_decode_batched(input_ids[start:end], chunk, skip_logits))
+                for i, item in enumerate(chunk):
+                    rows[i].extend(item.extract(r) for r in range(end - start))
+            for item, updated in zip(cache, rows):
+                item.adopt_rows(updated)
+                item.advance(1)
+            return mx.concatenate(results, axis=0)
         rcs = [[item.extract(row) for item in cache] for row in range(b_n)]
         starts = []
         for rc in rcs:
@@ -1000,33 +1296,44 @@ class LanguageModel(DSparkMixin, nn.Module):
         h = self.embed(input_ids)
         h = mx.repeat(h[..., None, :], c.hc_mult, -2)
         pre = mx.broadcast_to((mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1])
+        if self.pipeline_rank < self.pipeline_size - 1:
+            h, pre = _receive_stage(h, pre, self.pipeline_rank + 1)
         shareds = [{} for _ in range(b_n)]
+        engram_ids = list(c.engram_layer_ids)
+        stage = self._stage()
+        shared_rows = getattr(self, "mtp_shared_verify_rows", None)
+        together = callable(shared_rows) and shared_rows() > 0
         prefetch = getattr(self, "_engram_prefetch", None)
         with prefetch.forward() if prefetch is not None else nullcontext():
-            if prefetch is not None and c.engram_layer_ids:
-                prefetch.submit(self.layers[c.engram_layer_ids[0]].engram.embed, hashes[:, :, 0])
-            for i, layer in enumerate(self.layers):
+            first = self._next_engram(stage, -1)
+            if prefetch is not None and first is not None:
+                prefetch.submit(
+                    self.layers[first].engram.embed, hashes[:, :, engram_ids.index(first)]
+                )
+            for j, (i, layer) in enumerate(stage):
                 if "engram" in layer:
-                    ix = list(c.engram_layer_ids).index(i)
+                    ix = engram_ids.index(i)
                     if prefetch is not None:
                         mx.async_eval(h, pre)
                     h = layer.engram(h, hashes[:, :, ix], None)
-                    if prefetch is not None and ix + 1 < len(c.engram_layer_ids):
+                    following = self._next_engram(stage, i)
+                    if prefetch is not None and following is not None:
                         prefetch.submit(
-                            self.layers[c.engram_layer_ids[ix + 1]].engram.embed, hashes[:, :, ix + 1]
+                            self.layers[following].engram.embed,
+                            hashes[:, :, engram_ids.index(following)],
                         )
                 h, pre = decode_fused.decode_block_nb(
-                    layer, h, pre, [rcs[r][i] for r in range(b_n)], shareds, starts, c
+                    layer, h, pre, [rcs[r][j] for r in range(b_n)], shareds, starts, c, together
                 )
-                if prefetch is not None and "engram" in layer:
-                    mx.async_eval(h, pre)
+                # Submit each layer: the GPU runs it while the next one is built.
+                mx.async_eval(h, pre)
                 for r in range(b_n):
                     rc = rcs[r]
-                    rc[i][0] = mx.array([starts[r] + 1], mx.int32)
-                    if histories is not None and i == 0:
-                        rc[i][6] = mx.array(histories[r], mx.int64)
+                    rc[j][0] = mx.array([starts[r] + 1], mx.int32)
+                    if histories is not None and j == 0:
+                        rc[j][6] = mx.array(histories[r], mx.int64)
                     for slot in range(1, 7):
-                        if rc[i][slot] is None:
+                        if rc[j][slot] is None:
                             width = c.index_head_dim if slot == 3 else c.head_dim
                             empty = mx.zeros((1, 0, width), h.dtype)
                             if slot == 1:
@@ -1035,11 +1342,113 @@ class LanguageModel(DSparkMixin, nn.Module):
                                 empty = pack_activation(empty, 4, 16, True)
                             elif slot == 3:
                                 empty = pack_activation(empty, 4)
-                            rc[i][slot] = mx.zeros((1, 0), mx.int64) if slot == 6 else empty
-        logits = project_logits(self.norm(hc_pre(h, pre)), self.head.weight)
+                            rc[j][slot] = mx.zeros((1, 0), mx.int64) if slot == 6 else empty
+        logits = self._stage_output(h, pre, skip_logits)
         for i, item in enumerate(cache):
             item.adopt_rows([rcs[r][i] for r in range(b_n)])
             item.advance(1)
+        return logits
+
+    def _batched_verify_ok(self, input_ids, cache, masks, inputs_embeds, kwargs):
+        """B >= 2 requests' MTP verify blocks of one width, run through the fused layers:
+        the B * R rows fit the multi-vector kernels and no request has a pending replay."""
+        b_n, r_n = input_ids.shape
+        if not (
+            b_n >= 2
+            and b_n * r_n <= decode_fused.MAX_BATCH
+            and inputs_embeds is None
+            and not kwargs.get("_ced_prefill", False)
+            and self._stage()[0][1]._tensor_group is None
+        ):
+            return False
+        if masks is not None and not bool(np.all(np.asarray(masks))):
+            return False
+        if any(item.has_pending() for item in cache):
+            return False
+        return all(not item.empty() for item in cache) and self._stages_decode_fused()
+
+    def _forward_verify_batched(self, input_ids, cache, verify_states, capture, skip_logits=False):
+        """_forward for B requests' verify blocks ([B, R] tokens): each request gets the
+        result of its own verify forward (decode_fused.decode_block_verify_nb), with the
+        weights read once for all B * R rows. verify_states[r] holds request r's per-layer
+        rollback states."""
+        c = self._config
+        b_n, r_n = input_ids.shape
+        rcs = [[item.extract(row) for item in cache] for row in range(b_n)]
+        starts = []
+        for rc, states in zip(rcs, verify_states):
+            start = rc[0].size()
+            if any(item.size() != start for item in rc):
+                raise ValueError("DeepSeek V4.1 cache offsets diverged across layers")
+            starts.append(start)
+            for item, state in zip(rc, states):
+                item._mtp_verify_state = state
+        hashes, histories = None, None
+        if self._hasher is not None:
+            per_row = [self._hasher(input_ids[r : r + 1], rcs[r][0][6], None) for r in range(b_n)]
+            hashes = np.concatenate([p[0] for p in per_row], 0)
+            histories = [p[1] for p in per_row]
+        h = self.embed(input_ids)
+        h = mx.repeat(h[..., None, :], c.hc_mult, -2)
+        pre = mx.broadcast_to((mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1])
+        if self.pipeline_rank < self.pipeline_size - 1:
+            h, pre = _receive_stage(h, pre, self.pipeline_rank + 1)
+        shareds = [{} for _ in range(b_n)]
+        captured = {}
+        engram_ids = list(c.engram_layer_ids)
+        stage = self._stage()
+        prefetch = getattr(self, "_engram_prefetch", None)
+        with prefetch.forward() if prefetch is not None else nullcontext():
+            first = self._next_engram(stage, -1)
+            if prefetch is not None and first is not None:
+                prefetch.submit(
+                    self.layers[first].engram.embed, hashes[:, :, engram_ids.index(first)]
+                )
+            for j, (i, layer) in enumerate(stage):
+                if "engram" in layer:
+                    ix = engram_ids.index(i)
+                    if prefetch is not None:
+                        mx.async_eval(h, pre)
+                    h = layer.engram(h, hashes[:, :, ix], None)
+                    following = self._next_engram(stage, i)
+                    if prefetch is not None and following is not None:
+                        prefetch.submit(
+                            self.layers[following].engram.embed,
+                            hashes[:, :, engram_ids.index(following)],
+                        )
+                if capture and i in c.dspark_target_layer_ids:
+                    captured[i] = mx.mean(h, axis=2)
+                h, pre = decode_fused.decode_block_verify_nb(
+                    layer, h, pre, [rcs[r][j] for r in range(b_n)], shareds, starts, c
+                )
+                mx.async_eval(h, pre)
+                for r in range(b_n):
+                    rc = rcs[r]
+                    rc[j][0] = mx.array([starts[r] + r_n], mx.int32)
+                    if histories is not None and j == 0:
+                        rc[j][6] = mx.array(histories[r], mx.int64)
+                    for slot in range(1, 7):
+                        if rc[j][slot] is None:
+                            width = c.index_head_dim if slot == 3 else c.head_dim
+                            empty = mx.zeros((1, 0, width), h.dtype)
+                            if slot == 1:
+                                empty = pack_activation(empty)
+                            elif slot == 2:
+                                empty = pack_activation(empty, 4, 16, True)
+                            elif slot == 3:
+                                empty = pack_activation(empty, 4)
+                            rc[j][slot] = mx.zeros((1, 0), mx.int64) if slot == 6 else empty
+        logits = self._stage_output(h, pre, skip_logits)
+        for rc in rcs:
+            for item in rc:
+                del item._mtp_verify_state
+        for i, item in enumerate(cache):
+            item.adopt_rows([rcs[r][i] for r in range(b_n)])
+            item.advance(r_n)
+        if capture:
+            if set(captured) != set(c.dspark_target_layer_ids):
+                raise ValueError("Incomplete DSpark target hidden capture")
+            return logits, mx.concatenate([captured[i] for i in c.dspark_target_layer_ids], axis=-1)
         return logits
 
     def _forward(
@@ -1047,9 +1456,11 @@ class LanguageModel(DSparkMixin, nn.Module):
     ):
         c = self._config
         cache = self.make_cache() if cache is None else cache
-        if len(cache) != len(self.layers):
+        stage = self._stage()
+        skip_logits = bool(kwargs.get("skip_logits", False))
+        if len(cache) != len(stage):
             raise ValueError("DeepSeek V4.1 cache layer count mismatch")
-        for i, item in enumerate(cache):
+        for i, item in enumerate(cache, self.start_idx):
             ratio = c.compress_ratios[i] if i in c.kv_source_layers else 0
             if item.compress_ratio is None:
                 item.compress_ratio = ratio  # Upgrade a legacy full snapshot.
@@ -1062,13 +1473,19 @@ class LanguageModel(DSparkMixin, nn.Module):
         masks = cache[0].make_mask(input_ids.shape[1])
         capture = bool(kwargs.get("return_dspark_hidden", False))
         if self._batched_decode_ok(input_ids, cache, masks, inputs_embeds, capture, kwargs):
-            return self._forward_decode_batched(input_ids, cache)
+            return self._forward_decode_batched(input_ids, cache, skip_logits)
+        verify_rows = kwargs.get("mtp_verify_states")
+        if verify_rows is not None and input_ids.shape[0] > 1:
+            if not self._batched_verify_ok(input_ids, cache, masks, inputs_embeds, kwargs):
+                raise ValueError("DeepSeek V4.1 cannot verify these requests together")
+            return self._forward_verify_batched(input_ids, cache, verify_rows, capture, skip_logits)
         if capture and input_ids.shape[0] != 1:
             raise ValueError(
                 "DSpark target capture currently requires one unpadded row"
             )
-        captured = {}
-        results, rows = [], [[] for _ in self.layers]
+        captured, replayed, skip_decoder = {}, None, False
+        engram_ids = list(c.engram_layer_ids)
+        results, rows = [], [[] for _ in stage]
         for row in range(input_ids.shape[0]):
             valid = (
                 np.ones(input_ids.shape[1], bool)
@@ -1077,7 +1494,8 @@ class LanguageModel(DSparkMixin, nn.Module):
             )
             positions = np.flatnonzero(valid)
             if not len(positions):
-                results.append(mx.zeros((1, input_ids.shape[1], c.vocab_size)))
+                width = c.dim if skip_logits else c.vocab_size
+                results.append(mx.zeros((1, input_ids.shape[1], width)))
                 for i, item in enumerate(cache):
                     rows[i].append(item.extract(row))
                 continue
@@ -1088,6 +1506,25 @@ class LanguageModel(DSparkMixin, nn.Module):
                 raise ValueError("Prefill padding must be contiguous")
             rc = [item.extract(row) for item in cache]
             verify_states = kwargs.get("mtp_verify_states")
+            ced_chunk = (
+                c.ced_prefill
+                and kwargs.get("_ced_prefill", False)
+                and verify_states is None
+                and end - begin > c.window_size
+            )
+            mid = c.n_layers // 2 - self.start_idx
+            # DSpark prompt priming reads the decoder target layers. When they all
+            # follow the midpoint, a skipped chunk captures nothing (the next
+            # chunk restarts the draft context) and a replay captures its window.
+            targets = c.dspark_target_layer_ids
+            prime_decoder = bool(kwargs.get("_dspark_prime")) and bool(targets)
+            prime_decoder = prime_decoder and min(targets) > c.n_layers // 2
+            if 0 <= mid < len(rc) and rc[mid].has_pending():
+                if ced_chunk:
+                    # This chunk replaces every decoder window.
+                    rc[mid].set_pending(None)
+                else:
+                    replayed = self._replay_decoder(rc, stage, mid, prime_decoder)
             if verify_states is not None:
                 for item, state in zip(rc, verify_states):
                     item._mtp_verify_state = state
@@ -1108,7 +1545,13 @@ class LanguageModel(DSparkMixin, nn.Module):
             pre = mx.broadcast_to(
                 (mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1]
             )
-            shared = {}
+            # A prefill helper ran the layers before this stage on another Mac.
+            stage_input = kwargs.get("_stage_input")
+            if stage_input is not None:
+                h, pre = stage_input["h"], stage_input["pre"]
+            elif self.pipeline_rank < self.pipeline_size - 1:
+                h, pre = _receive_stage(h, pre, self.pipeline_rank + 1)
+            shared = {} if stage_input is None else dict(stage_input["shared"])
             # An MTP verify block runs through the fused decode kernels token-exactly
             # (decode_fused.decode_block_verify: each token gets its single-token decode
             # result, so speculation cannot change greedy output) when every layer has them.
@@ -1116,74 +1559,100 @@ class LanguageModel(DSparkMixin, nn.Module):
                 verify_states is not None
                 and inputs_embeds is None
                 and 1 <= end - begin <= decode_fused.MAX_BATCH
-                and all(decode_fused.supported(layer, c) for layer in self.layers)
+                and all(decode_fused.supported(layer, c) for _, layer in stage)
             ):
                 shared["_verify_rows"] = True
             # Only cache-only scheduler calls may omit decoder logits. A short
             # contiguous suffix retains its existing window rather than
             # pretending that a full replay window was present in this chunk.
-            ced_tail = (
-                c.window_size
-                if c.ced_prefill
-                and kwargs.get("_ced_prefill", False)
-                and verify_states is None
-                and end - begin > c.window_size
-                else None
-            )
+            ced_tail = c.window_size if ced_chunk else None
             ced_mid = c.n_layers // 2
+            # The next CED chunk replays the decoder layers from its own tail, so a
+            # cache-only chunk followed by one stops at the midpoint. It keeps the
+            # midpoint output of its window for a forward that needs the windows.
+            skip_decoder = (
+                ced_tail is not None
+                and (not capture or prime_decoder)
+                and image_mask is None
+                and self.pipeline_size == 1
+                and stage[0][1]._tensor_group is None
+                and int(kwargs.get("next_prefill_tokens") or 0) > c.window_size
+            )
             prefetch = getattr(self, "_engram_prefetch", None)
-            # The CPU enqueues a whole prefill chunk in ~1s while the GPU runs
-            # ~15x longer; with the layer loop fully lazy every intermediate
-            # (fp32 hyper-connection streams across hc_mult, gathered sparse
-            # attention loads, MoE routes) stays pinned until the final logits
-            # eval and the Metal pool hoards every freed size class as
-            # IOAccelerator footprint (measured +14.5GB per 2048-token chunk).
-            # Eval the running stream at each layer boundary during prefill so
-            # intermediates retire as the GPU progresses, and clear the pool at
-            # the same points (per-layer widths vary across the ratio switch,
-            # CED tail and 2047/2048 chunk widths, so size classes never
-            # reuse). Decode/verify widths stay lazy for latency.
+            # A fully lazy prefill loop pins every intermediate until the logits
+            # eval (+14.5GB per 2048-token chunk). Prefill bounds that under a
+            # bounded pool: each layer is submitted, then the previous layer is
+            # waited on, so the CPU builds layer k+1 while the GPU runs layer k
+            # and at most two layers' intermediates are alive. Decode/verify
+            # widths are only submitted (async_eval).
             prefill_backpressure = end - begin >= 256
-            with prefetch.forward() if prefetch is not None else nullcontext():
-                if prefetch is not None and c.engram_layer_ids:
-                    first = self.layers[c.engram_layer_ids[0]].engram.embed
-                    prefetch.submit(first, hashes[:, :, 0])
-                for i, layer in enumerate(self.layers):
+            lagged = None
+            with (
+                _prefill_cache_scope() if prefill_backpressure else nullcontext(),
+                prefetch.forward() if prefetch is not None else nullcontext(),
+            ):
+                first = self._next_engram(stage, -1)
+                if prefetch is not None and first is not None:
+                    prefetch.submit(
+                        self.layers[first].engram.embed,
+                        hashes[:, :, engram_ids.index(first)],
+                    )
+                for j, (i, layer) in enumerate(stage):
                     if "engram" in layer:
-                        ix = list(c.engram_layer_ids).index(i)
+                        ix = engram_ids.index(i)
                         if prefetch is not None:
                             mx.async_eval(h, pre)
                         h = layer.engram(h, hashes[:, :, ix], image_mask)
-                        if prefetch is not None and ix + 1 < len(c.engram_layer_ids):
-                            next_layer = self.layers[c.engram_layer_ids[ix + 1]]
+                        following = self._next_engram(stage, i)
+                        if prefetch is not None and following is not None:
                             prefetch.submit(
-                                next_layer.engram.embed, hashes[:, :, ix + 1]
+                                self.layers[following].engram.embed,
+                                hashes[:, :, engram_ids.index(following)],
                             )
-                    if capture and i in c.dspark_target_layer_ids:
+                    if (
+                        capture
+                        and i in c.dspark_target_layer_ids
+                        and not (skip_decoder and i > ced_mid)
+                    ):
                         captured[i] = mx.mean(h, axis=2)
                     query_start = start
                     if ced_tail is not None and i > ced_mid:
                         # The midpoint layer already advanced h to the tail.
                         query_start = start + end - begin - ced_tail
-                    h, pre = layer(
-                        h,
-                        pre,
-                        rc[i],
-                        shared,
-                        query_start,
-                        image_mask,
-                        ced_tail=ced_tail if ced_tail is not None and i >= ced_mid else None,
-                    )
-                    if prefetch is not None and "engram" in layer:
-                        mx.async_eval(h, pre)
+                    if skip_decoder and i > ced_mid:
+                        rc[j][1] = None
+                    else:
+                        h, pre = layer(
+                            h,
+                            pre,
+                            rc[j],
+                            shared,
+                            query_start,
+                            image_mask,
+                            ced_tail=ced_tail if i >= ced_mid else None,
+                        )
+                    if skip_decoder and i == ced_mid:
+                        rc[j].set_pending(
+                            (
+                                h,
+                                pre,
+                                shared["idx"],
+                                shared.get("candidates", mx.zeros((1, 0, 0), mx.int32)),
+                            )
+                        )
                     if prefill_backpressure:
-                        mx.eval(h, pre)
-                        mx.clear_cache()
-                    rc[i][0] = mx.array([start + end - begin], mx.int32)
-                    if history is not None and i == 0:
-                        rc[i][6] = mx.array(history, mx.int64)
+                        mx.async_eval(h, pre)
+                        if lagged is not None:
+                            mx.eval(*lagged)
+                        lagged = (h, pre)
+                    else:
+                        # The GPU runs this layer while the next one is built.
+                        mx.async_eval(h, pre)
+                    rc[j][0] = mx.array([start + end - begin], mx.int32)
+                    if history is not None and j == 0:
+                        rc[j][6] = mx.array(history, mx.int64)
                     for slot in range(1, 7):
-                        if rc[i][slot] is None:
+                        if rc[j][slot] is None:
                             width = c.index_head_dim if slot == 3 else c.head_dim
                             empty = mx.zeros((1, 0, width), h.dtype)
                             if slot == 1:
@@ -1192,11 +1661,19 @@ class LanguageModel(DSparkMixin, nn.Module):
                                 empty = pack_activation(empty, 4, 16, True)
                             elif slot == 3:
                                 empty = pack_activation(empty, 4)
-                            rc[i][slot] = (
+                            rc[j][slot] = (
                                 mx.zeros((1, 0), mx.int64) if slot == 6 else empty
                             )
-                    rows[i].append(rc[i])
-            logits = project_logits(self.norm(hc_pre(h, pre)), self.head.weight)
+                    rows[j].append(rc[j])
+            stage_capture = kwargs.get("_stage_capture")
+            if stage_capture is not None:
+                stage_capture.update(h=h, pre=pre, shared=shared)
+            if skip_decoder:
+                # Cache-only: a skipped chunk has no decoder output to project.
+                width = c.dim if skip_logits else c.vocab_size
+                logits = mx.zeros((1, h.shape[1], width), h.dtype)
+            else:
+                logits = self._stage_output(h, pre, skip_logits)
             # The scheduler discards this tail-only result. Ordinary forward
             # calls still return real logits for every input token.
             results.append(
@@ -1216,12 +1693,19 @@ class LanguageModel(DSparkMixin, nn.Module):
             item.advance(input_ids.shape[1])
         logits = mx.concatenate(results, 0)
         if capture:
+            if skip_decoder:
+                return logits, None
             if not c.dspark_target_layer_ids or set(captured) != set(
                 c.dspark_target_layer_ids
             ):
                 raise ValueError("Incomplete DSpark target hidden capture")
-            return logits, mx.concatenate(
+            hidden = mx.concatenate(
                 [captured[i][:, -logits.shape[1] :] for i in c.dspark_target_layer_ids],
                 axis=-1,
             )
+            if replayed:
+                # The replayed window directly precedes this forward's rows.
+                before = [replayed[i] for i in c.dspark_target_layer_ids]
+                hidden = mx.concatenate([mx.concatenate(before, -1), hidden], 1)
+            return logits, hidden
         return logits

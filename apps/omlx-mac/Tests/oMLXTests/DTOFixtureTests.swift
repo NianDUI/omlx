@@ -85,6 +85,7 @@ final class DTOFixtureTests: XCTestCase {
             dtype: "bfloat16",
             preserveMtp: false,
             enhanced: true,
+            hadamard: false,
             imatrixCachePath: "/Users/test/cache/imatrix.npz",
             imatrixReuseCache: true,
             imatrixStrict: true
@@ -143,6 +144,19 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertNotNil(settings.integrations,  "integrations block missing")
         XCTAssertEqual(settings.scheduler?.embeddingBatchSize, 32)
         XCTAssertEqual(settings.huggingface?.hfCacheEnabled, true)
+        XCTAssertEqual(settings.integrations?.markitdownEnabled, true)
+        XCTAssertEqual(settings.integrations?.markitdownExposeModel, false)
+        XCTAssertEqual(settings.integrations?.markitdownMaxFileSizeMb, 25)
+        XCTAssertEqual(settings.integrations?.markitdownMaxFilesPerRequest, 5)
+        XCTAssertEqual(settings.integrations?.markitdownPdfProcessingEngine, "markitdown")
+        XCTAssertEqual(settings.integrations?.webSearchProvider, "ddgs")
+        XCTAssertEqual(settings.integrations?.webSearchBraveApiKey, "")
+        XCTAssertEqual(settings.integrations?.webSearchSearxngUrl, "")
+        XCTAssertEqual(settings.integrations?.webSearchDdgsBackends, "")
+        XCTAssertEqual(settings.integrations?.webSearchMaxResults, 3)
+        XCTAssertEqual(settings.integrations?.webSearchContentMode, "snippet")
+        XCTAssertEqual(settings.integrations?.webSearchContentTruncate, true)
+        XCTAssertEqual(settings.integrations?.webSearchContentMaxChars, 20000)
     }
 
     // MARK: - Models list
@@ -218,7 +232,7 @@ final class DTOFixtureTests: XCTestCase {
             taskId: "t1", repoId: "mlx-community/model", status: "downloading",
             progress: 45.5, totalSize: 100, downloadedSize: 50,
             speedBps: 0, etaSeconds: nil, error: "", createdAt: 1.0, startedAt: 1.0,
-            completedAt: 0.0, retryCount: 0
+            completedAt: 0.0, retryCount: 0, files: nil, ggufFiles: nil
         )
         XCTAssertEqual(stopped.speedText, "0 B/s")
         XCTAssertNil(stopped.etaText)
@@ -227,7 +241,7 @@ final class DTOFixtureTests: XCTestCase {
             taskId: "t2", repoId: "mlx-community/model", status: "downloading",
             progress: 45.5, totalSize: 100, downloadedSize: 50,
             speedBps: 512, etaSeconds: 125, error: "", createdAt: 1.0, startedAt: 1.0,
-            completedAt: 0.0, retryCount: 0
+            completedAt: 0.0, retryCount: 0, files: nil, ggufFiles: nil
         )
         XCTAssertEqual(active.speedText, "512 B/s")
         XCTAssertEqual(active.etaText, "2m 5s")

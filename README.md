@@ -33,7 +33,8 @@
   <b>English</b> ·
   <a href="README.zh.md">中文</a> ·
   <a href="README.ko.md">한국어</a> ·
-  <a href="README.ja.md">日本語</a>
+  <a href="README.ja.md">日本語</a> ·
+  <a href="README.it.md">Italiano</a>
 </p>
 
 ---
@@ -171,6 +172,13 @@ and a capability-gated experimental token-only output path. See
 security boundaries, current limitations, and the physical-hardware validation
 checklist.
 
+A paired Mac can also speed up prefill without splitting the model: the
+[Prefill Accelerator](docs/experimental/prefill-accelerator.md) runs the first
+layers of long prompts on the other Mac while the model, its cache and
+decoding stay on this one (DeepSeek V4.1, GLM-5.3, Qwen3.8 Flash-Next,
+Qwen3.8 27B, MiniMax M3 and Inkling 2). The helper can also be a Linux machine with
+NVIDIA GPUs running [omlx-cuda-helper](apps/omlx-cuda-helper/README.md).
+
 ### Vision-Language Models
 
 Run VLMs with the same continuous batching and tiered KV cache stack as text LLMs. Supports multi-image chat, base64/URL/file image inputs, and tool calling with vision context. MiMo V2.6 checkpoints with bundled sidecars also accept sampled-frame video and 24 kHz audio. Qwen3.5, Qwen3.6 and Qwen3.8 checkpoints (dense and MoE) accept native video input as base64 `video_url` / `input_video` data URIs; video needs OpenCV (`opencv-python-headless`). oQ conversion of official MiMo V2.6 checkpoints preserves image and audio support. OCR models (DeepSeek-OCR, DOTS-OCR, GLM-OCR) are auto-detected with optimized prompts.
@@ -212,7 +220,7 @@ Configure sampling parameters, chat template kwargs, TTL, model alias, model typ
 
 - **Model alias**: set a custom API-visible name. `/v1/models` returns the alias, and requests accept both the alias and directory name.
 - **Model type override**: manually set a model as LLM or VLM regardless of auto-detection.
-- **External engine**: serve Qwen3.8-27B and Qwen3.6-35B-A3B MLX checkpoints from your model directories with [Splash](https://github.com/incoai/splash)'s Metal engine in its own process (official build on M3 or later, Splash M1 on M1/M2). See [docs/Splash.md](docs/Splash.md).
+- **External engine**: serve the models [Splash](https://github.com/incoai/splash) supports, including GGUF files, from your model directories on Splash's Metal engine in its own process. See [docs/Splash.md](docs/Splash.md) for the supported models and Splash versions.
 - **Profiles**: save named bundles of per-model settings and switch between them from the admin panel. A profile can optionally be exposed as its own model: `/v1/models` then also lists `<model>:<profile>` (e.g. `qwen3-8b:thinking`), which serves on the same engine as the base model with the profile's settings overlaid per request — no extra memory, no reload. When the base model has an alias, the exposed ID is advertised as `<alias>:<profile>`; the directory-name form keeps working, just like for the base model.
 
 <p align="center">
@@ -223,6 +231,8 @@ Configure sampling parameters, chat template kwargs, TTL, model alias, model typ
 
 Chat directly with any loaded model from the admin panel. Supports conversation history, model switching, dark mode, reasoning model output, and image upload for VLM/OCR models.
 
+Document attachments support PDF, DOCX, PPTX, TXT, and MD. Attachments are accepted by filename extension. If the client reports a MIME type oMLX does not recognize, such as `application/octet-stream`, the converter MIME type is inferred from the extension.
+
 <p align="center">
   <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX Chat" width="720">
 </p>
@@ -230,7 +240,7 @@ Chat directly with any loaded model from the admin panel. Supports conversation 
 
 ### Model Downloader
 
-Search and download MLX models from HuggingFace directly in the admin dashboard. Browse model cards, check file sizes, and download with one click.
+Search and download models from HuggingFace directly in the admin dashboard, in MLX, GGUF or all formats. Browse model cards, then pick the files to download: an MLX checkpoint keeps the files it needs, and a GGUF brings its vision projector.
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX Model Downloader" width="720">
@@ -243,6 +253,10 @@ Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi, Mistral Vibe, and D
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
 </p>
+
+`omlx launch codex` and `omlx launch codex_app` give Codex a catalog of every chat model on the server, so you switch models with `/model` or the app's model picker. `--model`, the saved Codex model, or the server default picks the starting model. This needs Codex 0.148 or newer; relaunch after you add or remove models.
+
+`omlx launch copilot` gives Copilot CLI a catalog of every chat model on the server, so you switch models with `/model`. `--model`, the saved Copilot model, or the server default picks the starting model. The catalog goes into Copilot's `providers.json` next to your other providers, and the file is kept at `0600` because it holds the server's API key. This needs Copilot CLI 1.0.83 or newer; relaunch after you add or remove models.
 
 Install [Mistral Vibe](https://github.com/mistralai/mistral-vibe) 2.26.0 or newer with `uv tool install mistral-vibe`, then run `omlx launch vibe` to select a local model, or `omlx launch vibe --model <model-id>`. Vibe's provider, model, API-key reference and context window are configured for that process through its `VIBE_*` environment overrides. Existing `config.toml`, `VIBE_HOME`, tool permissions and cloud configuration are preserved. Pass Vibe arguments after `--`, for example `omlx launch vibe --model <model-id> -- --resume`.
 
@@ -275,9 +289,27 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/rerank` | Document reranking |
 | `POST /v1/systemone` | Typed decisions with decision models or chat models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
-| `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`) |
+| `POST /v1/audio/transcriptions` | Speech-to-text, including speaker labels when supported |
+| `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`); embedding models take `prompt` only |
 
 The admin API for settings, models, downloads, quantization, and benchmarks takes the main API key as a Bearer token and also works in headless mode. See [Admin API](docs/admin-api.md).
+
+#### Transcription with speaker labels
+
+Select an installed speech model that supports timed speaker attribution, such as VibeVoice-ASR or Nemotron 3.5 Transcribe. Send a multipart request with the model ID from `GET /v1/models`:
+
+```sh
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer $OMLX_API_KEY" \
+  -F "file=@meeting.wav" \
+  -F "model=$MODEL_ID" \
+  -F "response_format=diarized_json" \
+  -F "chunking_strategy=auto"
+```
+
+The response includes text, the audio duration, and one segment per speaker turn with `speaker`, `start`, `end`, and `text`. Speaker labels are local to the recording.
+
+Streaming is not supported, and `chunking_strategy` must be `auto` or omitted; the whole file goes to the model. Models without timed speaker labels, including Nemotron checkpoints without the CTC alignment files, return HTTP 400.
 
 ### Tool Calling & Structured Output
 
@@ -286,7 +318,7 @@ Supports all function calling formats available in mlx-lm, JSON schema validatio
 | Model Family | Format |
 |---|---|
 | Llama, Qwen, DeepSeek, etc. | JSON `<tool_call>` |
-| Qwen3.5 Series | XML `<function=...>` |
+| Qwen3.5 Series, Raon-1 mini | XML `<function=...>` |
 | Gemma | `<start_function_call>` |
 | GLM (4.7, 5) | `<arg_key>/<arg_value>` XML |
 | MiniMax | Namespaced `<minimax:tool_call>` |
@@ -301,7 +333,7 @@ A bare JSON, EBNF, or regex grammar constrains the answer from the first generat
 
 ## Models
 
-Point `--model-dir` at a directory containing MLX-format model subdirectories. Two-level organization folders (e.g., `mlx-community/model-name/`) are also supported.
+Point `--model-dir` at a directory containing MLX-format model subdirectories. Two-level organization folders (e.g., `mlx-community/model-name/`) are also supported. GGUF files in these folders are listed one model per file and run on an [external engine](docs/Splash.md#gguf-models).
 
 ```
 ~/models/
@@ -317,7 +349,7 @@ Models are auto-detected by type. You can also download models directly from the
 | Type | Models |
 |------|--------|
 | LLM | Any model supported by [mlx-lm](https://github.com/ml-explore/mlx-lm) |
-| VLM | Qwen3.5 Series, GLM-4V, Pixtral, and other [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) models |
+| VLM | Qwen3.5 Series, GLM-4V, Pixtral, and other [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) models |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
@@ -461,12 +493,15 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 ## Acknowledgments
 
 - [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Vision-language model inference on Apple Silicon
+- [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) - Vision-language model inference on Apple Silicon
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) - oMLX started from vllm-mlx v0.1.0 and evolved significantly with multi-model serving, tiered KV caching, VLM with full paged cache support, an admin panel, and a macOS menu bar app
 - [venvstacks](https://venvstacks.lmstudio.ai) - Portable Python environment layering for the macOS app bundle
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embedding model support for Apple Silicon
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
-- [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel, and Qwen4's fused GDN decode and prefill kernels are adapted from mlx-serve's MIT-licensed `transformer.zig`; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel
-- [Splash](https://github.com/incoai/splash) - The verify-shape linear kernels use Splash's bf16 `0x4300 | q` weight operand with per-group input sums (from its Apache-2.0 `linear_q4_sgmatrix.metal`), and the tensor-op verify attention adapts the tile design of Splash's `paged_attention_tile.h`; Splash itself can also serve supported models as an external engine
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - Qwen GDN and QSA kernels (one via its mlxfast-challenge port) and the Linux helper's expert kernels and MLX CUDA patches are adapted from its MIT-licensed code
+- [TensorFold](https://github.com/ashhart/TensorFold) - The Linux helper's sparse-attention and Gated DeltaNet CUDA kernels for MiniMax M3, GLM-5.3 and Qwen3.8 Flash-Next are adapted from its Apache-2.0 kernels
+- [Splash](https://github.com/incoai/splash) - The verify-shape linear and attention kernels and GGUF tokenizer loading are adapted from its Apache-2.0 code, and it can serve models as an external engine
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating
+- [m5gpu](https://github.com/beamivalice/m5gpu) - The GPU power limit writes the AGX GPU power target that m5gpu by beamivalice documented (`SetMaxGPUAbsolutePower` with `AbsoluteTarget`, and `-1000` to remove it)
+- [ming-tts-serve](https://github.com/sbusso/ming-tts-serve) - Ming-3.0-tts's pipelined decode loop follows Stéphane Busso's ming-tts-serve, and its fused DiT kernels are adapted from ming-tts-serve's MIT-licensed `ming_fused.zig`

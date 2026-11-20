@@ -239,18 +239,22 @@ def test_existing_final_snapshot_eligibility(
 
 @pytest.mark.parametrize("path", ["external", "resumable"])
 @pytest.mark.parametrize(
-    "base_tokens,prefill_tokens,gen_start,"
+    "base_tokens,prefill_tokens,gen_start,system_end,"
     "expected_snapshots,expected_tails,expected_chunks",
     [
-        (0, 7, 0, [4], [7], [4, 3]),
-        (0, 8, 0, [4, 8], [], [4, 4]),
-        (6, 5, 0, [8], [11], [2, 3]),
+        (0, 7, 0, 0, [4], [7], [4, 3]),
+        (0, 8, 0, 0, [4, 8], [], [4, 4]),
+        (6, 5, 0, 0, [8], [11], [2, 3]),
         # The generation prompt marker splits the last chunk; no end tail.
-        (0, 7, 5, [4], [5], [4, 1, 2]),
+        (0, 7, 5, 0, [4], [5], [4, 1, 2]),
         # A marker on a boundary is covered by that boundary: no tail at all.
-        (0, 7, 4, [4], [], [4, 3]),
+        (0, 7, 4, 0, [4], [], [4, 3]),
         # Cached past the marker (repeat of a tailed prompt): no new tail.
-        (6, 5, 5, [8], [], [2, 3]),
+        (6, 5, 5, 0, [8], [], [2, 3]),
+        # The shared system prefix adds a stop before the marker.
+        (0, 9, 7, 5, [4, 8], [5, 7], [4, 1, 2, 1, 1]),
+        # Restored past the system prefix: only the marker stops.
+        (6, 5, 9, 5, [8], [9], [2, 1, 2]),
     ],
 )
 @pytest.mark.parametrize("guard_limit", [None, 2])
@@ -260,15 +264,17 @@ def test_prefill_end_emits_tail_snapshot_off_the_grid(
     base_tokens,
     prefill_tokens,
     gen_start,
+    system_end,
     expected_snapshots,
     expected_tails,
     expected_chunks,
     guard_limit,
 ):
     """Both prefill paths capture the tail in front of the generation prompt,
-    or at the prefill end when no marker lies inside the prefilled range.
-    A memory guard that shrinks chunks (context priority) only splits them
-    further; boundaries and the tail still land exactly."""
+    or at the prefill end when no marker lies inside the prefilled range, and
+    one more at the shared system prefix end. A memory guard that shrinks
+    chunks (context priority) only splits them further; boundaries and the
+    tails still land exactly."""
     context = boundary_scheduler
     scheduler = context.scheduler
     context.limit.tokens = guard_limit
@@ -297,6 +303,77 @@ def test_prefill_end_emits_tail_snapshot_off_the_grid(
     request.cached_tokens = base_tokens
     request.remaining_tokens = tokens[base_tokens:]
     request.generation_prompt_start = gen_start
+    request.system_prefix_end = system_end
+    cache = [KVCache()]
+    if base_tokens:
+        keys = mx.zeros((1, 1, base_tokens, 1))
+        cache[0].update_and_fetch(keys, keys)
+
+    with patch.object(scheduler, "_emit_prefill_tail_snapshot", side_effect=tail):
+        if path == "external":
+            scheduler._do_external_prefill(request, request.remaining_tokens, cache)
+        else:
+            state = scheduler._begin_prefill(request, request.remaining_tokens, cache)
+            state.sampler = MagicMock()
+            state.sm = MagicMock()
+            state.per_row_lps = []
+            while not scheduler._step_prefill_chunk(state):
+                pass
+            scheduler._emit_final_boundary_if_needed(state)
+
+    assert context.snapshots == expected_snapshots
+    assert tails == expected_tails
+    assert [e[1] for e in context.events if e[0] == "forward"] == expected_chunks
+
+
+@pytest.mark.parametrize("path", ["external", "resumable"])
+@pytest.mark.parametrize(
+    "base_tokens,prefill_tokens,gen_start,system_end,junction_end,"
+    "expected_snapshots,expected_tails,expected_chunks",
+    [
+        # A branch point inside the prefill adds a stop before the marker.
+        (0, 9, 7, 0, 5, [4, 8], [5, 7], [4, 1, 2, 1, 1]),
+        # The system prefix keeps the stop; the branch point adds none.
+        (0, 9, 7, 5, 6, [4, 8], [5, 7], [4, 1, 2, 1, 1]),
+        # A system prefix that is already cached leaves the stop to the branch point.
+        (6, 5, 9, 4, 7, [8], [7, 9], [1, 1, 1, 2]),
+    ],
+)
+def test_prefill_stops_at_the_branch_point(
+    boundary_scheduler,
+    path,
+    base_tokens,
+    prefill_tokens,
+    gen_start,
+    system_end,
+    junction_end,
+    expected_snapshots,
+    expected_tails,
+    expected_chunks,
+):
+    """The prefill captures a shared tail where the prompt branches off a stored
+    sequence, on both paths, and never stops twice for shared tails."""
+    context = boundary_scheduler
+    scheduler = context.scheduler
+    tails = []
+
+    def tail(request, cache, total_tokens):
+        assert cache[0].offset == total_tokens
+        tails.append(total_tokens)
+
+    tokens = list(range(base_tokens + prefill_tokens + 1))
+    request = Request(
+        request_id="branch",
+        prompt=tokens,
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+    request.prompt_token_ids = tokens
+    request.num_prompt_tokens = len(tokens)
+    request.cached_tokens = base_tokens
+    request.remaining_tokens = tokens[base_tokens:]
+    request.generation_prompt_start = gen_start
+    request.system_prefix_end = system_end
+    request.junction_end = junction_end
     cache = [KVCache()]
     if base_tokens:
         keys = mx.zeros((1, 1, base_tokens, 1))

@@ -5,15 +5,23 @@ import SwiftUI
 @MainActor
 final class ModelSettingsScreenVMTests: XCTestCase {
 
+    /// Some locales put a (narrow) no-break space before "%", e.g. "42 %".
+    private func normalizedPercent(_ label: String) -> String {
+        label
+            .replacingOccurrences(of: "\u{202F}", with: "")
+            .replacingOccurrences(of: "\u{00A0}", with: "")
+            .replacingOccurrences(of: " ", with: "")
+    }
+
     func testSnapshotResultHelpersFormatSkippedStatsAndAppliedJSON() {
         let skipped = [
             SkippedFeatureDTO(feature: "dflash", reason: "draft model 'x' is not installed"),
-            SkippedFeatureDTO(feature: "oq_a8", reason: "cannot be combined with qwen35_ane_prefill_enabled"),
+            SkippedFeatureDTO(feature: "a8_prefill", reason: "cannot be combined with qwen35_ane_prefill_enabled"),
         ]
         XCTAssertEqual(
             ModelSettingsScreenVM.summarizeSkipped(skipped),
             ["dflash: draft model 'x' is not installed",
-             "oq_a8: cannot be combined with qwen35_ane_prefill_enabled"]
+             "a8_prefill: cannot be combined with qwen35_ane_prefill_enabled"]
         )
         XCTAssertEqual(ModelSettingsScreenVM.summarizeSkipped(nil), [])
 
@@ -325,7 +333,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         vm.qwen35AnePrefillEnabled = true
         let presets = ModelSettingsScreenVM.aneFractionOptions(current: "0.42", presets: [1.0 / 3.0, 0.5])
         XCTAssertEqual(presets.map(\.0), ["0.42", String(1.0 / 3.0), "0.5"])
-        XCTAssertEqual(presets.map(\.1), ["42%", "33%", "50%"])
+        XCTAssertEqual(presets.map { normalizedPercent($0.1) }, ["42%", "33%", "50%"])
         vm.qwen35AnePrefillFraction = presets[0].0
         XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.qwen35AnePrefillFraction]?.value as? Double, 0.42)
         vm.qwen35AnePrefillFraction = presets[1].0
@@ -336,7 +344,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     func testK2SharedPresetsKeepLoadedStringSelection() {
         for current in ["0", "0.0", "1", "1.0", String(1.0 / 3.0)] {
             let options = ModelSettingsScreenVM.aneFractionOptions(current: current, presets: [0, 1.0 / 3.0, 1])
-            XCTAssertEqual(options.map(\.1), ["0%", "33%", "100%"])
+            XCTAssertEqual(options.map { normalizedPercent($0.1) }, ["0%", "33%", "100%"])
             XCTAssertEqual(options.filter { $0.0 == current }.count, 1)
         }
     }
@@ -380,18 +388,19 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertFalse(vm.isQwen35AnePrefillModel)
     }
 
-    func testQwenOqA8ModelGateCoversQwen4ExpOnly() {
+    func testA8PrefillModelGateCoversExactFamilies() {
         let vm = ModelSettingsScreenVM()
-        for type in ["qwen3_5", "qwen3_5_moe", "qwen3_6", "qwen3_8", "qwen4_exp", "Qwen4-Exp"] {
+        for type in ["qwen3_5", "qwen3_5_moe", "qwen3_6", "qwen3_8", "qwen4_exp", "Qwen4-Exp", "deepseek_v41",
+                     "minimax_m3", "minimax_m3_vl"] {
             vm.model = makeModel(id: "m", configModelType: type)
-            XCTAssertTrue(vm.isQwenOqA8Model, type)
+            XCTAssertTrue(vm.isA8PrefillModel, type)
         }
-        for type in ["qwen4", "qwen4_exp_x", "qwen3", "llama", "k2_horizon"] {
+        for type in ["qwen4", "qwen4_exp_x", "qwen3", "llama", "k2_horizon", "deepseek_v4", "minimax_m2"] {
             vm.model = makeModel(id: "m", configModelType: type)
-            XCTAssertFalse(vm.isQwenOqA8Model, type)
+            XCTAssertFalse(vm.isA8PrefillModel, type)
         }
         vm.model = makeModel(id: "m", configModelType: nil)
-        XCTAssertFalse(vm.isQwenOqA8Model)
+        XCTAssertFalse(vm.isA8PrefillModel)
     }
 
     func testQwen4SsdOffloadWireKeysAndCompatibility() throws {
@@ -621,14 +630,17 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertTrue(vm.showsEnginePages)
 
         XCTAssertFalse(vm.showsEmbeddingContextWindow)
+        XCTAssertFalse(vm.showsRerankerContextWindow)
 
         vm.model = makeModel(id: "embed", configModelType: "bert", modelType: "embedding")
         XCTAssertFalse(vm.showsGenerationSection)
         XCTAssertFalse(vm.showsEnginePages)
         XCTAssertTrue(vm.showsEmbeddingContextWindow)
+        XCTAssertFalse(vm.showsRerankerContextWindow)
 
         vm.model = makeModel(id: "rerank", configModelType: "xlm-roberta", modelType: "reranker")
         XCTAssertFalse(vm.showsEmbeddingContextWindow)
+        XCTAssertTrue(vm.showsRerankerContextWindow)
 
         vm.model = makeModel(id: "diffusion", configModelType: "diffusion_gemma")
         XCTAssertTrue(vm.showsGenerationSection)
@@ -648,6 +660,21 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         let summary = vm.summary(for: .acceleration)
         vm.externalEngine = "splash"
         XCTAssertNotEqual(vm.summary(for: .acceleration), summary)
+    }
+
+    func testSavingEmptyAliasAndModelTypeSendsExplicitClears() async {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RejectingSettingsURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = OMLXClient(host: "127.0.0.1", port: 18160, session: session)
+        let vm = ModelSettingsScreenVM()
+        vm.modelID = "clear"
+
+        await vm.save(.alias, client: client)
+        await vm.save(.modelType, client: client)
+
+        XCTAssertNil(vm.lastError)
     }
 
     func testRejectedAutoSaveRestoresTheStoredValues() async {
@@ -813,6 +840,42 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen35_ane_prefill_enabled"] as? Bool, false)
     }
 
+    func testLoRAAdapterPickerAndWorkingBody() throws {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "m", configModelType: "qwen3_5")
+        vm.loraAdapters = [
+            LoRAAdapterDTO(id: "fits", path: "/models/fits", baseModel: "Qwen/Base", rank: 32,
+                           targets: ["q_proj"], sizeFormatted: "638 MB", problem: nil),
+            LoRAAdapterDTO(id: "misfit", path: "/models/misfit", baseModel: nil, rank: 8,
+                           targets: ["q_proj"], sizeFormatted: nil, problem: "too many layers"),
+        ]
+        XCTAssertTrue(vm.workingSettingsBody()[ProfileSettingsKey.loraAdapter]?.value is NSNull)
+
+        // A saved adapter stays selectable even when it no longer fits.
+        vm.loraAdapter = "/models/misfit"
+        XCTAssertEqual(vm.loraAdapterOptions().map(\.0), ["", "/models/fits", "/models/misfit"])
+        vm.loraAdapter = "/elsewhere/adapter"
+        XCTAssertEqual(vm.loraAdapterOptions().map(\.0), ["", "/elsewhere/adapter", "/models/fits"])
+        XCTAssertEqual(
+            vm.workingSettingsBody()[ProfileSettingsKey.loraAdapter]?.value as? String,
+            "/elsewhere/adapter"
+        )
+    }
+
+    func testGPUPowerLimitSendsZeroWhenOff() throws {
+        let vm = ModelSettingsScreenVM()
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.gpuPowerLimitW]?.value as? Int, 0)
+        vm.limitGpuPower = true
+        vm.gpuPowerLimitWatts = "12"
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.gpuPowerLimitW]?.value as? Int, 12)
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        vm.model = try decoder.decode(ModelDTO.self, from: Data(#"{"id":"q","loaded":false,"is_loading":false,"estimated_size":0,"gpu_power_limit_supported":true,"settings":{"gpu_power_limit_w":20}}"#.utf8))
+        XCTAssertTrue(vm.gpuPowerLimitSupported)
+        XCTAssertEqual(vm.model?.settings?.gpuPowerLimitW, 20)
+    }
+
     func testQwenInt8RowNeedsSupportedHardwareUnlessAlreadyOn() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -820,13 +883,20 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             try decoder.decode(ModelDTO.self, from: Data(#"{"id":"q","loaded":false,"is_loading":false,"estimated_size":0,"config_model_type":"qwen3_5"\#(extra)}"#.utf8))
         }
         let vm = ModelSettingsScreenVM()
-        vm.model = try model(#","qwen35_oq_a8_supported":false"#)
-        XCTAssertTrue(vm.isQwenOqA8Model)
-        XCTAssertFalse(vm.showsQwenOqA8)
-        vm.model = try model(#","qwen35_oq_a8_supported":true"#)
-        XCTAssertTrue(vm.showsQwenOqA8)
-        vm.model = try model(#","qwen35_oq_a8_supported":false,"settings":{"qwen35_oq_a8_enabled":true}"#)
-        XCTAssertTrue(vm.showsQwenOqA8)
+        vm.model = try model(#","a8_prefill_supported":false"#)
+        XCTAssertTrue(vm.isA8PrefillModel)
+        XCTAssertFalse(vm.showsA8Prefill)
+        vm.model = try model(#","a8_prefill_supported":true"#)
+        XCTAssertTrue(vm.showsA8Prefill)
+        vm.model = try model(#","a8_prefill_supported":false,"settings":{"a8_prefill_enabled":true}"#)
+        XCTAssertTrue(vm.showsA8Prefill)
+
+        // A Prefill Accelerator Mac shows the row where the kernels cannot run here.
+        vm.model = try model(#","a8_prefill_supported":false"#)
+        vm.prefillHelperNodeID = "m5"
+        XCTAssertTrue(vm.showsA8Prefill)
+        vm.prefillHelperNodeID = ""
+        XCTAssertFalse(vm.showsA8Prefill)
     }
 
     func testLoadDefaultsStagesGenerationFieldsOnly() {
@@ -907,8 +977,9 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     }
 }
 
-/// Serves one model with Lightning MTP on and rejects every settings write
-/// the way the server rejects an MTP + DFlash pair.
+/// Serves one model with Lightning MTP on and rejects its settings writes
+/// the way the server rejects an MTP + DFlash pair. Writes to "clear" must
+/// send JSON null.
 private final class RejectingSettingsURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
 
@@ -930,6 +1001,13 @@ private final class RejectingSettingsURLProtocol: URLProtocol, @unchecked Sendab
                 body = try Data(contentsOf: URL(fileURLWithPath: #filePath)
                     .deletingLastPathComponent()
                     .appendingPathComponent("Fixtures/global-settings.json"))
+            case "/admin/api/models/clear/settings":
+                let stream = try XCTUnwrap(request.httpBodyStream)
+                stream.open()
+                defer { stream.close() }
+                let settings = try XCTUnwrap(JSONSerialization.jsonObject(with: stream) as? [String: Any])
+                XCTAssertTrue(!settings.isEmpty && settings.values.allSatisfy { $0 is NSNull })
+                body = Data(#"{"status":"ok"}"#.utf8)
             case "/admin/api/models/m/settings":
                 status = 400
                 body = Data(#"{"detail":"MTP and DFlash cannot both be enabled; choose one speculative-decoding path."}"#.utf8)

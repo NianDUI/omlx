@@ -29,7 +29,9 @@ import regex
 from jsonschema import Draft202012Validator, SchemaError, ValidationError, validate
 from jsonschema.exceptions import UndefinedTypeCheck
 
+from ..utils.tokenizer import is_mimo_tool_template
 from .openai_models import FunctionCall, ResponseFormat, ToolCall
+from .thinking import extract_thinking, leading_thinking_only
 
 logger = logging.getLogger(__name__)
 
@@ -43,20 +45,23 @@ def _template_safe_description(value: Any) -> str:
     return str(value)
 
 
+# Fully sorted keys put "type" last, and Qwen3.6 then makes fewer direct
+# tool calls. These keys keep the order clients usually send.
+_SCHEMA_LEADING_KEYS = ("type", "description", "properties", "required")
+
+
 def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
-    """Copy JSON Schema with stable object order and template descriptions."""
+    """Copy JSON Schema with stable key order and template descriptions."""
     if isinstance(value, dict):
         copied = {}
-        # Equivalent client JSON key orders must render the same token prefix.
-        # Keep array order intact: only object member order is canonicalized.
-        for key in sorted(value):
-            child = value[key]
+        for key, child in value.items():
             if key == "properties" and isinstance(child, dict):
+                # Property order is part of the tool definition; keep it.
                 copied[key] = {
                     name: _copy_schema_with_template_defaults(
-                        child[name], is_schema=True
+                        prop_schema, is_schema=True
                     )
-                    for name in sorted(child)
+                    for name, prop_schema in child.items()
                 }
             elif key in {
                 "items",
@@ -85,7 +90,10 @@ def _copy_schema_with_template_defaults(value: Any, *, is_schema: bool) -> Any:
             copied["description"] = _template_safe_description(
                 copied.get("description")
             )
-        return copied
+        # Equivalent client key orders must render the same token prefix.
+        leading = [key for key in _SCHEMA_LEADING_KEYS if key in copied]
+        rest = sorted(key for key in copied if key not in _SCHEMA_LEADING_KEYS)
+        return {key: copied[key] for key in leading + rest}
 
     if isinstance(value, list):
         return [
@@ -195,6 +203,13 @@ _SCHEMA_STRING_TYPES = {"string", "str", "text", "varchar", "char", "enum"}
 _SCHEMA_BOOL_TYPES = {"boolean", "bool", "binary"}
 _SCHEMA_CONTAINER_TYPES = {"object", "array", "arr"}
 _SCHEMA_INT_PREFIXES = ("int", "uint", "long", "short", "unsigned")
+
+
+def _is_container_type(ptype: Any) -> bool:
+    """True when a declared parameter type is a container (array/object)."""
+    return isinstance(ptype, str) and (
+        ptype in _SCHEMA_CONTAINER_TYPES or ptype.startswith(("dict", "list"))
+    )
 
 
 def _tool_param_properties(func_name: str, tools: Optional[List]) -> dict:
@@ -400,17 +415,23 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
             return int(num) if num == int(num) else num
         except (ValueError, OverflowError):
             pass
+    is_container = _is_container_type(ptype)
     try:
-        return json.loads(val, strict=False)
+        decoded = json.loads(val, strict=False)
     except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
         pass
+    else:
+        # Some models wrap the whole fragment list in a JSON string (#5336).
+        if is_container and isinstance(decoded, str):
+            decoded = _merge_json_fragments(decoded, spec) or decoded
+        return decoded
     try:
         literal = ast.literal_eval(val)
         if isinstance(literal, (dict, list, tuple)):
             return list(literal) if isinstance(literal, tuple) else literal
     except (ValueError, SyntaxError, TypeError, MemoryError, *_DEEP_NEST_ERRORS):
         pass
-    if ptype in _SCHEMA_CONTAINER_TYPES or ptype.startswith(("dict", "list")):
+    if is_container:
         merged = _merge_json_fragments(val, spec)
         if merged is not None:
             logger.warning(
@@ -423,6 +444,8 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
             )
             return merged
         repaired = _repair_json_value(val)
+        if isinstance(repaired, str):
+            repaired = _merge_json_fragments(repaired, spec) or repaired
         if repaired is not None:
             logger.warning(
                 "Repaired malformed JSON for parameter %r of tool %r "
@@ -752,7 +775,9 @@ def _iter_xml_parameters(params_text: str) -> Iterator[Tuple[str, str]]:
         pos = value_end + len(_XML_PARAMETER_CLOSE)
 
 
-_ATTR_FUNCTION_OPEN_RE = re.compile(r'<function\s+name="([^"]+)"\s*>')
+_ATTR_FUNCTION_OPEN_RE = re.compile(r'<(function)\s+name="([^"]+)"\s*>')
+# MiMo-format templates also accept bare MiniMax-style <invoke> elements (#4933).
+_ATTR_ELEMENT_OPEN_RE = re.compile(r'<(function|invoke)\s+name="([^"]+)"\s*>')
 # Both <param> (MiniCPM5's chat template) and <parameter> spellings occur in
 # the wild; the backreference pairs open/close spellings so a literal
 # "</param>" cannot close a <parameter> element. The non-greedy CDATA
@@ -790,13 +815,17 @@ def _find_attr_function_span(
     """
     span_start = open_match.start()
     payload_start = open_match.end()
+    kind = open_match.group(1)
+    close = f"</{kind}>"
     cursor = payload_start
     n = len(text)
 
     while cursor < n:
         cdata_start = text.find("<![CDATA[", cursor)
-        close_tag = text.find("</function>", cursor)
-        next_open = _ATTR_FUNCTION_OPEN_RE.search(text, cursor)
+        close_tag = text.find(close, cursor)
+        next_open = _ATTR_ELEMENT_OPEN_RE.search(text, cursor)
+        while next_open is not None and next_open.group(1) != kind:
+            next_open = _ATTR_ELEMENT_OPEN_RE.search(text, next_open.end())
 
         if close_tag < 0:
             return None
@@ -820,7 +849,7 @@ def _find_attr_function_span(
             continue
 
         # close_tag is outside CDATA!
-        span_end = close_tag + len("</function>")
+        span_end = close_tag + len(close)
         payload = text[payload_start:close_tag]
         return span_start, span_end, payload
 
@@ -990,7 +1019,7 @@ def _parse_xml_tool_calls(
         # truncate the element early.
         attr_open = _ATTR_FUNCTION_OPEN_RE.match(content)
         if attr_open:
-            func_name = attr_open.group(1)
+            func_name = attr_open.group(2)
             found = _find_attr_function_span(content, attr_open)
             if found is not None:
                 params_text = found[2]
@@ -1087,7 +1116,7 @@ def _parse_namespaced_tool_calls(
 
 
 def _parse_attribute_function_tool_calls(
-    text: str, tools: Optional[List] = None
+    text: str, tools: Optional[List] = None, *, bare_invoke: bool = False
 ) -> Tuple[str, Optional[List[ToolCall]]]:
     """
     Fallback parser for bare attribute-style tool calls (#3429).
@@ -1095,7 +1124,9 @@ def _parse_attribute_function_tool_calls(
     MiniCPM5-family chat templates emit
     ``<function name="name"><param name="key">value</param></function>``
     with no wrapper marker at all, so none of the envelope-anchored parsers
-    ever see it.
+    ever see it. With ``bare_invoke`` (MiMo-format templates, #4933),
+    MiniMax-style ``<invoke name="name"><parameter name="key">`` elements
+    without the ``<minimax:tool_call>`` wrapper are parsed too.
 
     Without an envelope the only safe anchor is the request's own tool
     declarations: an element is parsed only when its name exactly matches a
@@ -1118,14 +1149,15 @@ def _parse_attribute_function_tool_calls(
     if not registered:
         return text, None
 
+    open_re = _ATTR_ELEMENT_OPEN_RE if bare_invoke else _ATTR_FUNCTION_OPEN_RE
     tool_calls = []
     spans: List[Tuple[int, int]] = []
     pos = 0
     while pos < len(text):
-        match = _ATTR_FUNCTION_OPEN_RE.search(text, pos)
+        match = open_re.search(text, pos)
         if not match:
             break
-        func_name = match.group(1)
+        func_name = match.group(2)
         if func_name not in registered:
             pos = match.end()
             continue
@@ -2045,23 +2077,29 @@ def _parse_tool_calls_impl(
     cleaned_text = text
 
     # Remove thinking tags if present (reasoning models)
-    cleaned_text = re.sub(
-        r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
-    ).strip()
+    if leading_thinking_only(tokenizer):
+        # Only a leading block is thinking; later tags are answer text.
+        cleaned_text = extract_thinking(cleaned_text, leading_only=True)[1].strip()
+    else:
+        cleaned_text = re.sub(
+            r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
+        ).strip()
 
-    if tools and _ATTR_FUNCTION_OPEN_RE.search(cleaned_text):
+    bare_invoke = is_mimo_tool_template(getattr(tokenizer, "chat_template", None))
+    attr_open_re = _ATTR_ELEMENT_OPEN_RE if bare_invoke else _ATTR_FUNCTION_OPEN_RE
+    if tools and attr_open_re.search(cleaned_text):
         # Select outer envelopes before inspecting markers inside CDATA values.
         finder = ToolCallStreamFilter(tokenizer, tools=tools)
         pos, prose, attr_calls = 0, [], []
         while start := finder._find_start_envelope(cleaned_text, pos):
-            opening = _ATTR_FUNCTION_OPEN_RE.match(cleaned_text, start[0])
+            opening = attr_open_re.match(cleaned_text, start[0])
             if opening is None:
                 break
             span = _find_attr_function_span(cleaned_text, opening)
             if span is None:
                 break
             _, calls = _parse_attribute_function_tool_calls(
-                cleaned_text[span[0] : span[1]], tools
+                cleaned_text[span[0] : span[1]], tools, bare_invoke=bare_invoke
             )
             if not calls:
                 break
@@ -2139,7 +2177,14 @@ def _parse_tool_calls_impl(
                                 untyped_string = "type" not in spec and isinstance(
                                     value, str
                                 )
-                                if union_mismatch or untyped_string:
+                                container_mismatch = _is_container_type(
+                                    spec.get("type")
+                                ) and isinstance(value, str)
+                                if (
+                                    union_mismatch
+                                    or untyped_string
+                                    or container_mismatch
+                                ):
                                     arguments[key] = _coerce_param_value(
                                         val, key, props, name
                                     )
@@ -2237,10 +2282,13 @@ def _parse_tool_calls_impl(
         return _parse_namespaced_tool_calls(cleaned_text, ns, tools)
 
     # Fallback: bare attribute-style <function name="..."> elements with no
-    # wrapper marker (MiniCPM5 family, #3429). Anchored on declared tool
-    # names; see the parser's docstring.
-    if _ATTR_FUNCTION_OPEN_RE.search(cleaned_text):
-        attr_result = _parse_attribute_function_tool_calls(cleaned_text, tools)
+    # wrapper marker (MiniCPM5 family, #3429), plus <invoke name="..."> for
+    # MiMo-format templates (#4933). Anchored on declared tool names; see the
+    # parser's docstring.
+    if attr_open_re.search(cleaned_text):
+        attr_result = _parse_attribute_function_tool_calls(
+            cleaned_text, tools, bare_invoke=bare_invoke
+        )
         if attr_result[1] is not None:
             return attr_result
 
@@ -2483,6 +2531,33 @@ def extract_tool_calls_with_thinking(
         )
     else:
         cleaned_text, tool_calls = parse_tool_calls(regular_content, tokenizer, tools)
+
+    dsml_start = getattr(tokenizer, "tool_call_start", None)
+    if (
+        tools
+        and not tool_calls
+        and dsml_start == "<｜DSML｜ calls>"
+        and dsml_start in regular_content
+    ):
+        # V4.1's output parser returns rejected envelopes as text.
+        errors = []
+        if any(
+            payload.lstrip().startswith("<｜DSML｜ invoke")
+            for payload in _marker_payloads(
+                regular_content, dsml_start, tokenizer.tool_call_end
+            )
+        ):
+            errors.append("malformed")
+        stream_filter = ToolCallStreamFilter(tokenizer, tools=tools)
+        visible = stream_filter.feed(regular_content) + stream_filter.finish()
+        if (
+            stream_filter.recovery_candidate_is_payload()
+            and stream_filter.take_recovery_candidate().startswith(dsml_start)
+        ):
+            cleaned_text = visible.strip()
+            errors.append("incomplete")
+        parse_errors = tuple(errors)
+
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer, tools=tools)
     tool_calls_from_thinking = False
 
@@ -2515,12 +2590,29 @@ def extract_tool_calls_with_thinking(
                     tool_calls_from_thinking = False
             else:
                 valid_names = _extract_tool_names(tools)
+                dropped = [
+                    tc.function.name[:200]
+                    for tc in tool_calls
+                    if tc.function.name not in valid_names
+                ]
+                if dropped:
+                    # The reasoning filter already removed these envelopes.
+                    logger.warning(
+                        "Dropped %d tool call(s) from reasoning with undeclared "
+                        "names: %s",
+                        len(dropped),
+                        dropped[:8],
+                    )
                 tool_calls = [
                     tc for tc in tool_calls if tc.function.name in valid_names
                 ]
                 if not tool_calls:
                     tool_calls = None
                     tool_calls_from_thinking = False
+
+    if tools and finish_reason == "tool_calls" and not tool_calls and not parse_errors:
+        # A remote backend can consume the call span and still report this finish.
+        parse_errors = ("malformed",)
 
     return ToolCallExtraction(
         cleaned_text=cleaned_text,
@@ -2635,6 +2727,9 @@ class ToolCallStreamFilter:
                 self._registered_tool_names = _extract_tool_names(tools)
         else:
             self._registered_tool_names = set()
+        self._bare_invoke = is_mimo_tool_template(
+            getattr(tokenizer, "chat_template", None)
+        )
         self._attr_func_in_cdata = False
         if marker:
             if marker_end:
@@ -2674,6 +2769,16 @@ class ToolCallStreamFilter:
         )
         self._after_naked_function = False
         self._buffer = ""
+        # First character of every marker family, incl. custom pairs.
+        markers = [
+            "<",
+            *self._suppress_after_markers,
+            *self._orphan_close_markers,
+            *self._stray_close_markers,
+            *self._bracket_prefixes,
+            *(pair[0] for pair in self._marker_pairs),
+        ]
+        self._marker_trigger_chars = frozenset(m[0] for m in markers if m)
         self._suppressing_until: Optional[str] = None
         self._suppressing = False
         self._pending_envelope_parts: List[str] = []
@@ -2722,9 +2827,13 @@ class ToolCallStreamFilter:
         if self._opens_payload_at(tail, 0):
             return True
         start = len(self._opener_at(tail, 0))
-        # A declared tool name is call evidence in any call format.
+        # A declared tool name is call evidence only in call position, right
+        # after the opener (`<tool_call>write(...`, `<tool_call>name\n<arg_key>`,
+        # MiniCPM5 `<function name="write">`).
+        # Coding-agent tool names are common words (read, write, edit, bash):
+        # anywhere else they are prose, and counting them failed quoted markers.
         for name in self._registered_tool_names:
-            if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", tail[start:]):
+            if re.match(rf"\s*[\"']?{re.escape(name)}(?![\w-])", tail[start:]):
                 return True
         # One forward cursor per marker keeps marker-heavy tails linear.
         cursors = {
@@ -3007,7 +3116,7 @@ class ToolCallStreamFilter:
             self._naked_scan_off = len(buffer) if end is None else end
             return -1 if end is None else end - len(_XML_FUNCTION_CLOSE)
 
-        if marker == "</function>":
+        if marker in ("</function>", "</invoke>"):
             return self._find_attr_function_suppression_end(buffer)
 
         # Feed the boundary scanner while the dialect is still undecided too:
@@ -3172,9 +3281,12 @@ class ToolCallStreamFilter:
         def compute_attr_func() -> Optional[Tuple[int, int, Optional[str]]]:
             if not self._registered_tool_names:
                 return None
-            for m in _ATTR_FUNCTION_OPEN_RE.finditer(text, start):
-                if m.group(1) in self._registered_tool_names:
-                    return (m.start(), len(m.group(0)), "</function>")
+            open_re = (
+                _ATTR_ELEMENT_OPEN_RE if self._bare_invoke else _ATTR_FUNCTION_OPEN_RE
+            )
+            for m in open_re.finditer(text, start):
+                if m.group(2) in self._registered_tool_names:
+                    return (m.start(), len(m.group(0)), f"</{m.group(1)}>")
             return None
 
         hit = lookup("attr_func", compute_attr_func)
@@ -3217,16 +3329,25 @@ class ToolCallStreamFilter:
         return "tool_call".startswith(suffix)
 
     def _could_be_partial_attr_function_open(self, candidate: str) -> bool:
-        """Return True if candidate could prefix a bare <function name="..."> tag for a declared tool."""
+        """Return True if candidate could prefix a bare open tag for a declared tool.
+
+        Covers ``<function name="...">``, plus ``<invoke name="...">`` for
+        MiMo-format templates.
+        """
         if not self._registered_tool_names:
             return False
         if not candidate.startswith("<") or ">" in candidate:
             return False
-        if "<function".startswith(candidate):
+        tag = (
+            "<invoke"
+            if self._bare_invoke and candidate.startswith("<i")
+            else "<function"
+        )
+        if tag.startswith(candidate):
             return True
-        if not candidate.startswith("<function"):
+        if not candidate.startswith(tag):
             return False
-        rest = candidate[len("<function") :]
+        rest = candidate[len(tag) :]
         if not rest:
             return True
         if not rest[0].isspace():
@@ -3518,8 +3639,18 @@ class ToolCallStreamFilter:
         if not self.active:
             return text
 
-        self._buffer += text
         out: List[str] = []
+        # Prose fast path: no marker can begin, so skip the scan below.
+        if (
+            not self._buffer
+            and not self._after_naked_function
+            and self._suppressing_until is None
+            and self._marker_trigger_chars.isdisjoint(text)
+        ):
+            self._record_content(out, text)
+            return text
+
+        self._buffer += text
 
         while self._buffer:
             if self._after_naked_function:
@@ -3542,7 +3673,7 @@ class ToolCallStreamFilter:
                 end_idx = self._find_suppression_end(self._buffer)
                 if end_idx < 0:
                     if (
-                        self._suppressing_until == "</function>"
+                        self._suppressing_until in ("</function>", "</invoke>")
                         or self._json_state == "attr_xml"
                     ):
                         if self._attr_func_in_cdata:

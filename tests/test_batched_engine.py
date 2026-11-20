@@ -13,6 +13,8 @@ Tests cover:
 Note: mlx_lm.load() is mocked to avoid loading real models.
 """
 
+import threading
+import time
 from abc import ABC
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -20,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from omlx.api.grammar import GRAMMAR_CACHE_LIMIT_BYTES
 from omlx.engine.base import BaseEngine, BaseNonStreamingEngine, GenerationOutput
 
 
@@ -43,6 +46,7 @@ class FakeStreamingCore:
             finished=False,
             finish_reason=None,
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
         )
 
@@ -366,6 +370,30 @@ class TestBatchedEngineInitialization:
 
         assert engine._model is None
         assert engine._engine is None
+
+
+class TestBatchedEngineAbortRequest:
+    @pytest.mark.asyncio
+    async def test_abort_request_only_reaches_owned_requests(self):
+        from omlx.engine.batched import BatchedEngine
+
+        core = MagicMock()
+        core._output_collectors = {"req-1": object(), "done": object()}
+        core._finished_at = {"done": 0.0}
+        core.abort_request = AsyncMock(return_value=True)
+        engine = BatchedEngine(model_name="test-model")
+        engine._engine = SimpleNamespace(engine=core)
+
+        assert await engine.abort_request("other") is False
+        assert await engine.abort_request("done") is False
+        core.abort_request.assert_not_awaited()
+
+        assert await engine.abort_request(
+            "req-1", reason="stop", error_code="admin_abort"
+        )
+        core.abort_request.assert_awaited_once_with(
+            "req-1", reason="stop", error_code="admin_abort"
+        )
 
 
 class TestBatchedEngineStreamingCleanup:
@@ -910,6 +938,7 @@ class TestBatchedEngineSpecPrefillForwarding:
             completion_tokens=2,
             finish_reason="stop",
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
             first_token_at=None,
         )
@@ -983,6 +1012,23 @@ class TestBatchedEngineSpecPrefillForwarding:
         assert kwargs["preserve_reasoning"] is True
         assert kwargs["skip_cache_store"] is True
         assert kwargs["request_id"] == "req-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ignore_eos", [False, True])
+    async def test_generate_forwards_ignore_eos(self, ignore_eos):
+        """The non-streaming path must decode to max_tokens as the streaming one does."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt", ignore_eos=ignore_eos)
+
+        params = engine._engine.generate.call_args.kwargs["sampling_params"]
+        assert params.ignore_eos is ignore_eos
 
     @pytest.mark.asyncio
     async def test_generate_forwards_tools(self):
@@ -1111,6 +1157,37 @@ class TestBatchedEngineSpecPrefillForwarding:
         call_kwargs = engine._engine.generate.call_args.kwargs
         assert "generation_prompt_text" not in call_kwargs
 
+    @pytest.mark.asyncio
+    async def test_chat_forwards_system_prefix_ids_once_seen(self):
+        """A repeated system block reaches the engine as its rendered token ids."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._model_settings = SimpleNamespace(specprefill_enabled=False)
+        engine._preprocess_messages = lambda m: m
+        engine._tokenizer = MagicMock()
+        engine._tokenizer.encode.side_effect = lambda text, **kw: [ord(c) for c in text]
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+        engine._apply_chat_template = lambda msgs, *args, **kwargs: "".join(
+            f"<{m['role']}>{m['content']}" for m in msgs
+        )
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+        ]
+
+        await engine.chat(messages)
+        assert "system_prefix_ids" not in engine._engine.generate.call_args.kwargs
+        await engine.chat(messages)
+        assert engine._engine.generate.call_args.kwargs["system_prefix_ids"] == [
+            ord(c) for c in "<system>sys<user>"
+        ]
+        await engine.chat(messages[1:])
+        assert "system_prefix_ids" not in engine._engine.generate.call_args.kwargs
+
 
 class _TemplateTokenizer:
     """Renders a readable prompt and encodes one id per character."""
@@ -1205,6 +1282,7 @@ class TestBatchedEnginePreparedPrompt:
         engine._tokenizer.encode.return_value = [11, 22, 33]
         # Generation-suffix probes render different, short prompts.
         engine._generation_prompt_text = MagicMock(return_value=("suffix", True))
+        engine._system_prefix_ids = MagicMock(return_value=None)
         engine._engine = FakeStreamingCore()
         engine._engine.generate = AsyncMock(
             return_value=TestBatchedEngineSpecPrefillForwarding._fake_output()
@@ -1367,3 +1445,108 @@ class TestBatchedEngineMoeOffloadWiring:
             "test-model",
             engine._model_settings.moe_expert_offload_resident_fraction,
         )
+
+
+class TestBatchedEngineToolParserRepair:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "template, expected",
+        [
+            ("'<tool_call><function=' ~ tool_call.name ~ '>'", "qwen3_coder"),
+            # Other stale labels keep their API parser at load.
+            ("<tool_call>\n<function=", "json_tools"),
+        ],
+        ids=["mimo", "other-stale-label"],
+    )
+    async def test_api_tokenizer_repair_is_limited_to_mimo(self, template, expected):
+        """The scheduler repairs only its deep copy, so the engine tokenizer
+        that API tool parsing reads is repaired at load for MiMo (#4933)."""
+        from mlx_lm.tokenizer_utils import TokenizerWrapper
+        from mlx_lm.tool_parsers import json_tools
+
+        from omlx.engine.batched import BatchedEngine
+        from omlx.model_settings import ModelSettings
+
+        class _Abort(Exception):
+            """Unwinds start() right after the model load."""
+
+        tokenizer = TokenizerWrapper.__new__(TokenizerWrapper)
+        tokenizer._tokenizer = SimpleNamespace(
+            chat_template=template,
+            encode=lambda text, **kwargs: list(text.encode()),
+        )
+        tokenizer._chat_template = None
+        tokenizer._tool_parser = json_tools.parse_tool_call
+        tokenizer._tool_call_start = "<tool_call>"
+        tokenizer._tool_call_end = "</tool_call>"
+
+        engine = BatchedEngine(model_name="test-model", model_settings=ModelSettings())
+        with (
+            patch("omlx.engine.batched.get_tokenizer_config", return_value={}),
+            patch("omlx.utils.model_loading.maybe_apply_pre_load_patches"),
+            patch(
+                "omlx.utils.model_loading.maybe_load_custom_quantization",
+                return_value=(object(), SimpleNamespace(tokenizer=tokenizer)),
+            ),
+            patch(
+                "omlx.utils.model_loading.apply_post_load_transforms",
+                side_effect=_Abort,
+            ),
+            patch("omlx.engine_core.get_mlx_executor", return_value=None),
+        ):
+            with pytest.raises(_Abort):
+                await engine.start()
+
+        assert engine.tokenizer is tokenizer
+        assert tokenizer.tool_parser.__module__ == f"mlx_lm.tool_parsers.{expected}"
+
+
+class TestGrammarCompilerLazyInit:
+    def test_concurrent_first_access_shares_one_compiler(self):
+        """Concurrent first callers all get the compiler, built once."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._model = SimpleNamespace(config={"model_type": "k2_horizon"})
+        engine._tokenizer = object()
+
+        sentinel = object()
+        calls: list[int] = []
+        results: list[Any] = []
+        start = threading.Barrier(8)
+
+        def fake_create(tokenizer, model, cache_limit_bytes=-1):
+            calls.append(1)
+            time.sleep(0.05)
+            return sentinel
+
+        def worker():
+            start.wait(timeout=5)
+            results.append(engine.grammar_compiler)
+
+        with patch("omlx.api.grammar.create_grammar_compiler", side_effect=fake_create):
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert len(results) == 8
+        assert all(result is sentinel for result in results), results
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize(
+        ("model_type", "limit"),
+        [("qwen3", GRAMMAR_CACHE_LIMIT_BYTES), ("k2_horizon", 64 * 1024**2)],
+    )
+    def test_compiler_cache_is_bounded(self, model_type, limit):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._model = SimpleNamespace(config={"model_type": model_type})
+        engine._tokenizer = object()
+
+        with patch("omlx.api.grammar.create_grammar_compiler") as create:
+            assert engine.grammar_compiler is create.return_value
+
+        assert create.call_args.kwargs == {"cache_limit_bytes": limit}

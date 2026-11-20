@@ -53,6 +53,8 @@ def _make_mock_sts_engine(output_wav: bytes = None) -> MagicMock:
 def _make_mock_pool(sts_engine=None, model_id: str = "deepfilternet") -> MagicMock:
     """Build a mock EnginePool that returns the given STS engine."""
     pool = MagicMock()
+    # A mock cache dir makes lifespan create MagicMock/ dirs in CWD.
+    pool._scheduler_config.paged_ssd_cache_dir = None
     pool.get_engine = AsyncMock(return_value=sts_engine or _make_mock_sts_engine())
     pool.get_entry = MagicMock(return_value=MagicMock(
         model_type="audio_sts",
@@ -95,6 +97,7 @@ def server_sts_client():
         mock_state.global_settings = None
         mock_state.distributed_inference_enabled = False
         mock_state.process_memory_enforcer = None
+        mock_state.gpu_power_limiter = None
         mock_state.hf_downloader = None
         mock_state.ms_downloader = None
         mock_state.mcp_manager = None
@@ -286,6 +289,7 @@ class TestSTSModelAliasResolution:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
@@ -316,6 +320,7 @@ class TestSTSModelAliasResolution:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None

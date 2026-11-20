@@ -26,6 +26,7 @@ from omlx.utils.sampling import (
     categorical_sampling,
     make_sampler,
     make_shared_sampler,
+    select_logprobs,
 )
 
 
@@ -388,3 +389,108 @@ def test_no_repeat_ngram_matches_reference(dtype):
         assert {i for i, b in enumerate(banned) if b} == expected
         kept = mx.logical_not(mx.isinf(out))
         assert mx.array_equal(mx.where(kept, out, 0), mx.where(kept, logits, 0)).item()
+
+
+@pytest.mark.parametrize(
+    ("dtype", "tol"), [(mx.bfloat16, 0.07), (mx.float16, 0.01), (mx.float32, 1e-5)]
+)
+def test_select_logprobs_reads_batch_rows_on_host(dtype, tol):
+    rng = np.random.default_rng(0)
+    logits = mx.array(
+        np.stack([rng.permutation(64) * 0.25 - 8 for _ in range(3)]), dtype=dtype
+    )
+    rows = list(logits - mx.logsumexp(logits, axis=-1, keepdims=True))
+    mx.eval(rows)
+    ref = logits.astype(mx.float32)
+    ref = np.array(ref - mx.logsumexp(ref, axis=-1, keepdims=True))
+
+    chosen, top = select_logprobs(rows[1], 5, 3)
+
+    assert chosen == pytest.approx(ref[1, 5], abs=tol)
+    assert [token for token, _ in top] == np.argsort(-ref[1])[:3].tolist()
+    assert [value for _, value in top] == pytest.approx(
+        np.sort(ref[1])[::-1][:3], abs=tol
+    )
+    assert select_logprobs(rows[1], 5, 0)[1] == []
+    forced = mx.array([-float("inf"), 0.0, -float("inf")])
+    assert select_logprobs(forced, 1, 3) == (0.0, [(1, 0.0)])
+
+
+def _nucleus_rows(rows, vocab, dtype, scale, seed):
+    mx.random.seed(seed)
+    logits = (mx.random.normal((rows, vocab)) * scale).astype(dtype)
+    lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    mx.eval(lp)
+    return lp
+
+
+def _nucleus_inputs(sampler, lp, depth, seed):
+    from omlx.patches.mlx_lm_mtp.batch_generator import _accept_lp_for
+
+    mx.random.seed(seed)
+    noise = mx.random.normal(lp[:depth].shape) * 0.5
+    draft_lp = lp[:depth].astype(mx.float32) + noise
+    draft_lp = draft_lp - mx.logsumexp(draft_lp, axis=-1, keepdims=True)
+    q = _accept_lp_for(sampler, draft_lp)
+    drafts = mx.random.categorical(q).astype(mx.uint32)
+    qs = [q[row] for row in range(depth)]
+    mx.eval(q, drafts)
+    return drafts, qs
+
+
+def test_nucleus_support_is_the_dense_top_p_density():
+    from omlx.patches.mlx_lm_mtp.batch_generator import (
+        _accept_lp_for,
+        _nucleus_support,
+    )
+
+    lp = _nucleus_rows(5, 65536, mx.bfloat16, scale=6.0, seed=11)
+    sampler = make_sampler(temp=0.6, top_p=0.95)
+    ids, logp, exact = _nucleus_support(sampler, lp)
+    dense = _accept_lp_for(sampler, lp)
+    sparse = mx.put_along_axis(mx.full(dense.shape, -float("inf")), ids, logp, axis=-1)
+    assert exact.item() == 1
+    assert mx.array_equal(mx.isinf(sparse), mx.isinf(dense)).item()
+    diff = mx.abs(mx.where(mx.isinf(dense), 0.0, sparse - dense))
+    assert diff.max().item() < 1e-5
+
+
+def test_nucleus_verify_packet_matches_dense():
+    from omlx.patches.mlx_lm_mtp.batch_generator import (
+        _stochastic_verify_tokens,
+        _verify_stochastic,
+    )
+
+    depth = 4
+    lp = _nucleus_rows(depth + 1, 65536, mx.bfloat16, scale=6.0, seed=3)
+    sampler = make_sampler(temp=0.6, top_p=0.95)
+    drafts, qs = _nucleus_inputs(sampler, lp, depth, seed=4)
+    accepted = set()
+    for seed in range(40):
+        mx.random.seed(seed)
+        dense = _stochastic_verify_tokens(sampler, lp, drafts, qs).tolist()
+        mx.random.seed(seed)
+        fast = _verify_stochastic(sampler, lp, drafts, qs).tolist()
+        assert fast[-1] == 1
+        assert fast[: depth + 1] == dense[: depth + 1]
+        accepted.add(dense[0])
+    assert len(accepted) > 1
+
+
+def test_nucleus_wider_than_candidates_is_redone_densely():
+    from omlx.patches.mlx_lm_mtp.batch_generator import (
+        _settled_verify,
+        _stochastic_verify_tokens,
+        _verify_stochastic,
+    )
+
+    depth = 3
+    lp = _nucleus_rows(depth + 1, 65536, mx.float32, scale=0.3, seed=8)
+    sampler = make_sampler(temp=1.0, top_p=0.95)
+    drafts, qs = _nucleus_inputs(sampler, lp, depth, seed=9)
+    flagged = _verify_stochastic(sampler, lp, drafts, qs).tolist()
+    assert flagged[-1] == 0
+    mx.random.seed(2)
+    host = _settled_verify(flagged, sampler, lp, drafts, qs)
+    mx.random.seed(2)
+    assert host == _stochastic_verify_tokens(sampler, lp, drafts, qs).tolist()

@@ -13,10 +13,11 @@ struct TextInput: View {
     var step: Double?
     var suffix: String?
     var width: CGFloat?
+    var onStep: (() -> Void)?
 
     @Environment(\.omlxTheme) private var theme
 
-    init(_ titleKey: LocalizedStringKey = "", text: Binding<String>, placeholder: String = "", isSecure: Bool = false, mono: Bool = false, isNumeric: Bool = false, range: ClosedRange<Double>? = nil, step: Double? = nil, suffix: String? = nil, width: CGFloat? = nil) {
+    init(_ titleKey: LocalizedStringKey = "", text: Binding<String>, placeholder: String = "", isSecure: Bool = false, mono: Bool = false, isNumeric: Bool = false, range: ClosedRange<Double>? = nil, step: Double? = nil, suffix: String? = nil, width: CGFloat? = nil, onStep: (() -> Void)? = nil) {
         self._text = text
         self.titleKey = titleKey
         self.placeholder = placeholder
@@ -27,12 +28,16 @@ struct TextInput: View {
         self.step = step
         self.suffix = suffix
         self.width = width
+        self.onStep = onStep
     }
 
     private var textAsDouble: Binding<Double> {
         Binding(
             get: { Double(text) ?? 0 },
-            set: { text = $0.formatted(.number.grouping(.never)) }
+            set: {
+                text = $0.formatted(.number.grouping(.never))
+                onStep?()
+            }
         )
     }
 
@@ -42,13 +47,13 @@ struct TextInput: View {
             .textFieldStyle(.roundedBorder)
             // Regular weight: native macOS fields never render medium-weight
             // content, and the bolder text read as a foreign control.
-            .font(mono ? .omlxMono(13) : .omlxText(13))
+            .font(mono ? .omlxMono(DesignTokens.FontSize.body) : .omlxText(DesignTokens.FontSize.body))
             .foregroundStyle(theme.text)
             .overlay(alignment: .trailing) {
                 HStack(spacing: 0) {
                     if let suffix {
                         Text(suffix)
-                            .font(.omlxText(11))
+                            .font(.omlxText(DesignTokens.FontSize.subheadline))
                             .foregroundStyle(theme.textSecondary)
                             .padding(.horizontal, 10)
                     }

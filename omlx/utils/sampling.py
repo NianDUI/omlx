@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import Callable, List, Sequence
+from typing import Callable, List, Optional, Sequence
 
 import mlx.core as mx
+import numpy as np
 
 
 def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
@@ -78,20 +79,31 @@ def apply_min_p(
 _TOP_K_CHUNK = 128
 
 
+def _chunked_top_k(values: mx.array, k: int, chunk: int) -> mx.array:
+    vocab = values.shape[-1]
+    lead = values.shape[:-1]
+    blocks = values.reshape(-1, vocab // chunk, chunk)
+    best = mx.argpartition(-blocks.max(axis=-1), kth=k - 1, axis=-1)[:, :k]
+    cand = mx.take_along_axis(blocks, best[:, :, None], axis=1)
+    pick = mx.argpartition(-cand.reshape(-1, k * chunk), kth=k - 1, axis=-1)[:, :k]
+    picked = mx.take_along_axis(best, pick // chunk, axis=-1)
+    return (picked * chunk + pick % chunk).reshape(*lead, k)
+
+
 def top_k_indices(values: mx.array, k: int) -> mx.array:
     """Indices of the ``k`` largest entries along the last axis, unordered."""
     vocab = values.shape[-1]
     if k > 64 or vocab % _TOP_K_CHUNK or vocab < 64 * _TOP_K_CHUNK:
         return mx.argpartition(-values, kth=k - 1, axis=-1)[..., :k]
-    lead = values.shape[:-1]
-    blocks = values.reshape(-1, vocab // _TOP_K_CHUNK, _TOP_K_CHUNK)
-    best = mx.argpartition(-blocks.max(axis=-1), kth=k - 1, axis=-1)[:, :k]
-    cand = mx.take_along_axis(blocks, best[:, :, None], axis=1)
-    pick = mx.argpartition(-cand.reshape(-1, k * _TOP_K_CHUNK), kth=k - 1, axis=-1)[
-        :, :k
-    ]
-    chunk = mx.take_along_axis(best, pick // _TOP_K_CHUNK, axis=-1)
-    return (chunk * _TOP_K_CHUNK + pick % _TOP_K_CHUNK).reshape(*lead, k)
+    return _chunked_top_k(values, k, _TOP_K_CHUNK)
+
+
+def top_k_indices_wide(values: mx.array, k: int) -> mx.array:
+    """``top_k_indices`` for ``k`` up to a few hundred, with 64-wide chunks."""
+    vocab = values.shape[-1]
+    if vocab % 64 or vocab // 64 <= k:
+        return mx.argpartition(-values, kth=k - 1, axis=-1)[..., :k]
+    return _chunked_top_k(values, k, 64)
 
 
 def apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
@@ -206,13 +218,15 @@ def make_sampler(
     top_k: int = 0,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
-    xtc_special_tokens: List[int] = [],
+    xtc_special_tokens: Optional[List[int]] = None,
 ) -> Callable[[mx.array], mx.array]:
     """Build a sampler callable matching ``mlx_lm.sample_utils.make_sampler``.
 
     Returns ``argmax`` when ``temp == 0``; otherwise composes optional
     top-p / min-p / xtc / top-k filters and finishes with categorical sampling.
     """
+    if xtc_special_tokens is None:
+        xtc_special_tokens = []
     if temp == 0:
         sampler = lambda x: mx.argmax(x, axis=-1)
     else:
@@ -331,3 +345,30 @@ def make_shared_sampler(
         int(min_tokens_to_keep),
         int(top_k or 0),
     )
+
+
+def select_logprobs(
+    logprobs: mx.array, token_id: int, top_n: int
+) -> tuple[float, list[tuple[int, float]]]:
+    """Return the logprob of ``token_id`` and the ``top_n`` most likely tokens.
+
+    The row is read on the host: an MLX op here would wait behind the decode
+    step BatchGenerator has already queued. The row is in the model dtype, so
+    it is renormalized in float32.
+    """
+    if logprobs.dtype == mx.bfloat16:
+        raw = np.frombuffer(memoryview(logprobs), dtype=np.uint16)
+        values = (raw.astype(np.uint32) << 16).view(np.float32)
+    else:
+        values = np.asarray(memoryview(logprobs)).astype(np.float32)
+    peak = values.max()
+    values = values - (peak + np.log(np.exp(values - peak).sum()))
+    chosen = float(values[token_id])
+    top_n = min(top_n, values.size)
+    if top_n <= 0:
+        return chosen, []
+    top_ids = np.argpartition(-values, top_n - 1)[:top_n]
+    top_ids = top_ids[np.argsort(-values[top_ids], kind="stable")]
+    # Tokens masked by a logits processor are not alternatives.
+    top_ids = top_ids[np.isfinite(values[top_ids])]
+    return chosen, [(int(i), float(values[i])) for i in top_ids]

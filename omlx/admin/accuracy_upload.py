@@ -37,7 +37,9 @@ from .benchmark import (
     _derive_feature_flags,
     _detect_quantization,
     _filter_uploaded_settings,
+    _prefill_helper_details,
     _sanitize_upload_error,
+    _setting_feature_flags,
     _upload_model_name,
     _upload_model_repo,
 )
@@ -94,12 +96,29 @@ def build_upload_context(request: Any, engine_pool: Any) -> dict:
 
     feature_flags: list[dict] = []
     model_settings: dict | None = None
+    lora_adapter = None
     sm = getattr(engine_pool, "_settings_manager", None)
     if sm is not None:
         try:
             ms = sm.get_settings(request.model_id)
-            feature_flags = _derive_feature_flags(ms)
-            model_settings = _filter_uploaded_settings(ms)
+            lora_adapter = getattr(ms, "lora_adapter", None)
+            model_type = (
+                str(getattr(entry, "config_model_type", "") or "")
+                .replace("-", "_")
+                .lower()
+            )
+            helper = _prefill_helper_details(getattr(entry, "engine", None))
+            feature_flags = _derive_feature_flags(ms) + _setting_feature_flags(
+                ms, model_type, helper_a8=bool(helper and helper["a8"])
+            )
+            model_settings = _filter_uploaded_settings(ms, model_type)
+            if helper is not None and model_settings is not None:
+                feature_flags.append(
+                    {"key": "prefill_accelerator", "label": "Prefill Accelerator"}
+                )
+                model_settings["prefill_accelerator"] = {
+                    key: value for key, value in helper.items() if key != "a8"
+                }
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 f"Accuracy upload: failed to read settings for "
@@ -124,6 +143,8 @@ def build_upload_context(request: Any, engine_pool: Any) -> dict:
         "model_settings": model_settings,
         "submission_group": str(uuid.uuid4()),
         "owner_hash_full": owner_hash_full,
+        # Not uploaded: the leaderboard files scores under the base checkpoint.
+        "lora_adapter": lora_adapter,
     }
 
 
@@ -216,6 +237,8 @@ async def upload_intelligence_result(
     """Upload one suite result. Never raises; returns the outcome dict."""
     if result_data.get("total", 0) < _MIN_UPLOAD_QUESTIONS:
         return {"skipped": "min_questions"}
+    if ctx.get("lora_adapter"):
+        return {"skipped": "lora_adapter"}
     try:
         return await _do_upload(ctx, result_data)
     except Exception as e:  # noqa: BLE001
@@ -258,6 +281,7 @@ async def _do_upload(ctx: dict, result_data: dict) -> dict:
         "dataset_total": result_data.get("dataset_total"),
         "time_s": result_data.get("time_s"),
         "thinking_used": bool(result_data.get("thinking_used")),
+        "question_max_tokens": result_data.get("max_tokens"),
         "sampling_profile": ctx["sampling_profile"],
         "batch_size": ctx["batch_size"],
         "category_scores": result_data.get("category_scores"),

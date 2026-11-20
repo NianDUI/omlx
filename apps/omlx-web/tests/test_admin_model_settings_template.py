@@ -112,6 +112,12 @@ def test_reasoning_effort_has_presets_and_custom_input():
 
     assert 'x-for="value in selectedModel?.reasoning_effort_options || []"' in section
     assert ':value="value" x-text="value"' in section
+    # x-model runs before x-for adds the options, so each option binds its own selection.
+    assert ':selected="value === entry.value"' in section
+    assert (
+        ':selected="!selectedModel?.reasoning_effort_options?.includes(entry.value)"'
+        in section
+    )
     assert "!selectedModel?.reasoning_effort_custom && !entry.custom" in section
 
 
@@ -440,19 +446,20 @@ def test_embedding_context_window_is_in_basic_settings():
     assert 'x-model.number="modelSettings.max_context_window"' in row
 
 
-def test_oq_a8_toggle_is_gated_to_qwen35_models():
-    """The kernels only exist for this checkpoint family, so the UI hides them."""
+def test_a8_prefill_toggle_is_gated_to_supported_models():
+    """The kernels only exist for the validated families, so the UI hides them."""
     html = _model_settings_template()
     section = _section(
         html,
-        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- INT8-activation (A8) prefill kernels -->",
         "<!-- Memory Saving -->",
     )
-    assert 'x-if="showsQwenOqA8(selectedModel)"' in section
-    assert "modelSettings.qwen35_oq_a8_enabled" in section
+    assert 'x-if="showsA8Prefill(selectedModel)"' in section
+    assert "modelSettings.a8_prefill_enabled" in section
+    assert "modal.model_settings.qwen_oq_a8_quality_badge" in section
     # The detail controls only appear once the feature is on.
-    assert 'x-show="modelSettings.qwen35_oq_a8_enabled"' in section
-    assert "modelSettings.qwen35_oq_a8_min_tokens" in section
+    assert 'x-show="modelSettings.a8_prefill_enabled"' in section
+    assert "modelSettings.a8_prefill_min_tokens" in section
 
 
 def test_qwen4_wide_decode_is_a_qwen4_acceleration_setting():
@@ -462,7 +469,7 @@ def test_qwen4_wide_decode_is_a_qwen4_acceleration_setting():
     row = _section(
         acceleration,
         "<!-- Qwen4 Extended Fused Decode -->",
-        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- INT8-activation (A8) prefill kernels -->",
     )
     assert 'x-show="modelSettings.qwen4_gdn_decode_wide_proj_supported"' in row
     assert "modelSettings.qwen4_gdn_decode_wide_proj =" in row
@@ -487,7 +494,7 @@ def test_oq_a8_offers_no_kernel_choice():
     html = _model_settings_template()
     section = _section(
         html,
-        "<!-- Qwen 3.5/3.6/3.8 oQ INT8-activation prefill kernels -->",
+        "<!-- INT8-activation (A8) prefill kernels -->",
         "<!-- Memory Saving -->",
     )
     assert "modelSettings.qwen35_oq_a8_variant" not in section
@@ -495,13 +502,13 @@ def test_oq_a8_offers_no_kernel_choice():
 
 def test_oq_a8_settings_are_registered_in_the_dashboard_script():
     js = _dashboard_script()
-    for field in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
+    for field in ("a8_prefill_enabled", "a8_prefill_min_tokens"):
         # Profile-field registry, modal defaults, server load, and save payload.
         assert js.count(field) >= 4, field
-    assert "validateQwenOqA8Settings()" in js
+    assert "validateA8PrefillSettings()" in js
     # The modal has to explain the ANE clash itself rather than let the save
     # come back as a bare 400 with the toggle already flipped.
-    validator = js.split("validateQwenOqA8Settings()", 1)[1].split("},", 1)[0]
+    validator = js.split("validateA8PrefillSettings()", 1)[1].split("},", 1)[0]
     assert "qwen35_ane_prefill_enabled" in validator
     # The tile must not leak into any of those four places, not even as a
     # hidden default the modal never renders.
@@ -558,8 +565,8 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
         missing = set(english) - set(catalog)
         assert not missing, f"{path.name} is missing {sorted(missing)}"
         if path.name == "zh.json":
-            # Simplified Chinese carries its own labels; every other locale
-            # keeps the English fallback until its own translation lands.
+            # Simplified Chinese carries its own labels; untranslated locales
+            # keep the English fallback until their own translation lands.
             assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "开"
             assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "关"
             continue
@@ -567,6 +574,10 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
             # Czech carries its own labels (ZAP/VYP), same exemption as zh.
             assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "ZAP"
             assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "VYP"
+            continue
+        if path.name == "de.json":
+            assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "EIN"
+            assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "AUS"
             continue
         for key, value in english.items():
             assert (
@@ -753,7 +764,6 @@ DASHBOARD_BLOCK_IDS = (
     "active_models",
     "cache_observability",
     "api_endpoints",
-    "claude_code",
     "applications",
     "engine_versions",
 )
@@ -838,7 +848,7 @@ const plain = value => JSON.parse(JSON.stringify(value));
 assert.equal(lib.COLUMNS, 24);
 assert.equal(lib.MIN_W, 6);
 const def = lib.defaultLayout();
-assert.equal(def.blocks.length, 8);
+assert.equal(def.blocks.length, 7);
 assert.ok(def.blocks.every((b, i) => b.x === 0 && b.y === i && b.w === 24));
 assert.deepEqual(plain(lib.normalizeLayout(null)), plain(def));
 assert.deepEqual(plain(lib.normalizeLayout({ blocks: 'nope' })), plain(def));
@@ -911,7 +921,7 @@ const ids = () => plain(app.servingStatTiles.map(tile => tile.id));
 
 app.dashLayout = context.DashboardLayout.defaultLayout();
 assert.deepEqual(ids(), ['requests', 'prefill_tokens', 'cached_tokens', 'cache_efficiency']);
-assert.equal(app.servingStatGridClass, 'sm:grid-cols-2 lg:grid-cols-4');
+assert.equal(app.servingStatGridClass, 'grid-cols-2 lg:grid-cols-4');
 
 app.dashEditing = true;
 app.dashDraft = { width: 'default', ...app._dashServingTileDraft(app.dashLayout.serving_stats_tiles) };
@@ -923,6 +933,7 @@ assert.equal(app.dashTileLocked('generated_tokens'), true);
 app.toggleDashTile('generated_tokens');
 assert.equal(app.dashTileChecked('generated_tokens'), false);
 app.toggleDashTile('cached_tokens');
+assert.equal(app.servingStatGridClass, 'grid-cols-2 lg:grid-cols-3');
 app.toggleDashTile('generated_tokens');
 assert.deepEqual(ids(), ['requests', 'prefill_tokens', 'cache_efficiency', 'generated_tokens']);
 
@@ -946,7 +957,7 @@ assert.deepEqual(ids(), ['requests']);
 assert.equal(app.dashTileLocked('requests'), true);
 app.toggleDashTile('requests');
 assert.deepEqual(ids(), ['requests']);
-assert.equal(app.servingStatGridClass, '');
+assert.equal(app.servingStatGridClass, 'grid-cols-1');
 
 // Values follow the stats scope.
 app.toggleDashTile('generated_tokens');
@@ -982,3 +993,69 @@ assert.equal(app.statsNumberScale, 'exact');
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_model_settings_header_wraps_only_below_sm():
+    header = _section(_model_settings_template(), "<!-- Title bar;", "</h4>")
+    actions = _section(
+        _model_settings_template(), "</h4>", '<i data-lucide="x"'
+    )
+    assert "max-sm:flex-wrap" in header
+    assert "flex-shrink-0 max-sm:flex-shrink" in actions
+    assert "max-sm:justify-end max-sm:ml-auto" in actions
+    assert "max-sm:absolute max-sm:right-2" in actions
+
+
+def test_gpu_power_limit_row_follows_thinking_budget():
+    html = _model_settings_template()
+    after_budget = _section(
+        html, "<!-- Thinking Budget -->", "<!-- Limit Tool Result Tokens -->"
+    )
+    row = after_budget.split("<!-- GPU Power Limit -->", 1)[1]
+    assert 'x-model.number="modelSettings.gpu_power_limit_w"' in row
+    assert 'min="2"' in row
+    # Unsupported GPUs can still turn an existing limit off.
+    assert (
+        ':disabled="!modelSettings.gpu_power_limit_supported'
+        ' && !modelSettings.enableGpuPowerLimit"'
+    ) in row
+
+    js = _dashboard_script()
+    # Profile serialization, preset apply, server load, and save payload.
+    assert js.count("gpu_power_limit_w") >= 4
+    # Off sends 0, which the server stores as no limit.
+    payload = js.split("gpu_power_limit_w: ms.enableGpuPowerLimit", 1)[1]
+    assert payload.split("\n", 3)[2].strip() == ": 0,"
+    # Out-of-range values get the range message instead of a raw 422 list.
+    save = js.split("async saveModelSettings()", 1)[1].split("async ", 1)[0]
+    assert "this.validateGpuPowerLimit()" in save
+
+
+def test_speed_benches_say_the_gpu_power_limit_does_not_apply():
+    root = Path(__file__).resolve().parents[1] / "omlx_web/templates/dashboard"
+    for name in ("_bench.html", "_bench_context.html"):
+        html = (root / name).read_text()
+        assert "bench.config.gpu_power_limit_note" in html, name
+
+
+def test_reranker_context_window_is_in_basic_settings():
+    """Reranker requests use max_context_window as their default max_length,
+    the same knob embeddings already expose."""
+    basic = _section(
+        _model_settings_template(),
+        '<section id="ms-basic"',
+        "<!-- Generation defaults (LLM/VLM only) -->",
+    )
+    row = _section(basic, "<!-- Reranker context window -->", "</label>")
+    assert "x-show=\"selectedModel?.model_type === 'reranker'\"" in row
+    assert 'x-model.number="modelSettings.max_context_window"' in row
+    assert "t('modal.model_settings.reranker_context_window_hint')" in row
+
+
+def test_reranker_context_window_i18n_key_exists_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx_web/i18n"
+    key = "modal.model_settings.reranker_context_window_hint"
+    for path in sorted(i18n_dir.glob("*.json")):
+        catalog = json.loads(path.read_text())
+        assert key in catalog, f"{path.name} is missing {key}"

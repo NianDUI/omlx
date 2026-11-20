@@ -10,20 +10,25 @@ import asyncio
 import copy
 import functools
 import logging
+import threading
 from collections.abc import AsyncIterator
 from typing import Any
 
+from ..adapter.output_parser import repair_tool_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..lora_adapters import apply_adapter
 from ..model_settings import (
+    a8_prefill_on,
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from ..oqh.format import is_oqh_checkpoint
 from ..patches.mlx_lm_mtp import drafter_target
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
-from ..utils.tokenizer import get_tokenizer_config
+from ..utils.tokenizer import get_tokenizer_config, is_mimo_tool_template
 from .base import (
     BaseEngine,
     GenerationOutput,
@@ -103,6 +108,7 @@ class BatchedEngine(BaseEngine):
         self._dflash_drafter: Any | None = None
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
+        self._grammar_compiler_lock = threading.Lock()
 
     async def _preflight_or_raise_with_eviction(
         self,
@@ -132,6 +138,10 @@ class BatchedEngine(BaseEngine):
     def tokenizer(self) -> Any:
         """Get the tokenizer."""
         return self._tokenizer
+
+    @property
+    def supports_logprobs(self) -> bool:
+        return True
 
     @property
     def supports_early_tool_call_streaming(self) -> bool:
@@ -204,49 +214,58 @@ class BatchedEngine(BaseEngine):
         """
         if self._grammar_compiler is not None:
             return self._grammar_compiler
-        if self._grammar_compiler_init_attempted:
-            return None
-        self._grammar_compiler_init_attempted = True
-        try:
-            from ..api.grammar import create_grammar_compiler
+        # Prompt preparation calls this from worker threads. Build it once.
+        with self._grammar_compiler_lock:
+            if self._grammar_compiler is not None:
+                return self._grammar_compiler
+            if self._grammar_compiler_init_attempted:
+                return None
+            self._grammar_compiler_init_attempted = True
+            try:
+                from ..api.grammar import (
+                    GRAMMAR_CACHE_LIMIT_BYTES,
+                    create_grammar_compiler,
+                )
 
-            self._grammar_compiler = create_grammar_compiler(
-                self._tokenizer,
-                self._model,
-                cache_limit_bytes=(
-                    64 * 1024**2 if self.model_type == "k2_horizon" else -1
-                ),
-            )
-            logger.info("GrammarCompiler initialized for %s", self._model_name)
-        except Exception:
-            from ..utils.install import get_install_method
+                self._grammar_compiler = create_grammar_compiler(
+                    self._tokenizer,
+                    self._model,
+                    cache_limit_bytes=(
+                        64 * 1024**2
+                        if self.model_type == "k2_horizon"
+                        else GRAMMAR_CACHE_LIMIT_BYTES
+                    ),
+                )
+                logger.info("GrammarCompiler initialized for %s", self._model_name)
+            except Exception:
+                from ..utils.install import get_install_method
 
-            method = get_install_method()
-            if self.model_type == "k2_horizon":
-                logger.info(
-                    "K2 tool grammar is unavailable; generating unconstrained "
-                    "tool calls with normal API parsing. Install omlx[grammar] "
-                    "to enable tool-name constraints."
-                )
-            elif method == "dmg":
-                logger.warning(
-                    "GrammarCompiler initialization failed for %s on the "
-                    "DMG build. The bundle ships xgrammar against a torch "
-                    "stub; this usually means the bundled xgrammar / tvm-"
-                    "ffi version drifted past what the stub covers.",
-                    self._model_name,
-                )
-            elif method == "homebrew":
-                logger.info(
-                    "Structured output requires xgrammar. "
-                    "Reinstall with: brew reinstall omlx --with-grammar"
-                )
-            else:
-                logger.info(
-                    "Structured output requires xgrammar. "
-                    "Install with: pip install 'omlx[grammar]'"
-                )
-        return self._grammar_compiler
+                method = get_install_method()
+                if self.model_type == "k2_horizon":
+                    logger.info(
+                        "K2 tool grammar is unavailable; generating unconstrained "
+                        "tool calls with normal API parsing. Install omlx[grammar] "
+                        "to enable tool-name constraints."
+                    )
+                elif method == "dmg":
+                    logger.warning(
+                        "GrammarCompiler initialization failed for %s on the "
+                        "DMG build. The bundle ships xgrammar against a torch "
+                        "stub; this usually means the bundled xgrammar / tvm-"
+                        "ffi version drifted past what the stub covers.",
+                        self._model_name,
+                    )
+                elif method == "homebrew":
+                    logger.info(
+                        "Structured output requires xgrammar. "
+                        "Reinstall with: brew reinstall omlx --with-grammar"
+                    )
+                else:
+                    logger.info(
+                        "Structured output requires xgrammar. "
+                        "Install with: pip install 'omlx[grammar]'"
+                    )
+            return self._grammar_compiler
 
     @property
     def prefix_cache_enabled(self) -> bool:
@@ -340,9 +359,14 @@ class BatchedEngine(BaseEngine):
         self._model, self._tokenizer = await loop.run_in_executor(
             get_mlx_executor(), _load_model_sync
         )
+        # The scheduler repairs only its deep copy, and API tool parsing reads
+        # this tokenizer. Repair it here only for MiMo-format templates (#4933).
+        if is_mimo_tool_template(getattr(self._tokenizer, "chat_template", None)):
+            repair_tool_parser(self._tokenizer)
 
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import (
+            apply_activation_fp16,
             apply_post_load_transforms,
             materialize_lazy_state,
         )
@@ -358,12 +382,14 @@ class BatchedEngine(BaseEngine):
         # resident slot tensors (#1304).
         moe_offload_wrapped = 0
         offload_stats = offload_release = offload_restore = None
+        offload_releasable = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
                 moe_offload_caches,
                 moe_offload_stats,
+                releasable_moe_offload_bytes,
                 release_moe_offload_slots,
                 restore_moe_offload_slots,
             )
@@ -403,12 +429,29 @@ class BatchedEngine(BaseEngine):
                 offload_stats = functools.partial(moe_offload_stats, caches=caches)
                 offload_release = functools.partial(release_moe_offload_slots, caches)
                 offload_restore = functools.partial(restore_moe_offload_slots, caches)
+                offload_releasable = functools.partial(
+                    releasable_moe_offload_bytes, caches
+                )
 
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).
         await loop.run_in_executor(
             get_mlx_executor(), materialize_lazy_state, self._model
         )
+        await loop.run_in_executor(
+            get_mlx_executor(),
+            apply_activation_fp16,
+            self._model,
+            self._model_settings,
+        )
+        # After the fp16 recast so the adapter takes the activation dtype, and
+        # before the fusions and packers that replace the projections.
+        lora_path = getattr(self._model_settings, "lora_adapter", None)
+        if lora_path:
+            wrapped = await loop.run_in_executor(
+                get_mlx_executor(), apply_adapter, self._model, lora_path
+            )
+            logger.info("LoRA adapter %s: %d projections", lora_path, wrapped)
 
         # Supported MoE gate+up regroup: concatenate the routed experts'
         # gate and up projections so decode runs 2 gather_qmm launches per
@@ -515,7 +558,11 @@ class BatchedEngine(BaseEngine):
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
-        if getattr(self._model_settings, "qwen35_oq_a8_enabled", False):
+        # A8 and ANE prefill read affine weights; oQh linears have none.
+        oqh = is_oqh_checkpoint(self._model_name)
+        if oqh and a8_prefill_on(self._model_settings):
+            logger.warning("A8 prefill does not read oQh weights; it stays off")
+        elif a8_prefill_on(self._model_settings):
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -525,7 +572,7 @@ class BatchedEngine(BaseEngine):
                 apply_qwen35_oq_a8_patch(
                     self._model,
                     min_tokens=int(
-                        getattr(self._model_settings, "qwen35_oq_a8_min_tokens", 128)
+                        getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                     ),
                 )
             except Exception:
@@ -533,6 +580,9 @@ class BatchedEngine(BaseEngine):
 
         ane_backend = ane_prefill_backend(self.model_type)
         ane_enabled = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+        if ane_enabled and oqh:
+            logger.warning("ANE prefill does not read oQh weights; it stays off")
+            ane_enabled = False
         if ane_enabled:
             validate_ane_prefill(self._model_settings.to_dict(), self.model_type)
             ane_fraction = ane_prefill_fraction(
@@ -734,6 +784,7 @@ class BatchedEngine(BaseEngine):
         scheduler.moe_offload_stats = offload_stats
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore
+        scheduler.moe_offload_releasable = offload_releasable
         if ane_prefill_sequence_length:
             from ..patches.qwen35_ane_prefill import (
                 configure_qwen35_ane_prefill_scheduler,
@@ -807,7 +858,14 @@ class BatchedEngine(BaseEngine):
                         get_mlx_executor(), _load_draft
                     )
                     self._engine.engine.scheduler.set_specprefill_draft_model(
-                        draft_model, draft_model_name=specprefill_draft
+                        draft_model,
+                        draft_model_name=specprefill_draft,
+                        keep_pct=getattr(
+                            self._model_settings, "specprefill_keep_pct", None
+                        ),
+                        threshold=getattr(
+                            self._model_settings, "specprefill_threshold", None
+                        ),
                     )
                     logger.info(
                         f"SpecPrefill: draft model loaded ({specprefill_draft})"
@@ -1066,6 +1124,7 @@ class BatchedEngine(BaseEngine):
             "specprefill_system_end",
             "generation_prompt_text",
             "generation_prompt_persists",
+            "system_prefix_ids",
         ):
             if kwargs.get(key) is not None:
                 specprefill_kwargs[key] = kwargs.pop(key)
@@ -1178,11 +1237,14 @@ class BatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
+            ignore_eos=bool(kwargs.get("ignore_eos", False)),
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
             logits_observer=kwargs.get("logits_observer"),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -1208,6 +1270,7 @@ class BatchedEngine(BaseEngine):
             completion_tokens=output.completion_tokens,
             finish_reason=output.finish_reason,
             tool_calls=output.tool_calls,
+            logprobs=output.logprobs,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
         )
@@ -1264,11 +1327,14 @@ class BatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
+            ignore_eos=bool(kwargs.get("ignore_eos", False)),
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
             logits_observer=kwargs.get("logits_observer"),
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=kwargs.get("top_logprobs"),
         )
 
         # SpecPrefill: pass per-request overrides to engine
@@ -1310,6 +1376,7 @@ class BatchedEngine(BaseEngine):
                     finished=output.finished,
                     finish_reason=output.finish_reason,
                     tool_calls=output.tool_calls,
+                    logprobs=output.logprobs,
                     cached_tokens=output.cached_tokens,
                     generated_at=getattr(output, "generated_at", None),
                     generated_until=getattr(output, "generated_until", None),
@@ -1416,6 +1483,9 @@ class BatchedEngine(BaseEngine):
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
+        system_prefix = self._system_prefix_ids(messages, template_tools, ct_kwargs)
+        if system_prefix:
+            kwargs["system_prefix_ids"] = system_prefix
 
         return await self.generate(
             prompt=prepared[1] if prepared is not None else prompt,
@@ -1580,6 +1650,9 @@ class BatchedEngine(BaseEngine):
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
+        system_prefix = self._system_prefix_ids(messages, template_tools, ct_kwargs)
+        if system_prefix:
+            kwargs["system_prefix_ids"] = system_prefix
 
         async for output in self.stream_generate(
             prompt=prepared[1] if prepared is not None else prompt,
@@ -1595,15 +1668,18 @@ class BatchedEngine(BaseEngine):
         ):
             yield output
 
-    def has_active_requests(self) -> bool:
-        """Check if the engine has active in-flight requests."""
+    def active_request_count(self) -> int:
+        """Number of requests holding a live output collector."""
         engine_core = getattr(self, "_engine", None)
         if engine_core is not None:
             inner = getattr(engine_core, "engine", None)
             if inner is not None:
-                collectors = getattr(inner, "_output_collectors", {})
-                return len(collectors) > 0
-        return False
+                return len(getattr(inner, "_output_collectors", {}))
+        return 0
+
+    def has_active_requests(self) -> bool:
+        """Check if the engine has active in-flight requests."""
+        return self.active_request_count() > 0
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
@@ -1622,6 +1698,25 @@ class BatchedEngine(BaseEngine):
         if self._engine:
             return self._engine.get_cache_stats()
         return None
+
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        """Abort one live request; False when it is unknown or already finished."""
+        core = self._engine.engine if self._engine else None
+        if (
+            core is None
+            or request_id not in core._output_collectors
+            or request_id in core._finished_at
+        ):
+            return False
+        return await core.abort_request(
+            request_id, reason=reason, error_code=error_code
+        )
 
     async def abort_all_requests(
         self,

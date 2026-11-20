@@ -117,7 +117,7 @@ def test_partial_measurements_fall_back_to_original_memory_objective():
     assert all(item.predicted_stage_seconds is None for item in plan.assignments)
 
 
-def test_execution_tuner_reduces_concurrency_and_synchronizes_prompt_cache():
+def test_execution_tuner_reduces_concurrency_and_caps_prompt_cache():
     settings = execution_profile("throughput")
     assignments = [
         SimpleNamespace(headroom_bytes=3 * 1024**3),
@@ -130,14 +130,14 @@ def test_execution_tuner_reduces_concurrency_and_synchronizes_prompt_cache():
     assert tuned.prompt_concurrency == 1
     assert tuned.prefill_step_size == 512
     assert tuned.pipeline_microbatch_size == 1
-    assert tuned.prompt_cache_size == 1
+    assert tuned.prompt_cache_size == 2
     assert tuned.prompt_cache_bytes is None
     assert tuned.ring_connections_per_ip == 1
     assert "critical headroom" in tuned.tuning_reason
-    assert "synchronized single-prefix cache" in tuned.tuning_reason
+    assert "prompt cache byte budget disabled" in tuned.tuning_reason
 
 
-def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():
+def test_prompt_cache_bytes_stay_disabled_when_auto_tuning_is_disabled():
     settings = replace(
         execution_profile("throughput", auto_tune=False),
         prompt_cache_size=16,
@@ -154,9 +154,9 @@ def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():
     )
 
     assert tuned.decode_concurrency == settings.decode_concurrency
-    assert tuned.prompt_cache_size == 1
+    assert tuned.prompt_cache_size == 16
     assert tuned.prompt_cache_bytes is None
-    assert "synchronized single-prefix cache" in tuned.tuning_reason
+    assert "prompt cache byte budget disabled" in tuned.tuning_reason
 
 
 def test_performance_profiles_reject_nonfinite_measurements():
@@ -493,6 +493,68 @@ def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
     assert model.calls == [True]
     assert len(batch._next_logprobs) == 1
     assert batch._next_logprobs[0].shape == (32,)
+
+
+@pytest.mark.parametrize("group", [_Group(), _WorkerGroup()])
+def test_token_all_sum_is_scheduled_after_the_logprob_graph(monkeypatch, group):
+    """#4743: with the token all-sum scheduled first, a CUDA rank deadlocks.
+    The CPU stream finishes the collective, but its event-signal kernel launch
+    blocks while the GPU spins waiting for that signal."""
+
+    class Cache:
+        state = mx.array([0])
+
+    class LogitsModel:
+        def __init__(self):
+            self.model = _ValidatedPipeline()
+            self.model.pipeline_rank = group.rank()
+
+        def __call__(self, value, cache=None):
+            value = self.model(value, cache=cache)
+            return mx.zeros((*value.shape, 32))
+
+    class Batch:
+        def __init__(self, model):
+            self.model = model
+            self.uids = [1]
+            self.prompt_cache = [Cache()]
+            self.tokens = [[]]
+            self.samplers = [None]
+            self.fallback_sampler = lambda value: mx.argmax(value, axis=-1)
+            self.logits_processors = [[]]
+            self.state_machines = []
+            self.max_tokens = [2]
+            self._current_tokens = None
+            self._current_logprobs = []
+            self._next_tokens = mx.array([3], dtype=mx.uint32)
+            self._next_logprobs = []
+            self._token_context = []
+            self._num_tokens = [0]
+            self._matcher_states = []
+
+    scheduled = []
+    batch = Batch(LogitsModel())
+    settings = replace(
+        execution_profile("balanced"),
+        sampling_rank_only=True,
+    )
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
+    monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
+    monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
+    monkeypatch.setattr(mx, "async_eval", lambda *values: scheduled.append(values))
+
+    with install_runtime_optimizations(
+        batch.model,
+        group,
+        settings,
+        batchable=True,
+    ) as capabilities:
+        assert capabilities["sampling_rank_only"]["active"] is True
+        mlx_generate.GenerationBatch._step(batch)
+
+    assert len(scheduled) == 1
+    assert scheduled[0][0] is batch._next_logprobs
+    assert scheduled[0][-1] is batch._next_tokens
 
 
 def test_pipeline_prefill_schedule_has_equal_fill_and_drain_timeline():

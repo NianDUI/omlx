@@ -409,9 +409,9 @@ def _write_engine_commits(omlx_pkg_dir: Path):
 
     repo_urls = {
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
-        "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
+        "mlx-vlm": "https://github.com/Neywa-Labs/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
-        "mlx-audio": "https://github.com/Blaizzy/mlx-audio",
+        "mlx-audio": "https://github.com/Neywa-Labs/mlx-audio",
     }
 
     commits = {}
@@ -628,8 +628,8 @@ def _venvstacks_driver() -> list[str]:
         return ["venvstacks"]
     print(
         "  ✗ No venvstacks driver found. Install with one of:\n"
-        "      pip install -e \".[dev]\"     (pip-managed venv)\n"
-        "      uv sync --dev                (uv-managed venv)\n"
+        "      pip install -e . --group dev (pip-managed venv, pip 25.1+)\n"
+        "      uv sync                      (uv-managed venv)\n"
         "      pipx install venvstacks       (host-global tool)",
         file=sys.stderr,
     )
@@ -736,7 +736,7 @@ def build_venvstacks():
 
 
 # mlx-audio git commit — aligned with pyproject.toml [audio] extra
-_MLX_AUDIO_GIT = "git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78"
+_MLX_AUDIO_GIT = "git+https://github.com/Neywa-Labs/mlx-audio@1157775c1999654b1ebde41ed03d88108e23f88b"
 
 
 def _install_mlx_audio(export_dir: Path):

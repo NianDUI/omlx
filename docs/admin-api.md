@@ -47,17 +47,21 @@ curl -H "Authorization: Bearer $OMLX_API_KEY" http://127.0.0.1:8000/admin/api/st
 
 Inference responses (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`) carry the engine request id in the `X-oMLX-Request-ID` header. Streaming responses send it before prefill starts, so a client can find its request in the `waiting` and `prefilling` rows of `activity` by `request_id` while it waits. A `/v1/completions` request with a list of prompts has no single id and gets no header.
 
+The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The request still reuses any cached prefix, but its own prompt and output are not stored in the hot or SSD cache, so one-shot calls such as summaries do not evict prefixes that other requests reuse. Other values, or no header, keep the default behavior. Anthropic `cache_control` blocks and HTTP `Cache-Control` headers do not change what the engine stores.
+
 ### Models
 
 | Endpoint | Description |
 |---|---|
 | `GET /admin/api/models` | Discovered models with load state, size, and settings |
 | `POST /admin/api/models/{model_id}/load`, `.../unload` | Load or unload a model |
+| `POST /admin/api/models/{model_id}/requests/{request_id}/abort` | Stop one waiting, prefilling, or generating request and keep the model loaded |
 | `POST /admin/api/reload` | Rescan the model directories |
 | `PUT /admin/api/models/{model_id}/settings` | Update per-model settings (sampling, context, aliases, acceleration) |
 | `POST /admin/api/models/{model_id}/settings/reset` | Reset per-model settings |
 | `GET`, `POST /admin/api/models/{model_id}/settings/optimal` | List or apply benchmarked optimal settings |
 | `POST /admin/api/models/{model_id}/settings/recipe` | Apply a shared settings recipe |
+| `GET /admin/api/models/{model_id}/lora-adapters` | List LoRA adapters in the model folders, each with why it does not fit this model |
 | `GET`, `POST /admin/api/models/{model_id}/profiles`, `PUT`, `DELETE .../profiles/{name}`, `POST .../profiles/{name}/apply` | Per-model profiles |
 | `GET`, `POST /admin/api/profile-templates`, `PUT`, `DELETE .../{name}` | Global profile templates |
 
@@ -67,12 +71,13 @@ Inference responses (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`, 
 
 | Endpoint | Description |
 |---|---|
-| `GET /admin/api/hf/search?q=`, `GET /admin/api/hf/model-info?repo_id=` | Search Hugging Face and read a model card |
+| `GET /admin/api/hf/search?q=&model_format=`, `GET /admin/api/hf/recommended?model_format=` | Search Hugging Face, or list trending and popular repos; `model_format` is `mlx` (default), `gguf` or `all` |
+| `GET /admin/api/hf/model-info?repo_id=` | A model card, with per-file download hints: `required`, `preselected`, `group` (split GGUF), `mmproj` (paired projector) and `local` |
 | `GET /admin/api/hf/recommendations` | oQ builds that fit this Mac's memory guard and Metal limit, grouped as best match, bigger, more bits, faster, and builds that need a higher limit |
-| `POST /admin/api/hf/download` | Start a download, `{"repo_id": "mlx-community/..."}` |
+| `POST /admin/api/hf/download` | Start a download, `{"repo_id": "mlx-community/..."}`; `"files": [...]` fetches only those repo paths. One download runs per repo |
 | `GET /admin/api/hf/tasks` | Download progress |
 | `POST /admin/api/hf/cancel/{task_id}`, `POST .../retry/{task_id}`, `DELETE .../task/{task_id}` | Cancel, retry, or remove a task |
-| `GET /admin/api/hf/models`, `DELETE /admin/api/hf/models/{model_name}` | List or delete downloaded models |
+| `GET /admin/api/hf/models`, `DELETE /admin/api/hf/models/{model_name}` | List or delete downloaded models; a GGUF lists and deletes per file |
 | `/admin/api/ms/...` | The same for ModelScope |
 | `/admin/api/upload/...` | Upload oQ models to Hugging Face |
 
@@ -94,7 +99,7 @@ Inference responses (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`, 
 | `/admin/api/bench/accuracy/...` | Accuracy benchmark queue |
 | `/admin/api/bench/ane-tune/...` | ANE prefill tuning |
 
-Cluster endpoints are described in [distributed-cluster.md](experimental/distributed-cluster.md).
+Cluster endpoints are described in [distributed-cluster.md](experimental/distributed-cluster.md), and the Prefill Accelerator endpoints in [prefill-accelerator.md](experimental/prefill-accelerator.md).
 
 ## Long-running tasks
 

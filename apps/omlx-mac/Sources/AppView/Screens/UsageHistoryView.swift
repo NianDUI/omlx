@@ -57,7 +57,7 @@ struct UsageHistoryView: View {
             }
             .padding(.horizontal, 18)
             if let error {
-                Text(error).font(.omlxText(12)).foregroundStyle(.secondary)
+                Text(error).font(.omlxText(DesignTokens.FontSize.callout)).foregroundStyle(.secondary)
                     .padding(.horizontal, 18)
             }
             if disabled {
@@ -65,7 +65,7 @@ struct UsageHistoryView: View {
                     Text(String(localized: "status.usage.disabled",
                                 defaultValue: "Usage history is off. Turn it on in Server settings.",
                                 comment: "Shown on the Status screen when usage history recording is switched off"))
-                        .font(.omlxText(12)).foregroundStyle(.secondary)
+                        .font(.omlxText(DesignTokens.FontSize.callout)).foregroundStyle(.secondary)
                     Button(String(localized: "status.usage.open_settings",
                                   defaultValue: "Open Server Settings",
                                   comment: "Button that jumps from the Status screen to the usage history switch on the Server screen")) {
@@ -81,7 +81,7 @@ struct UsageHistoryView: View {
                     Text(String(localized: "status.usage.empty",
                                 defaultValue: "No recorded usage in this range. History begins after upgrading.",
                                 comment: "Shown when the selected usage history range has no recorded requests"))
-                        .font(.omlxText(12)).foregroundStyle(.secondary)
+                        .font(.omlxText(DesignTokens.FontSize.callout)).foregroundStyle(.secondary)
                         .padding(.horizontal, 18)
                 }
                 ListGroup {
@@ -89,13 +89,13 @@ struct UsageHistoryView: View {
                         Row(label: row.modelId ?? "", sublabel: detail(row)) {
                             VStack(alignment: .trailing, spacing: 3) {
                                 Text(String(localized: "status.usage.row.tokens",
-                                            defaultValue: "\(CountFormat.compact(row.totalTokens)) tokens",
+                                            defaultValue: "\(CountFormat.count(row.totalTokens)) tokens",
                                             comment: "Per-model total token count; placeholder is a compact number"))
                                 Text(String(localized: "status.usage.row.requests_speed",
                                             defaultValue: "\(row.requests) requests · \(speed(row.generationTps)) tok/s",
                                             comment: "Per-model request count and output speed; placeholders are a count and a formatted tokens-per-second value"))
                                     .foregroundStyle(.secondary)
-                            }.font(.omlxMono(11))
+                            }.font(.omlxMono(DesignTokens.FontSize.subheadline))
                         }
                     }
                 }
@@ -165,8 +165,9 @@ struct UsageHistoryView: View {
 
     private func tile(_ label: String, _ value: Int) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(label).font(.omlxText(11)).foregroundStyle(.secondary)
-            Text(CountFormat.compact(value)).font(.omlxMono(20))
+            Text(label).font(.omlxText(DesignTokens.FontSize.subheadline)).foregroundStyle(.secondary)
+            Text(CountFormat.count(value)).font(.omlxMono(20))
+                .lineLimit(1).minimumScaleFactor(0.6)
         }
         .frame(maxWidth: .infinity, alignment: .leading).padding(12)
         .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
@@ -178,11 +179,11 @@ struct UsageHistoryView: View {
             Text(String(localized: "status.usage.heatmap.title",
                         defaultValue: "Token Usage by Day and Hour",
                         comment: "Heading above the usage history day/hour heatmap"))
-                .font(.omlxText(13))
+                .font(.omlxText(DesignTokens.FontSize.body))
             Text(String(localized: "status.usage.heatmap.note",
                         defaultValue: "00–23 hours · darker green means more tokens · repeated DST hours combine",
                         comment: "Legend text under the usage heatmap heading"))
-                .font(.omlxText(11)).foregroundStyle(.secondary)
+                .font(.omlxText(DesignTokens.FontSize.subheadline)).foregroundStyle(.secondary)
             HStack(spacing: 3) {
                 Text("").frame(width: 78)
                 ForEach(0..<24) { hour in
@@ -194,7 +195,7 @@ struct UsageHistoryView: View {
                 LazyVStack(spacing: 3) {
                     ForEach(days.reversed()) { day in
                         HStack(spacing: 3) {
-                            Text(day.date).font(.omlxMono(10)).frame(width: 78, alignment: .leading)
+                            Text(day.date).font(.omlxMono(DesignTokens.FontSize.caption)).frame(width: 78, alignment: .leading)
                             ForEach(0..<24) { hour in
                                 // The server always emits 24 cells; guard anyway so a
                                 // short array can never index out of range.
@@ -225,7 +226,7 @@ struct UsageHistoryView: View {
 
     private func detail(_ row: UsageHistoryDTO.UsageTotalsDTO) -> String {
         String(localized: "status.usage.row.detail",
-               defaultValue: "Prompt \(CountFormat.compact(row.promptTokens)) · output \(CountFormat.compact(row.completionTokens)) · cached \(CountFormat.compact(row.cachedTokens))",
+               defaultValue: "Prompt \(CountFormat.count(row.promptTokens)) · output \(CountFormat.count(row.completionTokens)) · cached \(CountFormat.count(row.cachedTokens))",
                comment: "Per-model breakdown sublabel; placeholders are compact prompt, output, and cached token counts")
     }
 }

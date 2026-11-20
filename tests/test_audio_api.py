@@ -43,6 +43,8 @@ def _make_engine_entry(
 def _make_pool(entries: list) -> MagicMock:
     """Build a mock EnginePool with the given entries."""
     pool = MagicMock()
+    # A mock cache dir makes lifespan create MagicMock/ dirs in CWD.
+    pool._scheduler_config.paged_ssd_cache_dir = None
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
     pool.shutdown = AsyncMock()
@@ -109,6 +111,7 @@ class TestModelsListAudio:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
@@ -131,6 +134,7 @@ class TestModelsListAudio:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None

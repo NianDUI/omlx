@@ -15,11 +15,13 @@ from collections.abc import Callable
 from typing import Any
 
 _ALLOWED_DOWNLOAD_KWARGS = {
+    "allow_patterns",
     "endpoint",
     "etag_timeout",
     "ignore_patterns",
     "local_dir",
     "repo_id",
+    "revision",
     "token",
 }
 

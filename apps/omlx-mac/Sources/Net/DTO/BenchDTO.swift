@@ -49,7 +49,7 @@ enum BenchmarkWarmupMode: String, Codable, CaseIterable, Sendable {
 /// `batch_sizes` are server-validated against a known whitelist
 /// (1024…200000 / 2…8). `generation_length` is free-form int.
 ///
-/// The server always publishes results to the public omlx.ai
+/// The server publishes eligible results to the public omlx.ai
 /// leaderboard after the bench completes (matching the browser admin
 /// panel). Submission is anonymous — the payload carries an
 /// owner_hash derived from hardware fingerprint, not user identity.
@@ -61,6 +61,14 @@ struct BenchStartRequest: Encodable, Sendable {
     let promptLengths: [Int]
     let generationLength: Int
     let batchSizes: [Int]
+    let forceLmEngine: Bool
+    let external: BenchExternalEndpoint?
+}
+
+struct BenchExternalEndpoint: Encodable, Sendable {
+    let baseUrl: String
+    let apiKey: String
+    let model: String
 }
 
 struct BenchStartResponse: Codable, Sendable {
@@ -337,8 +345,11 @@ struct AccuracyQueueItem: Codable, Equatable, Sendable {
 /// run is in flight.
 struct AccuracyQueueStatus: Codable, Sendable {
     let running: Bool
-    let currentModel: String
-    let currentBenchId: String
+    /// Null when no run is in flight (idle, or right after a cancel).
+    /// Non-optional here made every idle poll fail to decode, so the VM
+    /// kept its last "running" snapshot forever after Cancel.
+    let currentModel: String?
+    let currentBenchId: String?
     let lastProgress: AccuracyProgressDTO?
     let phase: String?
     let queue: [AccuracyQueueItem]
@@ -407,8 +418,9 @@ struct AccuracyResultDTO: Codable, Equatable, Sendable, Identifiable {
 struct AccuracyResultsResponse: Codable, Sendable {
     let results: [AccuracyResultDTO]
     let running: Bool
-    let currentModel: String
-    let currentBenchId: String
+    /// Null when no run is in flight — see AccuracyQueueStatus.
+    let currentModel: String?
+    let currentBenchId: String?
 }
 
 // =============================================================================

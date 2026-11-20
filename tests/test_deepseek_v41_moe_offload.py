@@ -3,12 +3,14 @@
 import json
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
 import pytest
 from test_deepseek_v41 import write_checkpoint
 
+from omlx.engine.vlm import wire_moe_offload_slot_hooks
 from omlx.patches.deepseek_v41.convert import convert
 from omlx.patches.deepseek_v41.loading import load
 from omlx.patches.deepseek_v41.moe_offload import OffloadedExpert
@@ -464,41 +466,182 @@ def _synthetic_affine_experts(tmp_path, fraction, seed=412):
     return reference, OffloadedExpert(Expert(config, True), plan, prefix), plan
 
 
-def _lru_reference(sequence, capacity):
-    """The serial residency policy: hits protect, misses evict the LRU expert."""
-    slot_of, free = {}, list(range(capacity))
-    for ids in sequence:
+def test_release_slots_keeps_hot_banks_and_routes(tmp_path):
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
+    slots = disk.slots
+    try:
+        slots.ensure_ids([0, 1, 2, 3, 4, 5])
+        idx = mx.array([3, 2, 0, 5]).reshape(1, 2, 2)
+        x = mx.random.normal((1, 2, 1, 1, 64)).astype(mx.bfloat16)
+        weights = mx.full(idx.shape, 0.5, dtype=mx.bfloat16)
+        before = np.array(disk(x, idx, weights).view(mx.uint16))
+        # Whole-reference heat, as the eviction policy ranks it. Experts 1 and 4
+        # are the cold tail; 1 and 3 tie, so the more recently used 3 stays.
+        slots._uses = {
+            0: (4.0, 0),
+            1: (1.0, 0),
+            2: (2.0, 0),
+            3: (1.0, 0),
+            4: (0.5, 0),
+            5: (5.0, 0),
+        }
+        assert slots.release_slots(4) == plan.expert_bytes * 2
+        assert slots.capacity == 4 and plan.capacity == 6
+        # Compacted least to most recently used: the probe call above touched
+        # 3, 2, 0, 5 in that order, so _victim keeps its tie-break order.
+        assert list(slots.slot_of) == [3, 2, 0, 5]
+        # The contract that order exists for: the cold tail goes first, and a
+        # tie goes to the least recently used expert.
+        assert slots._victim(set()) == 3
+        assert slots.free == []
+        misses = slots.misses
+        np.testing.assert_array_equal(disk(x, idx, weights).view(mx.uint16), before)
+        assert slots.misses == misses
+    finally:
+        plan.close()
+
+
+def test_restore_slots_grows_back_and_refills_on_misses(tmp_path):
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
+    slots = disk.slots
+    try:
+        slots.ensure_ids([0, 1, 2, 3, 4, 5])
+        assert slots.release_slots(3) == plan.expert_bytes * 3
+        assert slots.capacity == 3 and slots.free == []
+        assert set(slots.slot_of) == {3, 4, 5}
+        assert slots.restore_slots() == plan.expert_bytes * 3
+        assert slots.capacity == plan.capacity == 6
+        assert slots.free == [3, 4, 5]
+        assert slots.restore_slots() == 0
+        assert slots.release_slots(6) == 0
+
+        idx = mx.array([0, 1, 2, 3, 4, 5]).reshape(1, 2, 3)
+        x = mx.random.normal((1, 2, 1, 1, 64)).astype(mx.bfloat16)
+        weights = mx.full(idx.shape, 0.5, dtype=mx.bfloat16)
+        np.testing.assert_array_equal(
+            disk(x, idx, weights).view(mx.uint16),
+            reference(x, idx, weights).view(mx.uint16),
+        )
+        assert set(slots.slot_of) == {0, 1, 2, 3, 4, 5}
+    finally:
+        plan.close()
+
+
+def test_resize_failure_before_publish_leaves_the_bank_unchanged(
+    tmp_path, monkeypatch
+):
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
+    slots = disk.slots
+    try:
+        slots.ensure_ids([0, 1])
+        bank = slots.expert.w1.weight
+        other = slots.expert.w3.weight
+        before = list(slots.slot_of.items())
+        before_free = list(slots.free)
+        before_views = slots._views
+
+        def fail(*_args, **_kwargs):
+            raise RuntimeError("replacement allocation failed")
+
+        # Every replacement array is materialized by this one eval before any
+        # of them is published, so a failed allocation is the only failure
+        # point: the setattr loop after it cannot fail.
+        with monkeypatch.context() as patch:
+            patch.setattr(mx, "eval", fail)
+            with pytest.raises(RuntimeError, match="allocation failed"):
+                slots.release_slots(4)
+        assert slots.capacity == 6 and slots.expert.w1.weight is bank
+        assert slots.expert.w3.weight is other
+        assert list(slots.slot_of.items()) == before
+        assert slots.free == before_free
+        assert slots._views is before_views
+    finally:
+        plan.close()
+
+
+def test_slot_hooks_wire_the_banks_into_the_scheduler(tmp_path):
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.75)
+    slots = disk.slots
+    try:
+        slots.ensure_ids([0, 1, 2, 3])
+        scheduler = SimpleNamespace()
+        model = SimpleNamespace(_moe_offload_slots=[slots])
+        assert wire_moe_offload_slot_hooks(scheduler, model)
+        assert scheduler.moe_offload_releasable() == plan.expert_bytes * (
+            slots.capacity - slots.floor
+        )
+        reclaimed = []
+        assert (
+            scheduler.moe_offload_release(
+                plan.expert_bytes, lambda: reclaimed.append(True)
+            )
+            == plan.expert_bytes
+        )
+        assert slots.capacity == 5 and reclaimed == [True]
+        scheduler.moe_offload_restore(lambda: reclaimed.append(True))
+        assert slots.capacity == 6 and reclaimed == [True, True]
+        # A model without banks keeps whatever hooks it already had.
+        plain = SimpleNamespace()
+        assert not wire_moe_offload_slot_hooks(plain, SimpleNamespace())
+        assert not hasattr(plain, "moe_offload_release")
+    finally:
+        plan.close()
+
+
+def _eviction_reference(sequence, capacity, half_life):
+    """The serial residency policy: hits protect, a miss evicts the unprotected
+    resident expert with the lowest decayed use count (ties: least recent)."""
+    slot_of, free, uses, misses = {}, list(range(capacity)), {}, 0
+    for clock, ids in enumerate(sequence, start=1):
         needed = list(dict.fromkeys(ids))
+        for e in needed:
+            count, then = uses.get(e, (0.0, clock))
+            uses[e] = (count * 0.5 ** ((clock - then) / half_life) + 1.0, clock)
         for e in needed:
             if e in slot_of:
                 slot_of[e] = slot_of.pop(e)
         protected = set(needed)
         for e in needed:
             if e not in slot_of:
-                slot = (
-                    free.pop()
-                    if free
-                    else slot_of.pop(next(k for k in slot_of if k not in protected))
-                )
+                if free:
+                    slot = free.pop()
+                else:
+                    candidates = [k for k in slot_of if k not in protected]
+                    decayed = [
+                        uses[k][0] * 0.5 ** ((clock - uses[k][1]) / half_life)
+                        for k in candidates
+                    ]
+                    victim = candidates[decayed.index(min(decayed))]
+                    slot = slot_of.pop(victim)
                 slot_of[e] = slot
-    return list(slot_of.items())
+                misses += 1
+    return list(slot_of.items()), misses
 
 
 @pytest.mark.parametrize("inflight", [1, 1 << 30])
-def test_parallel_reads_install_in_serial_lru_order(tmp_path, monkeypatch, inflight):
+@pytest.mark.parametrize("in_place", [True, False])
+@pytest.mark.parametrize("half_life", [32, 1])
+def test_parallel_reads_install_in_serial_eviction_order(
+    tmp_path, monkeypatch, inflight, in_place, half_life
+):
     from omlx.patches.deepseek_v41 import moe_offload
 
     monkeypatch.setattr(moe_offload, "INFLIGHT_BYTES", inflight)
+    monkeypatch.setattr(moe_offload, "EVICTION_HALF_LIFE", half_life)
     _, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
     try:
         assert plan.capacity == 3
+        assert disk.slots._views is not None  # affine slabs are slot bytes
+        if not in_place:
+            disk.slots._views = None
         sequence = [[0, 1, 2], [3, 1], [4, 5, 5], [1, 4], [6, 7, 0], [2]]
         for ids in sequence:
             slots = disk.slots.ensure_ids(ids)
             assert slots == [disk.slots.slot_of[e] for e in ids]
-        assert list(disk.slots.slot_of.items()) == _lru_reference(sequence, 3)
+        expected, expected_misses = _eviction_reference(sequence, 3, half_life)
+        assert list(disk.slots.slot_of.items()) == expected
         misses = sum(len(dict.fromkeys(ids)) for ids in sequence) - disk.slots.hits
-        assert disk.slots.misses == misses == 11
+        assert disk.slots.misses == misses == expected_misses
         assert disk.slots.fetched_bytes == misses * plan.expert_bytes
         assert plan.expert_bytes * plan.count == plan.full_bytes
     finally:
@@ -508,11 +651,90 @@ def test_parallel_reads_install_in_serial_lru_order(tmp_path, monkeypatch, infli
         disk(mx.zeros((1, 1, 64), mx.bfloat16), mx.array([0]), sorted_indices=True)
 
 
+def test_in_place_reads_fall_back_when_slot_arrays_are_replaced(tmp_path):
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    try:
+        assert disk.slots._views is not None
+        lin = disk.slots.expert.w1
+        lin["weight"] = mx.array(lin["weight"])  # same values, a new array object
+        disk.slots.ensure_ids([0, 1])
+        assert disk.slots._views is None  # the copying path took over
+        x = mx.random.normal((1, 1, 1, 1, 64)).astype(mx.bfloat16)
+        idx = mx.array([[[0, 1]]])
+        w = mx.ones(idx.shape) / 2
+        want, got = reference(x, idx, w), disk(x, idx, w)
+        mx.eval(want, got)
+        np.testing.assert_allclose(
+            got.astype(mx.float32), want.astype(mx.float32), rtol=0.01, atol=0.002
+        )
+    finally:
+        plan.close()
+
+
+@pytest.mark.parametrize("field", ["weight", "scales"])
+def test_in_place_reads_detect_a_moved_buffer_under_the_same_array(tmp_path, field):
+    """``array[i] = v`` keeps the Python object but can move its buffer."""
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    try:
+        disk.slots.ensure_ids([0, 1, 2])
+        lin = disk.slots.expert.w3
+        owner = lin[field]
+        owner[0] = owner[0]  # same values, same object, possibly a new buffer
+        mx.eval(owner)
+        assert lin[field] is owner
+        disk.slots.ensure_ids([3, 4])  # misses: the in-place path re-checks first
+        x = mx.random.normal((1, 1, 1, 1, 64)).astype(mx.bfloat16)
+        for idx in ([[[3, 4]]], [[[0, 2]]]):
+            idx = mx.array(idx)
+            w = mx.ones(idx.shape) / 2
+            want, got = reference(x, idx, w), disk(x, idx, w)
+            mx.eval(want, got)
+            np.testing.assert_allclose(
+                got.astype(mx.float32), want.astype(mx.float32), rtol=0.01, atol=0.002
+            )
+    finally:
+        plan.close()
+
+
+def test_in_place_slot_bytes_match_the_checkpoint(tmp_path):
+    """Every installed slot holds exactly the expert's stored bytes, over many
+    evictions, and matches what the copying path installs."""
+    import random
+
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    (tmp_path / "copy").mkdir()
+    _, copy, copy_plan = _synthetic_affine_experts(tmp_path / "copy", 0.375)
+    copy.slots._views = None
+    rng = random.Random(7)
+    try:
+        checked = 0
+        for _ in range(60):
+            ids = rng.sample(range(plan.count), rng.randint(1, plan.capacity))
+            disk.slots.ensure_ids(ids)
+            copy.slots.ensure_ids(ids)
+            for e in ids:
+                for proj in ("w1", "w3", "w2"):
+                    for slab in plan.slabs(disk.slots.prefix, proj, e):
+                        field = slab.key.rsplit(".", 1)[1]
+                        stored = bytes(plan.read(slab))
+                        got = getattr(disk.slots.expert, proj)[field][disk.slots.slot_of[e]]
+                        ref = getattr(copy.slots.expert, proj)[field][copy.slots.slot_of[e]]
+                        assert np.array(got.view(mx.uint8)).tobytes() == stored
+                        assert np.array(ref.view(mx.uint8)).tobytes() == stored
+                        checked += 1
+        assert checked > 200
+        assert disk.slots._views is not None  # stayed on the in-place path
+    finally:
+        plan.close()
+        copy_plan.close()
+
+
 def test_failed_read_leaves_the_cache_intact(tmp_path, monkeypatch):
     from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan
 
     _, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
     original = ExpertOffloadPlan.read
+    original_into = ExpertOffloadPlan.read_into
     broken = {"expert": None}
 
     def read(slab):
@@ -520,7 +742,13 @@ def test_failed_read_leaves_the_cache_intact(tmp_path, monkeypatch):
             raise OSError("simulated EIO")
         return original(slab)
 
+    def read_into(slab, dst):
+        if slab.expert == broken["expert"] and slab.key.endswith("w3.scales"):
+            raise OSError("simulated EIO")
+        return original_into(slab, dst)
+
     monkeypatch.setattr(ExpertOffloadPlan, "read", staticmethod(read))
+    monkeypatch.setattr(ExpertOffloadPlan, "read_into", staticmethod(read_into))
     try:
         assert disk.slots.ensure_ids([0, 1, 2]) == [2, 1, 0]
         broken["expert"] = 4
@@ -573,11 +801,45 @@ def test_sorted_routes_chunk_on_expert_boundaries(tmp_path, monkeypatch):
         # chunk, never a chunk cut inside an expert's run.
         assert calls == [4, 3, 5, 3]
         assert disk.slots.misses == 8 and disk.slots.hits == 0
-        # A second sweep evicts the last resident pair before reaching it:
-        # sorted routes over more experts than slots thrash by construction.
-        disk(x, idx, weights, sorted_indices=True)
-        assert disk.slots.misses == 16 and disk.slots.hits == 0
+        # Read-ahead must not outlive the call that started it.
+        assert disk.slots._ahead == {}
+        # A second sweep runs the resident pair (6, 7) first, before any miss
+        # evicts it: six reads instead of eight, same outputs.
+        calls.clear()
+        again = disk(x, idx, weights, sorted_indices=True)
+        mx.eval(again)
+        assert calls == [3, 4, 3, 5]
+        assert disk.slots.misses == 14 and disk.slots.hits == 2
+        assert disk.slots._ahead == {}
+        np.testing.assert_allclose(
+            again.astype(mx.float32),
+            expected.astype(mx.float32),
+            rtol=0.01,
+            atol=0.002,
+        )
     finally:
+        plan.close()
+
+
+def test_read_ahead_folds_into_the_inflight_window(tmp_path, monkeypatch):
+    """Carried reads count against the same bound ``ensure_ids`` enforces."""
+    from omlx.patches.deepseek_v41 import moe_offload
+
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.25)
+    window = 2
+    monkeypatch.setattr(moe_offload, "INFLIGHT_BYTES", window * plan.expert_bytes)
+    try:
+        assert disk.slots.read_ahead([0, 1, 2, 3, 4, 5, 6, 7]) == window
+        assert len(disk.slots._ahead) == window
+        # The read-ahead itself installs nothing.
+        assert disk.slots.misses == 0 and disk.slots.hits == 0
+        # The chunk that needs them consumes the carried reads instead of
+        # starting a second set.
+        assert len(disk.slots.ensure_ids([0, 1])) == 2
+        assert disk.slots.misses == 2
+        assert disk.slots._ahead == {}
+    finally:
+        disk.slots.release_read_ahead()
         plan.close()
 
 
@@ -643,6 +905,8 @@ def test_consumed_read_buffers_are_released_within_window(
     from omlx.patches.deepseek_v41 import moe_offload
 
     _, disk, plan = _synthetic_affine_experts(tmp_path, 1.0)
+    # The window bounds the copying path's host buffers; in-place reads have none.
+    disk.slots._views = None
     budget = window_experts * plan.expert_bytes
     monkeypatch.setattr(moe_offload, "INFLIGHT_BYTES", budget)
     refs, samples = [], []
@@ -879,3 +1143,33 @@ def test_admin_validate_offload_mtp_family_gate(tmp_path, monkeypatch):
             settings,
         )
     assert error.value.status_code == 400
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_resident_first_groups_restore_the_sorted_route_order(tmp_path, seed):
+    """Non-contiguous groups (resident experts first) give every route its own output."""
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.25)
+    rng = np.random.default_rng(seed)
+    try:
+        for k in range(4):
+            ids = sorted(rng.integers(0, 8, size=24).tolist())
+            idx = mx.array(ids)
+            mx.random.seed(seed * 10 + k)
+            x = mx.random.normal((len(ids), 1, 64)).astype(mx.bfloat16)
+            weights = mx.array(rng.uniform(0.1, 1.0, size=len(ids)).astype(np.float32))
+            before = set(disk.slots.slot_of)
+            misses = disk.slots.misses
+            actual = disk(x, idx, weights, sorted_indices=True)
+            expected = reference(x, idx, weights, sorted_indices=True)
+            mx.eval(actual, expected)
+            np.testing.assert_allclose(
+                actual.astype(mx.float32),
+                expected.astype(mx.float32),
+                rtol=0.01,
+                atol=0.002,
+            )
+            # Experts resident before the call are never read again by it.
+            assert disk.slots.misses - misses == len(set(ids) - before)
+            assert disk.slots._ahead == {}
+    finally:
+        plan.close()

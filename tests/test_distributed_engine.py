@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from omlx.api.thinking import ThinkingParser, extract_thinking
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
@@ -17,6 +18,7 @@ from omlx.engine.distributed import (
     DistributedBatchedEngine,
     DistributedInferenceError,
 )
+from omlx.exceptions import InvalidRequestError
 
 
 def _deployment() -> ClusterDeployment:
@@ -42,8 +44,8 @@ class _Tokenizer:
         return list(text.encode())
 
 
-def _ready_engine(handler) -> DistributedBatchedEngine:
-    engine = DistributedBatchedEngine(_deployment())
+def _ready_engine(handler, **engine_kwargs) -> DistributedBatchedEngine:
+    engine = DistributedBatchedEngine(_deployment(), **engine_kwargs)
     engine._loaded = True
     engine._tokenizer = _Tokenizer()
     engine._client = httpx.AsyncClient(
@@ -437,6 +439,57 @@ def test_qwen35_ane_prefill_rejected_by_distributed_engine():
 
     with pytest.raises(ValueError, match="qwen35_ane_prefill_enabled"):
         engine._validate_model_settings()
+
+
+def test_model_lightning_mtp_runs_only_when_the_plan_holds_the_head():
+    planned = replace(
+        _deployment(), execution=replace(execution_profile("balanced"), mtp=True)
+    )
+    settings = SimpleNamespace(
+        mtp_enabled=True, mtp_fixed_depth=None, mtp_adaptive_max_depth=4
+    )
+
+    engine = DistributedBatchedEngine(planned, model_settings=settings)
+    engine._validate_model_settings()
+    execution = engine._supervisor.deployment.execution
+    assert (execution.mtp, execution.mtp_depth, execution.mtp_fixed_depth) == (
+        True,
+        4,
+        False,
+    )
+    # Turned off in the model settings, the planned head stays unused.
+    off = DistributedBatchedEngine(
+        planned, model_settings=SimpleNamespace(mtp_enabled=False)
+    )
+    assert not off._supervisor.deployment.execution.mtp
+    # A plan without room for the head cannot run it.
+    unplanned = DistributedBatchedEngine(_deployment(), model_settings=settings)
+    assert not unplanned._supervisor.deployment.execution.mtp
+
+
+def test_model_prefill_settings_reach_v41_tensor_parallel_ranks():
+    def execution(deployment, model_type, settings=None):
+        engine = DistributedBatchedEngine(
+            deployment, model_settings=settings, config_model_type=model_type
+        )
+        found = engine._supervisor.deployment.execution
+        return found.ced_prefill, found.a8_prefill
+
+    tensor = replace(_deployment(), tensor_parallel_size=2)
+    # Unset, CED is on and A8 off, as on a single Mac.
+    assert execution(tensor, "deepseek_v41") == (True, False)
+    saved = SimpleNamespace(a8_prefill_enabled=True)
+    assert execution(tensor, "deepseek_v41", saved) == (True, True)
+    # Model settings leave the A8 threshold unchecked while A8 is off.
+    off = SimpleNamespace(
+        deepseek_v41_ced_prefill_enabled=False,
+        a8_prefill_enabled=False,
+        a8_prefill_min_tokens=0,
+    )
+    assert execution(tensor, "deepseek_v41", off) == (False, False)
+    # Other models and pipeline stages do not read them.
+    assert execution(tensor, "qwen3_5_moe") == (False, False)
+    assert execution(_deployment(), "deepseek_v41") == (False, False)
 
 
 @pytest.mark.asyncio
@@ -1302,6 +1355,28 @@ async def test_preflight_fails_open_when_the_probe_itself_breaks(monkeypatch):
         await engine._client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_preflight_refuses_media_for_a_vision_checkpoint(monkeypatch):
+    engine = _ready_engine(lambda request: httpx.Response(200), vision_checkpoint=True)
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+    monkeypatch.setattr(
+        distributed,
+        "check_peers",
+        lambda hosts, **kwargs: (SimpleNamespace(healthy=True),),
+    )
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+    try:
+        # The parts must reach the engine, or the API layer drops them silently.
+        assert engine.accepts_image_input is True
+        with pytest.raises(InvalidRequestError, match="text model only"):
+            await engine.preflight_chat(
+                [{"role": "user", "content": [{"type": "text", "text": "hi"}, image]}]
+            )
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+    finally:
+        await engine._client.aclose()
+
+
 def test_failed_runtime_quiescence_evidence(tmp_path, monkeypatch):
     """A failed runtime or dead rank process must report 0 active requests."""
     engine = _ready_engine(lambda request: httpx.Response(200))
@@ -1394,3 +1469,64 @@ async def test_local_stop_passes_scope_to_supervisor(monkeypatch):
     assert calls == [{"local_only": True}]
     assert engine._client is None
     assert not engine._loaded
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_recovers_reasoning_only_reply_as_content():
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning": "Paris is the answer.",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+            },
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.chat([{"role": "user", "content": "Capital?"}])
+    finally:
+        await engine._client.aclose()
+
+    assert extract_thinking(output.text) == ("", "Paris is the answer.")
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_recovers_reasoning_only_reply_as_content():
+    events = [
+        {"choices": [{"delta": {"reasoning": "Paris "}, "finish_reason": None}]},
+        {"choices": [{"delta": {"reasoning": "is it."}, "finish_reason": "stop"}]},
+        {"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 2}},
+    ]
+    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    content += "data: [DONE]\n\n"
+
+    def handler(request):
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=content
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Capital?"}]
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    parser = ThinkingParser()
+    for output in outputs:
+        parser.feed(output.new_text)
+    assert parser.finish() == ("", "Paris is it.")

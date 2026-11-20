@@ -34,6 +34,17 @@ with a resident-fraction field accepting 5% to 95%, including fractional percent
 
 Toggling triggers an engine reload (it is a load-time transform).
 
+In the web dashboard, **Fit to memory** under the field offers the largest whole percent that leaves about 4 GB for prompts. It uses the same size estimate as load admission. The target is the prompt admission line, (memory ceiling - hot cache) x memory-guard tier headroom, less the models already loaded and that 4 GB. Clicking it fills the field. When even 5% leaves less than 4 GB, a short notice replaces it. If a larger percent only fits because the load would move a Qwen4-Exp PLE or DeepSeek V4.1 Engram table to SSD, the hint keeps the table resident at a lower percent when one fits. `GET /admin/api/models/{model_id}/moe-offload-fit` returns the same value.
+
+Measured on an M3 Ultra with the ceiling held at 12 GiB (balanced tier), each model loaded at the suggested percent and sent one 16K-token prompt:
+
+| model | suggested | loaded | 16K-token prompt | peak |
+|---|---:|---:|---|---:|
+| gemma-4-26b-a4b-it-4bit | 33% | 8.3 GB | served | 11.4 GB |
+| Qwen3.6-35B-A3B-MLX-4bit | 28% | 7.7 GB | served | 10.0 GB |
+
+The prompt line here is 11.9 GB. Prompt memory depends on the model and the prompt length, so 4 GB is a starting point rather than a guarantee. Longer prompts or several concurrent requests need a lower percent.
+
 Missing experts are read by 12 threads, with at most 48 experts' reads in flight, which bounds the host memory the pipeline holds ahead of the slot writes. In decode, when a step's reads are slow, the GPU stays busy while they finish: it computes the resident routes, stays clocked for the rest of the read, and dispatches each layer's output as soon as it is built. Steps whose reads arrive within 0.5 ms keep the serial order: read, then compute. None of this changes what is computed.
 
 ## Performance
@@ -74,7 +85,7 @@ A miss evicts the resident expert with the lowest decayed routing count: each ro
 
 A call's misses are read in parallel with `os.pread` on a shared thread pool. `ensure()` protects every expert the call routes to, so a miss never evicts one of them, then schedules the missing experts before the serial install loop. Slot writes, eviction state, and hit/miss counters stay on the calling thread. In an over-capacity prefill, the reads of the next expert-major chunk's first misses start before the current chunk is evaluated; their slot writes still wait for it.
 
-An expert-major prefill forward streams almost every expert once, so a wider prefill step reads the experts fewer times. With offload active, `qwen4_exp` uses the 8192-token prefill step on every host (otherwise only NAX hosts with 64 GB or more), the first chunk included. When the memory guard has no headroom for a chunk, the prefill headroom ladder releases the requesting model's offload slots right after the pooled-buffer reclaim, before the hot cache or any idle model gives way: each cache shrinks to its routing top-k floor and returns to its full capacity at the engine's next decode step. The release is skipped while another request runs on the engine.
+An expert-major prefill forward streams almost every expert once, so a wider prefill step reads the experts fewer times. With offload active, `qwen4_exp` uses the 8192-token prefill step on every host (otherwise only NAX hosts with 64 GB or more), the first chunk included. When the memory guard has no headroom for a chunk, the prefill headroom ladder releases the requesting model's offload slots right after the pooled-buffer reclaim, before the hot cache or any idle model gives way. The release is sized from the shortfall the ladder measured: every cache gives up the smallest quarter, half, three quarters or all of its slots above the routing top-k floor that covers it, keeps the experts with the highest routing counts, and repeats with the next step while the chunk still does not fit. A pause whose ladder releases slots does not count toward the request's two prefill pauses (at most one such pause per step), so a long prompt reaches the floor with the same pauses left as a single release to the floor would leave it. The caches return to their full capacity at the engine's next decode step and keep the experts they hold, so decode does not restart from an empty cache. The release is skipped while another request runs on the engine.
 
 Measured on `Qwen3.8-Flash-Next-oQ4e` as a 24 GB host emulated on an M3 Ultra: system RAM, Metal working set (16 GiB) and VM statistics faked to 24 GB, every expert read from the SSD (`F_NOCACHE` after dropping the shards' page cache), 10% residency, PLE on SSD, Lightning MTP, aggressive memory tier, greedy, two runs each. Before is the common adapter as it was (LRU, no in-call protection, 2048-token prefill steps):
 

@@ -23,12 +23,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from .config import parse_size
 
@@ -211,9 +212,13 @@ class ServerSettings:
     # Seconds between trivial GPU kernels submitted while a model is loaded
     # but idle, so the GPU stays out of its idle power state (the first
     # command buffer after ~1s+ of GPU idle stalls for up to seconds on
-    # large resident models). Ticks stop after 5 minutes without requests.
-    # 0 disables.
+    # large resident models). Ticks stop after gpu_keep_warm_idle_window
+    # seconds without requests. 0 disables.
     gpu_keep_warm_interval: float = 0.5
+    # Seconds without requests after which the keep-warm ticks stop (default
+    # 5 minutes). A client that talks to the server less often than this pays
+    # the first-command stall on every request; raise it to cover that gap.
+    gpu_keep_warm_idle_window: float = 300.0
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
@@ -263,6 +268,9 @@ class ServerSettings:
             max_request_body_size=data.get("max_request_body_size", "512MB"),
             max_image_side_length=data.get("max_image_side_length", 2048),
             gpu_keep_warm_interval=float(data.get("gpu_keep_warm_interval", 0.5)),
+            gpu_keep_warm_idle_window=float(
+                data.get("gpu_keep_warm_idle_window", 300.0)
+            ),
         )
 
 
@@ -329,6 +337,10 @@ class ModelSettings:
         )
 
 
+ConcurrentPriority = Literal["prefill", "balanced", "decode"]
+CONCURRENT_PRIORITIES: tuple[str, ...] = get_args(ConcurrentPriority)
+
+
 @dataclass
 class SchedulerSettings:
     """Scheduler configuration settings."""
@@ -344,15 +356,22 @@ class SchedulerSettings:
     #   "speed" — never shrink; keep full-size steps and only admit prompts
     #     that fit at full speed (smaller effective context limit).
     prefill_priority: str = "context"
-    # When True (default), prefill yields GPU time to running decodes:
-    # prompts are force-chunked under contention, chunks are capped while
-    # any engine decodes, and each chunk accrues a decode time debt repaid
-    # before the next chunk runs. Off restores the pre-fairness behavior.
-    decode_fairness: bool = True
+    # How prefill shares the GPU with running decodes:
+    #   "prefill" - no decode fairness; prefill runs to completion.
+    #   "balanced" (default) - fairness with the adaptive debt ratio.
+    #   "decode" - fairness with the fixed debt ratio.
+    concurrent_priority: str = "balanced"
+
+    @property
+    def decode_fairness(self) -> bool:
+        return self.concurrent_priority != "prefill"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return asdict(self)
+        data = asdict(self)
+        # Older builds read only this switch after a downgrade.
+        data["decode_fairness"] = self.decode_fairness
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SchedulerSettings:
@@ -369,12 +388,18 @@ class SchedulerSettings:
         prefill_priority = data.get("prefill_priority", "context")
         if prefill_priority not in ("context", "speed"):
             prefill_priority = "context"
+        concurrent_priority = data.get("concurrent_priority")
+        if concurrent_priority not in CONCURRENT_PRIORITIES:
+            # Older settings stored only the decode_fairness switch.
+            concurrent_priority = (
+                "balanced" if data.get("decode_fairness", True) else "prefill"
+            )
         return cls(
             max_concurrent_requests=value,
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
-            decode_fairness=bool(data.get("decode_fairness", True)),
+            concurrent_priority=concurrent_priority,
         )
 
 
@@ -402,6 +427,11 @@ class CacheSettings:
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
     gdn_sidecar_state_dtype: str = "fp32"
+    # Runtime-only: the configured dir that GlobalSettings.ensure_directories()
+    # could not create, e.g. on a disconnected external drive.
+    unavailable_ssd_cache_dir: Path | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def get_gdn_snapshot_storage(self) -> str:
         """Return the user-facing GDN storage policy."""
@@ -451,6 +481,13 @@ class CacheSettings:
         if self.ssd_cache_dir:
             return Path(self.ssd_cache_dir).expanduser().resolve()
         return base_path / "cache"
+
+    def is_ssd_cache_dir_unavailable(self) -> bool:
+        """Return whether the configured SSD cache dir was unavailable at startup."""
+        return bool(self.ssd_cache_dir) and (
+            Path(self.ssd_cache_dir).expanduser().resolve()
+            == self.unavailable_ssd_cache_dir
+        )
 
     def get_ssd_cache_max_size_bytes(self, base_path: Path) -> int:
         """
@@ -551,6 +588,8 @@ VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"
 
 # KV cache storage formats `splash serve --kv-format` accepts.
 SPLASH_KV_FORMATS = frozenset({"int8", "bf16"})
+# Activation precisions `splash serve --activations` accepts (Splash 1.6.1+).
+SPLASH_ACTIVATIONS = frozenset({"auto", "bf16"})
 
 
 @dataclass
@@ -867,21 +906,27 @@ class UISettings:
     language: str = "en"
     # Admin dashboard block layout. None means the built-in default layout.
     dashboard_layout: dict[str, Any] | None = None
+    # Web UI color token overrides, {"light": {token: hex}, "dark": {...}}.
+    # None means the stock colors.
+    custom_theme: dict[str, dict[str, str]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
             "language": self.language,
             "dashboard_layout": self.dashboard_layout,
+            "custom_theme": self.custom_theme,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> UISettings:
         """Create from dictionary."""
         layout = data.get("dashboard_layout")
+        theme = data.get("custom_theme")
         return cls(
             language=data.get("language", "en"),
             dashboard_layout=layout if isinstance(layout, dict) else None,
+            custom_theme=theme if isinstance(theme, dict) else None,
         )
 
 
@@ -971,6 +1016,7 @@ class IntegrationSettings:
     # oMLX looks for an installed launcher itself.
     splash_path: str | None = None
     splash_kv_format: str = "int8"  # "int8" | "bf16"
+    splash_activations: str = "bf16"  # "auto" | "bf16" (Splash 1.6.1+)
     splash_max_memory_gb: float | None = None  # None = what the ceiling leaves
     splash_ssd_cache_gb: float | None = None  # None = oMLX's SSD cache size
     splash_ane_prefill: bool = True
@@ -1002,6 +1048,7 @@ class IntegrationSettings:
             "web_search_content_max_chars": self.web_search_content_max_chars,
             "splash_path": self.splash_path,
             "splash_kv_format": self.splash_kv_format,
+            "splash_activations": self.splash_activations,
             "splash_max_memory_gb": self.splash_max_memory_gb,
             "splash_ssd_cache_gb": self.splash_ssd_cache_gb,
             "splash_ane_prefill": self.splash_ane_prefill,
@@ -1043,6 +1090,7 @@ class IntegrationSettings:
             ),
             splash_path=data.get("splash_path") or None,
             splash_kv_format=data.get("splash_kv_format", "int8"),
+            splash_activations=data.get("splash_activations", "bf16"),
             splash_max_memory_gb=data.get("splash_max_memory_gb"),
             splash_ssd_cache_gb=data.get("splash_ssd_cache_gb"),
             splash_ane_prefill=data.get("splash_ane_prefill", True),
@@ -1614,7 +1662,6 @@ class GlobalSettings:
         # Required directories - fatal if creation fails
         required = [
             self.base_path,
-            self.cache.get_ssd_cache_dir(self.base_path),
             self.logging.get_log_dir(self.base_path),
         ]
 
@@ -1627,9 +1674,26 @@ class GlobalSettings:
                     logger.error(f"Failed to create directory {directory}: {e}")
                     raise
 
-        # Model directories - skip unavailable paths (e.g. disconnected external drive)
-        valid_dirs = []
-        for directory in self.model.get_model_dirs(self.base_path):
+        # SSD cache - turn the SSD cache off until restart when the configured
+        # dir is unavailable. Writing to another disk could fill it unnoticed.
+        cache_dir = self.cache.get_ssd_cache_dir(self.base_path)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            if cache_dir == self.base_path / "cache":
+                logger.error(f"Failed to create directory {cache_dir}: {e}")
+                raise
+            if self.cache.unavailable_ssd_cache_dir != cache_dir:
+                logger.warning(
+                    f"SSD cache directory unavailable, SSD cache is off until "
+                    f"restart: {cache_dir} ({e})"
+                )
+            self.cache.unavailable_ssd_cache_dir = cache_dir
+
+        # Keep unavailable model dirs (e.g. disconnected external drive) in the
+        # settings so discovery finds them again after reconnection.
+        model_dirs = self.model.get_model_dirs(self.base_path)
+        for directory in model_dirs:
             if not directory.exists():
                 try:
                     directory.mkdir(parents=True, exist_ok=True)
@@ -1643,12 +1707,9 @@ class GlobalSettings:
             access_error = model_directory_access_error(directory)
             if access_error is not None:
                 logger.warning(f"Model directory unavailable, skipping: {access_error}")
-                continue
 
-            valid_dirs.append(str(directory))
-
-        # Update model_dirs to only include valid paths
-        self.model.model_dirs = valid_dirs
+        # Store resolved paths so they match what the admin API reports.
+        self.model.model_dirs = [str(d) for d in model_dirs]
         self.model.model_dir = None
 
     def validate(self) -> list[str]:
@@ -1734,6 +1795,10 @@ class GlobalSettings:
 
         if self.server.max_image_side_length < 0:
             errors.append("max_image_side_length must be non-negative")
+        if not math.isfinite(self.server.gpu_keep_warm_interval):
+            errors.append("gpu_keep_warm_interval must be finite")
+        if not math.isfinite(self.server.gpu_keep_warm_idle_window):
+            errors.append("gpu_keep_warm_idle_window must be finite")
 
         # Memory guard tier validation
         if self.memory.memory_guard_tier not in VALID_MEMORY_GUARD_TIERS:
@@ -1882,6 +1947,10 @@ class GlobalSettings:
             errors.append(
                 f"splash_kv_format must be one of {sorted(SPLASH_KV_FORMATS)}"
             )
+        if self.integrations.splash_activations not in SPLASH_ACTIVATIONS:
+            errors.append(
+                f"splash_activations must be one of {sorted(SPLASH_ACTIVATIONS)}"
+            )
         memory = self.integrations.splash_max_memory_gb
         if memory is not None and memory <= 0:
             errors.append("splash_max_memory_gb must be > 0")
@@ -1938,7 +2007,9 @@ class GlobalSettings:
         # When hot_cache_only=True, PagedSSDCacheManager skips directory init and
         # the writer thread internally — the dir is not used for disk I/O.
         ssd_dir = (
-            self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+            self.cache.get_ssd_cache_dir(self.base_path)
+            if self.cache.enabled and not self.cache.is_ssd_cache_dir_unavailable()
+            else None
         )
 
         return SchedulerConfig(
@@ -1948,6 +2019,7 @@ class GlobalSettings:
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,
+            adaptive_decode_share=self.scheduler.concurrent_priority == "balanced",
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

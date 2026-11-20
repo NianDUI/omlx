@@ -49,8 +49,8 @@
         'qwen35_ane_prefill_cpu_shared_resource',
         'moe_expert_offload_enabled',
         'moe_expert_offload_resident_fraction',
-        'qwen35_oq_a8_enabled',
-        'qwen35_oq_a8_min_tokens',
+        'a8_prefill_enabled',
+        'a8_prefill_min_tokens',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -70,6 +70,7 @@
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
+        'lora_adapter',
     ]);
     const DIFFUSION_UNSUPPORTED_CT_KWARGS = new Set([
         'enable_thinking',
@@ -91,7 +92,7 @@
         'muse_glimmer_assistant',
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'cluster', 'settings', 'models', 'logs', 'bench']);
-    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
+    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models', 'theme']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
     const DASHBOARD_DOWNLOADER_SOURCES = new Set(['hf', 'ms', 'recommended']);
@@ -115,7 +116,8 @@
         generated_tokens: { label: 'status.stat.generated_tokens', field: 'total_completion_tokens' },
     };
     // Static class strings so Tailwind keeps them; indexed by tile count.
-    const SERVING_STAT_GRID_CLASSES = ['', '', 'sm:grid-cols-2', 'sm:grid-cols-2 lg:grid-cols-3', 'sm:grid-cols-2 lg:grid-cols-4'];
+    // Phones pair the tiles two per row; wider screens step up to three or four.
+    const SERVING_STAT_GRID_CLASSES = ['', 'grid-cols-1', 'grid-cols-2', 'grid-cols-2 lg:grid-cols-3', 'grid-cols-2 lg:grid-cols-4'];
     // Accuracy bench presets: benchmark -> samples, where 0 is the full
     // dataset. `standard` is the default selection; `full` is built from the
     // catalogue.
@@ -137,6 +139,24 @@
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
             enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
+            // Script tests load this file without custom_theme.js, hence the fallbacks.
+            customThemeGroups: window.OmlxCustomTheme?.GROUPS ?? [],
+            customThemeStored: window.OmlxCustomTheme?.sanitize(window._customTheme) ?? { light: {}, dark: {} },
+            customThemeDefaults: { light: {}, dark: {} },
+            customThemeDraft: { light: {}, dark: {} },
+            customThemeSaving: false,
+            customThemeSaved: false,
+            customThemeError: '',
+            customThemeJson: '',
+            customThemeJsonError: '',
+            themeImageError: '',
+            themeImageBusy: false,
+            customThemeJsonCopied: false,
+            customThemeJsonCopyBlocked: false,
+            showCustomThemeRestoreConfirm: false,
+            _customThemeSavedTimer: null,
+            _customThemeJsonCopiedTimer: null,
+            _customThemeReady: false,
 
             // Global settings section rail
             settingsActiveSection: 'settings-language',
@@ -161,11 +181,11 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, gpu_keep_warm_idle_window: 300, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
-                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
+                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', concurrent_priority: 'balanced' },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_unavailable: false, ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
                 usage: { usage_history: true },
@@ -198,6 +218,7 @@
                     web_search_content_max_chars: 20000,
                     splash_path: null,
                     splash_kv_format: 'int8',
+                    splash_activations: 'bf16',
                     splash_max_memory_gb: null,
                     splash_ssd_cache_gb: null,
                     splash_ane_prefill: true,
@@ -263,6 +284,8 @@
             // Model settings modal
             showModelSettingsModal: false,
             selectedModel: null,
+            moeOffloadFit: null,
+            moeOffloadFitUrl: null,
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
@@ -297,10 +320,11 @@
                 qwen35_ane_prefill_cpu_shared_resource: true,
                 moe_expert_offload_enabled: false,
                 moe_expert_offload_resident_fraction: 0.25,
-                qwen35_oq_a8_enabled: false,
-                qwen35_oq_a8_min_tokens: 128,
+                a8_prefill_enabled: false,
+                a8_prefill_min_tokens: 128,
                 external_engine: '',
                 external_engines: [],
+                model_format: null,
                 trust_remote_code: false,
                 embedding_audio_enabled: false,
                 embedding_audio_max_seconds: null,
@@ -310,6 +334,7 @@
             importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
+            loraAdapters: [],
             aneTuning: {
                 tuningId: null,
                 modelId: null,
@@ -330,6 +355,12 @@
                 allowCpuSharedResource: true,
             },
             _aneTuningPollTimer: null,
+            // Prefill Accelerator: paired Macs that can help the open model,
+            // and its helper status (polled while the modal is open).
+            prefillHelper: { modelId: null, candidates: [], loading: false, status: null, busy: false, original: null, applied: false },
+            _prefillHelperPollTimer: null,
+            // Set while this Mac runs another Mac's prefill helper.
+            prefillLending: null,
 
             // Profile / template / preset state
             profiles: [],                // per-model profiles for selectedModel
@@ -381,6 +412,7 @@
                 runtime_cache: {
                     base_path: '',
                     ssd_cache_dir: '',
+                    ssd_cache_unavailable: false,
                     response_state_dir: '',
                     models: [],
                     total_num_files: 0,
@@ -485,13 +517,19 @@
             hfTokenInvalid: false,
             _hfRefreshTimer: null,
             hfDeleteConfirm: null,
+            // Lowercased repo ID -> {files, size} from the last update check.
+            hfUpdates: {},
+            hfUpdatesChecking: false,
+            hfUpdatesStatus: '',
 
             // Recommended models state
             hfRecommended: { trending: [], popular: [] },
             hfRecommendedLoaded: false,
             hfRecommendedLoading: false,
             hfRecommendedTab: 'trending',
-            hfMlxOnly: true,
+            // Downloader repo filter: 'mlx', 'gguf' or 'all'.
+            hfModelFormat: ['mlx', 'gguf', 'all'].includes(localStorage.getItem('hfModelFormat'))
+                ? localStorage.getItem('hfModelFormat') : 'mlx',
 
             // Pagination state
             hfPage: { trending: 1, popular: 1, search: 1 },
@@ -526,6 +564,9 @@
             // Model detail modal
             hfModelDetail: null,
             hfModelDetailLoading: false,
+            hfDetailTab: 'card',
+            // File name -> picked for download, for the detail modal's Files tab.
+            hfSelectedFiles: {},
 
             // Recommended (hardware-aware oQ picks) state
             recommendations: null,
@@ -595,8 +636,10 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
+            oqPreserveNgram: false,
             oqMtpAssistantPath: '',
             oqEnhanced: false,
+            oqHadamard: false,
             oqeReuseImatrixCache: true,
             oqeImatrixCachePath: '',
             oqeStrictImatrix: false,
@@ -657,7 +700,7 @@
             benchUploadResults: [],
             benchUploadDone: null,
             benchUploading: false,
-            benchUploadSkipped: null,  // { reason } — only external-endpoint runs skip now
+            benchUploadSkipped: null,  // { reason, features } from the upload_skipped event
             benchUploadFlags: [],      // [{key, label}] acceleration active during the run
             // { bench_id, model_id } when the server reports a running bench
             // that is NOT the one this tab is displaying. Drives the "another
@@ -747,6 +790,8 @@
             // endpoint settings because it is a simple number the user sets
             // once per endpoint (thinking models need a larger budget).
             accExternalMaxTokens: localStorage.getItem('omlx_acc_external_max_tokens') || '',
+            // Local runs: session-only, since a larger limit makes runs much longer.
+            accMaxTokens: '',
             accRunning: false,
             _managerStatusTimer: null,
             benchConfirm: null,      // 'throughput' | 'accuracy' | 'context' while asking
@@ -777,6 +822,7 @@
                 this.fetchClaudeDesktopStatus();
 
                 this.startUpdateCheckTimer();
+                this.pollPrefillLending();
 
                 this.onboardingStartedEmpty = !this.hasUserModels;
                 if (this.onboardingStartedEmpty
@@ -809,7 +855,8 @@
                     }
                 });
 
-                this.$watch('hfMlxOnly', () => {
+                this.$watch('hfModelFormat', (value) => {
+                    localStorage.setItem('hfModelFormat', value);
                     this.hfRecommended = { trending: [], popular: [] };
                     this.hfRecommendedLoaded = false;
                     this.hfSearchResults = [];
@@ -917,6 +964,7 @@
 
                 this.mainTab = DASHBOARD_MAIN_TABS.has(mainTab) ? mainTab : 'status';
                 this.activeTab = DASHBOARD_SETTINGS_TABS.has(settingsTab) ? settingsTab : 'global';
+                if (this.activeTab === 'theme') this.initCustomThemeEditor();
                 this.modelsTab = DASHBOARD_MODELS_TABS.has(modelsTab) ? modelsTab : 'manager';
                 this.benchTab = DASHBOARD_BENCH_TABS.has(benchTab) ? benchTab : 'throughput';
                 const source = params.get('source');
@@ -1012,6 +1060,7 @@
                 if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
                 this.activeTab = tab;
                 this.mainTab = 'settings';
+                if (tab === 'theme') this.initCustomThemeEditor();
                 this.syncTabStateToUrl();
             },
 
@@ -1360,7 +1409,7 @@
             },
 
             async saveGlobalSettings() {
-                if (this.resettingGlobalSettings) return;
+                if (this.saving || this.resettingGlobalSettings) return;
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -1422,6 +1471,7 @@
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
+                            gpu_keep_warm_idle_window: this.globalSettings.server.gpu_keep_warm_idle_window,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
                             max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
@@ -1434,7 +1484,7 @@
                             embedding_batch_size: this.globalSettings.scheduler.embedding_batch_size,
                             chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
                             prefill_priority: this.globalSettings.scheduler.prefill_priority,
-                            decode_fairness: this.globalSettings.scheduler.decode_fairness,
+                            concurrent_priority: this.globalSettings.scheduler.concurrent_priority,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,
@@ -1486,7 +1536,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.saveError = Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
+                        this.saveError = this.formatApiError(data.detail) || window.t('js.error.save_settings_failed');
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
                     }
@@ -1535,7 +1585,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.subKeyError = data.detail || window.t('js.error.save_settings_failed');
+                        this.subKeyError = this.formatApiError(data.detail) || window.t('js.error.save_settings_failed');
                     }
                 } catch (err) {
                     this.subKeyError = window.t('js.error.save_settings_failed');
@@ -1630,7 +1680,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.update_model_setting_failed'));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.update_model_setting_failed'));
                         await this.loadModels();
                     }
                 } catch (err) {
@@ -1686,6 +1736,25 @@
                 }
             },
 
+            async abortRequest(modelId, requestId) {
+                try {
+                    const response = await fetch(
+                        `/admin/api/models/${encodeURIComponent(modelId)}/requests/${encodeURIComponent(requestId)}/abort`,
+                        { method: 'POST' },
+                    );
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else if (!response.ok && response.status !== 404) {
+                        // 404 means the request finished before the click landed.
+                        const data = await response.json();
+                        alert(data.detail || window.t('js.error.stop_request_failed'));
+                    }
+                } catch (err) {
+                    console.error('Failed to stop request:', err);
+                    alert(window.t('js.error.stop_request_failed'));
+                }
+            },
+
             // ===== Profiles / Templates =====
             formValuesForProfile() {
                 const ms = this.modelSettings;
@@ -1696,6 +1765,8 @@
                     if (k === 'enable_thinking' && this.selectedModel?.thinking_forced) continue;
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
                     if (isDiffusion && this.isDiffusionUnsupportedProfileField(k)) continue;
+                    // A hidden A8 toggle stays unset rather than saved.
+                    if (k.startsWith('a8_prefill_') && !this.showsA8Prefill(this.selectedModel)) continue;
                     if (k === 'thinking_budget_enabled') {
                         if (ms.enableThinkingBudget) out.thinking_budget_enabled = true;
                         continue;
@@ -1713,6 +1784,12 @@
                     if (k === 'max_tool_result_tokens') {
                         if (ms.enableToolResultLimit && ms.max_tool_result_tokens) {
                             out.max_tool_result_tokens = Number(ms.max_tool_result_tokens);
+                        }
+                        continue;
+                    }
+                    if (k === 'gpu_power_limit_w') {
+                        if (ms.enableGpuPowerLimit && ms.gpu_power_limit_w) {
+                            out.gpu_power_limit_w = Number(ms.gpu_power_limit_w);
                         }
                         continue;
                     }
@@ -1840,6 +1917,35 @@
             get activeTemplateName() {
                 const profile = this.profiles.find(p => p.name === this.activeProfileName);
                 return this.matchingProfileTemplate(profile)?.name || null;
+            },
+            async loadLoraAdapters(modelId) {
+                this.loraAdapters = [];
+                try {
+                    const r = await fetch(`/admin/api/models/${encodeURIComponent(modelId)}/lora-adapters`);
+                    if (r.ok) this.loraAdapters = (await r.json()).adapters || [];
+                    else if (r.status === 401) window.location.href = '/admin';
+                } catch (_) { /* network error */ }
+            },
+            loraAdapterOptions() {
+                const current = this.modelSettings.lora_adapter;
+                // A saved path outside the model folders still shows as selected.
+                if (current && !this.loraAdapters.some(a => a.path === current)) {
+                    return [{ id: current, path: current, problem: null }, ...this.loraAdapters];
+                }
+                return this.loraAdapters;
+            },
+            loraAdapterLabel(a) {
+                const parts = [a.id];
+                if (a.rank) parts.push('r' + a.rank);
+                if (a.size_formatted) parts.push(a.size_formatted);
+                return parts.join(' · ');
+            },
+            selectedLoraAdapter() {
+                const current = this.modelSettings.lora_adapter;
+                return current ? this.loraAdapters.find(a => a.path === current) || null : null;
+            },
+            loraAdapterProblem() {
+                return this.selectedLoraAdapter()?.problem || '';
             },
             async loadProfilesForModel(modelId) {
                 const seq = this._applySeq;
@@ -2068,6 +2174,31 @@
                 return v;
             },
 
+            // The admin API answers a pydantic validation error with an array
+            // of {loc, msg} objects. alert() on that array prints
+            // "[object Object]" and hides which field the server refused, so
+            // the settings endpoints that can return one render it here.
+            formatApiError(detail) {
+                if (!detail) return '';
+                if (Array.isArray(detail)) {
+                    return detail.map(item => {
+                        if (!item || typeof item !== 'object') return String(item);
+                        const loc = Array.isArray(item.loc) ? item.loc : [];
+                        const fields = ['body', 'query', 'path', 'header'].includes(loc[0])
+                            ? loc.slice(1) : loc;
+                        const path = fields.join('.');
+                        const message = String(item.msg || item.message || '')
+                            .replace(/^Value error, /, '');
+                        const text = message || JSON.stringify(item);
+                        return path ? `${path}: ${text}` : text;
+                    }).filter(Boolean).join('; ');
+                }
+                if (typeof detail === 'object') {
+                    return String(detail.message || detail.msg || JSON.stringify(detail));
+                }
+                return String(detail);
+            },
+
             buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
                 const ctk = chatTemplateKwargs || {};
                 const forced = new Set(forcedCtKwargs || []);
@@ -2135,12 +2266,18 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    prefill_helper_supported: model?.prefill_helper_supported === true,
+                    prefill_helper_node_id: s.prefill_helper_node_id || '',
+                    prefill_helper_layers: s.prefill_helper_layers ? String(s.prefill_helper_layers) : '',
+                    // Unset means on; only a saved false is off.
                     deepseek_v41_ced_prefill_enabled:
-                        s.deepseek_v41_ced_prefill_enabled === true,
+                        s.deepseek_v41_ced_prefill_enabled !== false,
                     deepseek_v41_ced_prefill_supported:
                         String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
                     qwen4_gdn_decode_wide_proj:
                         s.qwen4_gdn_decode_wide_proj === true,
+                    activation_fp16_enabled: s.activation_fp16_enabled === true,
+                    activation_fp16_supported: model?.activation_fp16_supported === true,
                     qwen4_gdn_decode_wide_proj_supported:
                         String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'qwen4_exp',
                     deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
@@ -2153,6 +2290,9 @@
                         model?.deepseek_v41_engram_ssd_offload_forced === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
+                    enableGpuPowerLimit: !!(s.gpu_power_limit_w),
+                    gpu_power_limit_w: s.gpu_power_limit_w || null,
+                    gpu_power_limit_supported: model?.gpu_power_limit_supported === true,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
                     guided_grammar: s.guided_grammar || '',
                     enableToolResultLimit: !!(s.max_tool_result_tokens),
@@ -2172,8 +2312,8 @@
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
                     moe_expert_offload_resident_touched: false,
                     moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
-                    qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
-                    qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
+                    a8_prefill_enabled: s.a8_prefill_enabled || false,
+                    a8_prefill_min_tokens: s.a8_prefill_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
@@ -2215,10 +2355,12 @@
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
+                    lora_adapter: isDiffusion ? '' : (s.lora_adapter || ''),
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
                     external_engine: s.external_engine || '',
                     external_engines: model?.external_engines || [],
+                    model_format: model?.model_format || null,
                     trust_remote_code: s.trust_remote_code || false,
                     embedding_audio_enabled: s.embedding_audio_enabled || false,
                     embedding_audio_max_seconds: s.embedding_audio_max_seconds ?? null,
@@ -2247,6 +2389,41 @@
                         ),
                     );
                 }
+                this.onMoeExpertOffloadResidentPercent();
+            },
+
+            loadMoeOffloadFit() {
+                // Sized from the unsaved edits that change the estimate; refetch only when they change.
+                const model = this.selectedModel;
+                if (model?.moe_expert_offload_supported !== true) return;
+                const payload = this.buildModelSettingsPayload(this.modelSettings);
+                const params = new URLSearchParams();
+                for (const key of ['mtp_enabled', 'qwen4_ple_ssd_offload', 'deepseek_v41_engram_ssd_offload']) {
+                    params.set(key, String(!!payload[key]));
+                }
+                const url = `/admin/api/models/${encodeURIComponent(model.id)}/moe-offload-fit?${params}`;
+                if (url === this.moeOffloadFitUrl) return;
+                this.moeOffloadFitUrl = url;
+                this.moeOffloadFit = null;
+                return fetch(url).then(async resp => {
+                    if (!resp.ok) return;
+                    const fit = await resp.json();
+                    if (this.moeOffloadFitUrl === url) this.moeOffloadFit = fit;
+                }).catch(() => { /* network error */ });
+            },
+
+            moeOffloadFitText() {
+                const fit = this.moeOffloadFit;
+                const key = fit?.status === 'fit' ? 'moe_expert_offload_fit' : 'moe_expert_offload_no_fit';
+                return window.t(`modal.model_settings.${key}`)
+                    .replace('{percent}', fit?.max_percent)
+                    .replace('{size}', this.formatByteCount(fit?.bytes))
+                    .replace('{reserve}', this.formatByteCount(fit?.reserve_bytes));
+            },
+
+            applyMoeOffloadFit() {
+                if (this.moeOffloadFit?.status !== 'fit') return;
+                this.modelSettings.moe_expert_offload_resident_percent = this.moeOffloadFit.max_percent;
                 this.onMoeExpertOffloadResidentPercent();
             },
 
@@ -2280,6 +2457,8 @@
                 ms.enable_thinking = null;
                 ms.enableThinkingBudget = false;
                 ms.thinking_budget_tokens = null;
+                ms.enableGpuPowerLimit = false;
+                ms.gpu_power_limit_w = null;
                 ms.enableToolResultLimit = false;
                 ms.max_tool_result_tokens = null;
                 ms.ctKwargEntries = [];
@@ -2303,6 +2482,10 @@
                     } else if (k === 'max_tool_result_tokens') {
                         ms.enableToolResultLimit = s[k] != null;
                         ms.max_tool_result_tokens = s[k] ?? null;
+                    } else if (k === 'gpu_power_limit_w') {
+                        // Profiles may store 0 for "off".
+                        ms.enableGpuPowerLimit = s[k] > 0;
+                        ms.gpu_power_limit_w = s[k] > 0 ? s[k] : null;
                     } else if (k === 'guided_grammar_enabled') {
                         ms.guided_grammar_enabled = !!s[k];
                     } else if (k === 'guided_grammar') {
@@ -2388,7 +2571,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.save_profile_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.save_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2515,7 +2698,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.update_profile_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.update_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2556,7 +2739,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.save_template_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.save_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2582,7 +2765,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.update_template_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.update_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2881,7 +3064,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || window.t('js.error.apply_ane_tuning_result_failed'));
+                        throw new Error(this.formatApiError(data.detail) || window.t('js.error.apply_ane_tuning_result_failed'));
                     }
                     Object.assign(this.modelSettings, patch);
                     const model = this.models.find(item => item.id === this.selectedModel.id);
@@ -2936,6 +3119,7 @@
                     await Promise.all([
                         this.loadProfilesForModel(model.id),
                         this.loadTemplates(),
+                        this.loadLoraAdapters(model.id),
                     ]);
                     if (this.reasoningParsers.length === 0) {
                         try {
@@ -2950,6 +3134,8 @@
                     || this.selectedModel?.id !== model.id
                     || JSON.stringify(this.modelSettings) !== baseline)) return;
                 this.selectedModel = model;
+                // A fresh open re-sizes; a focus refresh keeps the current hint.
+                if (!preservingEdits) this.moeOffloadFitUrl = null;
                 this.modelSettings = this.buildModelSettingsState(
                     model,
                     model.settings || {},
@@ -2961,10 +3147,275 @@
                 }
                 this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                 this.showModelSettingsModal = true;
+                if (!preservingEdits) this.openPrefillHelper(model);
                 // Sync on the next frame: sections have no layout until the dialog opens.
                 this.$nextTick(() => {
                     if (this.$refs.modelSettingsBody) this.modelSettingsOnScroll(this.$refs.modelSettingsBody);
                 });
+            },
+
+            async pollPrefillLending() {
+                if (this.globalSettings.server.distributed_inference_active && !document.hidden) {
+                    try {
+                        const resp = await fetch('/admin/api/prefill-helper/lending');
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            this.prefillLending = data.active ? data : null;
+                        }
+                    } catch (_) { /* network error */ }
+                } else if (!this.globalSettings.server.distributed_inference_active) {
+                    this.prefillLending = null;
+                }
+                setTimeout(() => this.pollPrefillLending(), 5000);
+            },
+
+            async stopPrefillLending() {
+                try {
+                    await fetch('/admin/api/prefill-helper/lending/stop', { method: 'POST' });
+                } catch (_) { /* network error */ }
+                this.prefillLending = null;
+            },
+
+            prefillLendingText() {
+                const lending = this.prefillLending;
+                if (!lending) return '';
+                return window.t('dashboard.prefill_lending')
+                    .replaceAll('{host}', lending.host || '?')
+                    .replace('{n}', lending.layers ?? '')
+                    .replace('{model}', String(lending.model || '').split('/').pop());
+            },
+
+            openPrefillHelper(model) {
+                if (this._prefillHelperPollTimer) {
+                    clearTimeout(this._prefillHelperPollTimer);
+                    this._prefillHelperPollTimer = null;
+                }
+                this.prefillHelper = {
+                    modelId: model.id,
+                    candidates: [],
+                    loading: false,
+                    status: model.prefill_helper || null,
+                    busy: false,
+                    original: {
+                        prefill_helper_node_id: model.settings?.prefill_helper_node_id || null,
+                        prefill_helper_layers: model.settings?.prefill_helper_layers ?? null,
+                    },
+                    applied: false,
+                    checked: false,
+                };
+                if (!model.prefill_helper_supported
+                    || !this.globalSettings.server.distributed_inference_active) return;
+                this.loadPrefillHelperCandidates();
+                this.pollPrefillHelper();
+            },
+
+            async loadPrefillHelperCandidates() {
+                const modelId = this.prefillHelper.modelId;
+                this.prefillHelper.loading = true;
+                try {
+                    const resp = await fetch(
+                        '/admin/api/prefill-helper/candidates?model_id=' + encodeURIComponent(modelId)
+                    );
+                    if (resp.ok && this.prefillHelper.modelId === modelId) {
+                        const data = await resp.json();
+                        this.prefillHelper.candidates = data.devices || [];
+                    }
+                } catch (_) { /* network error */ }
+                if (this.prefillHelper.modelId === modelId) this.prefillHelper.loading = false;
+            },
+
+            async pollPrefillHelper() {
+                const modelId = this.prefillHelper.modelId;
+                if (!this.showModelSettingsModal || this.selectedModel?.id !== modelId) {
+                    this._prefillHelperPollTimer = null;
+                    return;
+                }
+                try {
+                    const resp = await fetch(
+                        '/admin/api/prefill-helper/models/' + encodeURIComponent(modelId)
+                    );
+                    if (resp.ok && this.prefillHelper.modelId === modelId) {
+                        this.prefillHelper.status = await resp.json();
+                        // A saved helper of an unloaded model: see whether its
+                        // files are already there (nothing is copied).
+                        if (this.prefillHelper.status.state === 'unloaded'
+                            && this.selectedModel?.settings?.prefill_helper_node_id
+                            && !this.prefillHelper.checked) {
+                            this.prefillHelper.checked = true;
+                            this.prefillHelperAction('check');
+                        }
+                    }
+                } catch (_) { /* network error */ }
+                this._prefillHelperPollTimer = setTimeout(() => this.pollPrefillHelper(), 2000);
+            },
+
+            async prefillHelperAction(action) {
+                const modelId = this.prefillHelper.modelId;
+                this.prefillHelper.busy = true;
+                try {
+                    const resp = await fetch(
+                        '/admin/api/prefill-helper/models/' + encodeURIComponent(modelId) + '/' + action,
+                        { method: 'POST' }
+                    );
+                    if (resp.ok && this.prefillHelper.modelId === modelId) {
+                        this.prefillHelper.status = await resp.json();
+                    }
+                } catch (_) { /* network error */ }
+                this.prefillHelper.busy = false;
+            },
+
+            prefillHelperCandidate(nodeId) {
+                return this.prefillHelper.candidates.find((d) => d.node_id === nodeId) || null;
+            },
+
+            prefillHelperUsable(device) {
+                return device.online && device.version_ok && device.layers_fit > 0;
+            },
+
+            prefillHelperOption(device) {
+                const parts = [device.name];
+                if (device.chip) parts.push(device.chip + (device.ram_gb ? ` ${device.ram_gb} GB` : ''));
+                if (!device.online) {
+                    parts.push(window.t('modal.model_settings.prefill_helper_offline'));
+                } else if (!device.version_ok) {
+                    parts.push(window.t('modal.model_settings.prefill_helper_update'));
+                } else if (device.layers_fit > 0) {
+                    parts.push(window.t('modal.model_settings.prefill_helper_fits')
+                        .replace('{n}', device.layers_fit));
+                } else {
+                    parts.push(window.t('modal.model_settings.prefill_helper_no_memory'));
+                }
+                return parts.join(' · ');
+            },
+
+            prefillHelperPending() {
+                const saved = this.selectedModel?.settings || {};
+                const ms = this.modelSettings;
+                return (saved.prefill_helper_node_id || '') !== (ms.prefill_helper_node_id || '')
+                    || String(saved.prefill_helper_layers || '') !== String(ms.prefill_helper_layers || '');
+            },
+
+            // Applies the helper choice without closing the dialog, so its
+            // progress and the Copy files step show here.
+            async applyPrefillHelper() {
+                const model = this.selectedModel;
+                const ms = this.modelSettings;
+                if (!model) return;
+                const body = {
+                    prefill_helper_node_id: ms.prefill_helper_node_id || null,
+                    prefill_helper_layers: ms.prefill_helper_node_id && ms.prefill_helper_layers
+                        ? parseInt(ms.prefill_helper_layers, 10)
+                        : null,
+                };
+                this.prefillHelper.busy = true;
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(model.id)}/settings`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    if (resp.ok) {
+                        model.settings = { ...(model.settings || {}), ...body };
+                        this.prefillHelper.applied = true;
+                    } else if (resp.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await resp.json().catch(() => ({}));
+                        alert(typeof data.detail === 'string' ? data.detail : window.t('js.error.save_model_settings_failed'));
+                    }
+                } catch (_) {
+                    alert(window.t('js.error.save_model_settings_failed'));
+                }
+                this.prefillHelper.busy = false;
+            },
+
+            // Cancel undoes an applied helper choice; Save keeps it.
+            closeModelSettings() {
+                this.showModelSettingsModal = false;
+                const model = this.selectedModel;
+                const body = this.prefillHelper.original;
+                if (!this.prefillHelper.applied || !model || !body) return;
+                this.prefillHelper.applied = false;
+                fetch(`/admin/api/models/${encodeURIComponent(model.id)}/settings`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                }).then((resp) => {
+                    if (resp.ok) model.settings = { ...(model.settings || {}), ...body };
+                }).catch(() => { /* network error */ });
+            },
+
+            prefillHelperTakeoverText(device) {
+                if (!device?.lending) return '';
+                return window.t('modal.model_settings.prefill_helper_takes_over')
+                    .replaceAll('{name}', device.name || '')
+                    .replaceAll('{host}', device.lending.host || '?')
+                    .replaceAll('{model}', device.lending.model || '?');
+            },
+
+            prefillHelperLayerChoices() {
+                const device = this.prefillHelperCandidate(this.modelSettings.prefill_helper_node_id);
+                const most = Math.max(
+                    device?.layers_fit || 0,
+                    parseInt(this.modelSettings.prefill_helper_layers, 10) || 0,
+                );
+                return Array.from({ length: most }, (_, i) => i + 1);
+            },
+
+            prefillHelperStatusText() {
+                const s = this.prefillHelper.status;
+                const t = (key) => window.t('modal.model_settings.prefill_helper_state_' + key);
+                if (!s) return t('unloaded');
+                const name = s.name || this.prefillHelperCandidate(s.node_id)?.name || '';
+                const size = (n) => this.formatSizeBytes(Number(n || 0));
+                switch (s.state) {
+                    case 'connecting':
+                        return t('connecting').replace('{name}', name);
+                    case 'starting':
+                        return t('starting').replace('{name}', name).replace('{n}', s.layers ?? '');
+                    case 'needs_files':
+                        return t(s.prompt).replace('{name}', name).replace('{size}', size(s.bytes))
+                            .replace('{left}', size(s.left))
+                            .replace('{copies}', (s.delete || []).map((c) => c.name + ' (' + size(c.bytes) + ')').join(', '));
+                    case 'copying': {
+                        const text = t('copying').replace('{name}', name).replace('{done}', size(s.done))
+                            .replace('{size}', size(s.bytes));
+                        if (s.seconds_left == null) return text;
+                        const left = s.seconds_left < 90
+                            ? t('seconds_left').replace('{n}', s.seconds_left)
+                            : t('minutes_left').replace('{n}', Math.ceil(s.seconds_left / 60));
+                        return text + ' · ' + left;
+                    }
+                    case 'files_ready':
+                        return t('files_ready').replace('{name}', name).replace('{n}', s.held ?? '')
+                            + (this.prefillHelper.applied ? ' ' + t('save_keeps') : '');
+                    case 'files_missing':
+                        return t('files_missing').replace('{name}', name).replace('{n}', s.held ?? '')
+                            .replace('{size}', size(s.bytes));
+                    case 'ready':
+                    case 'working': {
+                        // No split beats this Mac alone over the measured link.
+                        if (s.layers === 0) return t('slow_link').replace('{name}', name);
+                        let text = t(s.state).replace('{name}', name).replace('{n}', s.held ?? '');
+                        if (s.last_prompt) {
+                            text += ' · ' + t('last_prompt')
+                                .replace('{tokens}', Number(s.last_prompt.tokens).toLocaleString())
+                                .replace('{seconds}', Number(s.last_prompt.seconds).toFixed(1));
+                        }
+                        if (s.out_of_memory) text += ' · ' + t('out_of_memory');
+                        return text;
+                    }
+                    case 'offline':
+                        return t('offline').replace('{name}', name).replace('{reason}', s.reason || '');
+                    case 'stopped':
+                        return s.reason ? s.reason + '.' : t('stopped');
+                    case 'error':
+                        return s.reason || t('error');
+                    case 'unloaded':
+                        return t('unloaded');
+                    default:
+                        return '';
+                }
             },
 
             async importMtplxSidecar() {
@@ -3000,31 +3451,42 @@
                 return null;
             },
 
-            isQwenOqA8Model(model) {
+            isA8PrefillModel(model) {
                 const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
-                // qwen4_exp (Qwen3.8-Flash-Next) is an exact match: only that
-                // validated family has routed-expert A8, not every qwen4*.
-                return type === 'qwen4_exp'
+                // Exact matches: only these validated families have routed-expert A8.
+                return ['qwen4_exp', 'deepseek_v41', 'minimax_m3', 'minimax_m3_vl'].includes(type)
                     || ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
             },
 
-            // The kernels need native INT8 tensor ops (M5-series or newer).
-            // A saved "on" keeps the toggle so it can be turned off.
-            showsQwenOqA8(model) {
-                return this.isQwenOqA8Model(model)
-                    && (model?.qwen35_oq_a8_supported === true
-                        || model?.settings?.qwen35_oq_a8_enabled === true);
+            // The kernels need native INT8 tensor ops (M5-series or newer),
+            // here or on the Prefill Accelerator Mac. A saved "on" keeps the
+            // toggle so it can be turned off.
+            showsA8Prefill(model) {
+                return this.isA8PrefillModel(model)
+                    && (model?.a8_prefill_supported === true
+                        || model?.settings?.a8_prefill_enabled === true
+                        || !!this.modelSettings?.prefill_helper_node_id);
             },
 
-            validateQwenOqA8Settings() {
-                if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
+            validateGpuPowerLimit() {
+                if (!this.modelSettings.enableGpuPowerLimit) return null;
+                const watts = Number(this.modelSettings.gpu_power_limit_w);
+                if (!Number.isInteger(watts) || watts < 2 || watts > 1000) {
+                    return window.t('js.error.gpu_power_limit_range');
+                }
+                return null;
+            },
+
+            validateA8PrefillSettings() {
+                if (!this.modelSettings.a8_prefill_enabled
+                    || !this.showsA8Prefill(this.selectedModel)) return null;
                 // Both wrap the same MLP call, so the combination silently
                 // disables one of them. Caught here so the modal explains it
                 // instead of surfacing the server's 400.
                 if (this.modelSettings.qwen35_ane_prefill_enabled) {
                     return window.t('js.error.ane_oq_a8_conflict');
                 }
-                const minTokens = Number(this.modelSettings.qwen35_oq_a8_min_tokens);
+                const minTokens = Number(this.modelSettings.a8_prefill_min_tokens);
                 if (!Number.isInteger(minTokens) || minTokens < 1) {
                     return window.t('js.error.oq_a8_min_tokens_positive');
                 }
@@ -3160,10 +3622,13 @@
                         ms.qwen4_ple_ssd_offload_forced
                             ? !!ms.qwen4_ple_ssd_offload_requested
                             : !!ms.qwen4_ple_ssd_offload,
-                    deepseek_v41_ced_prefill_enabled:
-                        !!ms.deepseek_v41_ced_prefill_enabled,
+                    prefill_helper_node_id: ms.prefill_helper_node_id || null,
+                    prefill_helper_layers: ms.prefill_helper_node_id && ms.prefill_helper_layers
+                        ? parseInt(ms.prefill_helper_layers, 10)
+                        : null,
                     qwen4_gdn_decode_wide_proj:
                         !!ms.qwen4_gdn_decode_wide_proj,
+                    activation_fp16_enabled: !!ms.activation_fp16_enabled,
                     deepseek_v41_engram_ssd_offload:
                         ms.deepseek_v41_engram_ssd_offload_forced
                             ? !!ms.deepseek_v41_engram_ssd_offload_requested
@@ -3171,6 +3636,9 @@
                     thinking_budget_enabled: ms.enableThinkingBudget,
                     thinking_budget_tokens: ms.enableThinkingBudget
                         ? (ms.thinking_budget_tokens || null)
+                        : 0,
+                    gpu_power_limit_w: ms.enableGpuPowerLimit
+                        ? (Number(ms.gpu_power_limit_w) || 0)
                         : 0,
                     guided_grammar_enabled: ms.guided_grammar_enabled,
                     guided_grammar: ms.guided_grammar_enabled
@@ -3192,8 +3660,6 @@
                         : 4,
                     moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!ms.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: ms.moe_expert_offload_resident_fraction ?? 0.25,
-                    qwen35_oq_a8_enabled: !!ms.qwen35_oq_a8_enabled,
-                    qwen35_oq_a8_min_tokens: Number(ms.qwen35_oq_a8_min_tokens) || 128,
                     qwen35_ane_prefill_enabled: !!ms.qwen35_ane_prefill_enabled,
                     // Validation only runs when the feature is enabled, so a
                     // blank numeric input must fall back to the server default
@@ -3265,9 +3731,18 @@
                         && ms.vlm_mtp_draft_block_size
                         ? parseInt(ms.vlm_mtp_draft_block_size)
                         : null,
+                    lora_adapter: ms.lora_adapter || null,
                     trust_remote_code: ms.trust_remote_code,
                     external_engine: ms.external_engine || null,
                 };
+                // Sent only where the toggle shows, so a hidden setting stays unset.
+                if (ms.deepseek_v41_ced_prefill_supported) {
+                    payload.deepseek_v41_ced_prefill_enabled = !!ms.deepseek_v41_ced_prefill_enabled;
+                }
+                if (this.showsA8Prefill(this.selectedModel)) {
+                    payload.a8_prefill_enabled = !!ms.a8_prefill_enabled;
+                    payload.a8_prefill_min_tokens = Number(ms.a8_prefill_min_tokens) || 128;
+                }
                 if (isDiffusion) {
                     Object.assign(payload, {
                         top_p: null,
@@ -3321,6 +3796,7 @@
                         vlm_mtp_enabled: false,
                         vlm_mtp_draft_model: null,
                         vlm_mtp_draft_block_size: null,
+                        lora_adapter: null,
                     });
                 }
                 if (this.selectedModel?.embedding_audio_supported) {
@@ -3335,17 +3811,24 @@
             },
 
             async saveModelSettings() {
+                if (this.savingModelSettings) return;
                 if (!this.selectedModel) return;
 
-                const qwenOqA8ValidationError = this.validateQwenOqA8Settings();
-                if (qwenOqA8ValidationError) {
-                    alert(qwenOqA8ValidationError);
+                const a8PrefillValidationError = this.validateA8PrefillSettings();
+                if (a8PrefillValidationError) {
+                    alert(a8PrefillValidationError);
                     return;
                 }
 
                 const qwenAneValidationError = this.validateQwenAneSettings();
                 if (qwenAneValidationError) {
                     alert(qwenAneValidationError);
+                    return;
+                }
+
+                const gpuPowerLimitError = this.validateGpuPowerLimit();
+                if (gpuPowerLimitError) {
+                    alert(gpuPowerLimitError);
                     return;
                 }
 
@@ -3375,6 +3858,7 @@
                         // Refresh the model list to update badges
                         await this.loadModels();
                         const data = await response.json();
+                        this.prefillHelper.applied = false;
                         this.showModelSettingsModal = false;
                         if (data.requires_reload) {
                             if (data.auto_reloaded) {
@@ -3391,7 +3875,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.save_model_settings_failed'));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.save_model_settings_failed'));
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
@@ -3440,7 +3924,7 @@
                     }
                     const data = await response.json().catch(() => ({}));
                     if (!response.ok) {
-                        this.settingsApply.error = data.detail || window.t('js.error.settings_apply_failed');
+                        this.settingsApply.error = this.formatApiError(data.detail) || window.t('js.error.settings_apply_failed');
                         this.settingsApply.phase = 'error';
                         return null;
                     }
@@ -3585,6 +4069,8 @@
                         this.modelSettings.enable_thinking = false;
                         this.modelSettings.enableThinkingBudget = false;
                         this.modelSettings.thinking_budget_tokens = 0;
+                        this.modelSettings.enableGpuPowerLimit = false;
+                        this.modelSettings.gpu_power_limit_w = null;
                         this.modelSettings.enableToolResultLimit = false;
                         this.modelSettings.max_tool_result_tokens = 0;
                         this.modelSettings.ctKwargEntries = [];
@@ -3815,6 +4301,17 @@
             },
 
             get claudeCodeCommand() {
+                return this._claudeCodeCommand(this.stats.api_key);
+            },
+
+            // On-screen variant with the auth token masked (sub-key style), so
+            // the rendered dashboard never exposes the API key; the copy
+            // button still copies the real claudeCodeCommand.
+            get claudeCodeCommandDisplay() {
+                return this._claudeCodeCommand(this.stats.api_key ? '••••••••' : '');
+            },
+
+            _claudeCodeCommand(authToken) {
                 const mode = this.globalSettings.claude_code.mode;
                 if (mode === 'cloud') {
                     return 'env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u API_TIMEOUT_MS -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC claude';
@@ -3826,8 +4323,8 @@
                 const haikuModel = this.globalSettings.claude_code.haiku_model || 'select-a-model';
                 const parts = [];
                 parts.push(this.shellEnvAssign('ANTHROPIC_BASE_URL', `http://${this.displayHost}:${port}`));
-                if (this.stats.api_key) {
-                    parts.push(this.shellEnvAssign('ANTHROPIC_AUTH_TOKEN', this.stats.api_key));
+                if (authToken) {
+                    parts.push(this.shellEnvAssign('ANTHROPIC_AUTH_TOKEN', authToken));
                 }
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_OPUS_MODEL', opusModel));
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_SONNET_MODEL', sonnetModel));
@@ -4313,6 +4810,7 @@
                             web_search_content_max_chars: this.globalSettings.integrations.web_search_content_max_chars,
                             splash_path: this.globalSettings.integrations.splash_path,
                             splash_kv_format: this.globalSettings.integrations.splash_kv_format,
+                            splash_activations: this.globalSettings.integrations.splash_activations,
                             splash_max_memory_gb: this.globalSettings.integrations.splash_max_memory_gb,
                             splash_ssd_cache_gb: this.globalSettings.integrations.splash_ssd_cache_gb,
                             splash_ane_prefill: this.globalSettings.integrations.splash_ane_prefill,
@@ -4341,9 +4839,48 @@
                 return usable ? usable.id : '';
             },
 
+            isGgufModel() {
+                return this.modelSettings.model_format === 'gguf';
+            },
+
+            // A GGUF runs on an external engine even when its settings pick none.
+            effectiveExternalEngine() {
+                if (this.modelSettings.external_engine) return this.modelSettings.external_engine;
+                if (!this.isGgufModel()) return '';
+                return this.firstUsableExternalEngine() || this.modelSettings.external_engines?.[0]?.id || '';
+            },
+
+            externalEngineDraftRepo() {
+                const engines = this.modelSettings.external_engines || [];
+                const engine = engines.find(e => e.id === this.effectiveExternalEngine()) || engines[0];
+                return engine && !engine.compatible ? engine.draft_repo || '' : '';
+            },
+
+            async downloadEngineDraft() {
+                const repoId = this.externalEngineDraftRepo();
+                if (!repoId) return;
+                try {
+                    const response = await fetch('/admin/api/hf/download', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ repo_id: repoId, hf_token: this.hfToken }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        alert(data.detail || window.t('js.error.start_download_failed'));
+                        return;
+                    }
+                    alert(window.t('js.success.download_started').replace('{repo_id}', repoId));
+                    await this.loadHFTasks();
+                    this.startHFRefresh();
+                } catch (err) {
+                    alert(window.t('js.error.hf_connect_failed'));
+                }
+            },
+
             externalEngineReason() {
                 const engines = this.modelSettings.external_engines || [];
-                const selected = engines.find(e => e.id === this.modelSettings.external_engine);
+                const selected = engines.find(e => e.id === this.effectiveExternalEngine());
                 if (selected) return selected.compatible ? '' : selected.reason;
                 return engines.some(e => e.compatible) ? '' : (engines[0]?.reason || '');
             },
@@ -4520,11 +5057,15 @@
             async clearSsdCache() {
                 try {
                     const resp = await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
-                    if (!resp.ok) console.error('SSD cache clear failed:', resp.status);
+                    if (!resp.ok) {
+                        const data = await resp.json();
+                        throw new Error(data.detail || window.t('js.error.clear_ssd_cache_failed'));
+                    }
                     this.showClearSsdCacheConfirm = false;
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear SSD cache:', err);
+                    alert(err.message || window.t('js.error.clear_ssd_cache_failed'));
                     this.showClearSsdCacheConfirm = false;
                 }
             },
@@ -4689,11 +5230,12 @@
 
             get activeModelsPressureBarColor() {
                 const pct = this.activeModelsPressurePercent;
-                if (pct >= 90) return 'rgb(var(--palette-red-500))';
-                if (pct >= 80) return 'rgb(var(--palette-orange-500))';
-                if (pct >= 70) return 'rgb(var(--palette-amber-500))';
-                if (pct >= 60) return 'rgb(var(--palette-yellow-400))';
-                return 'rgb(var(--palette-green-500))';
+                if (pct >= 90) return 'var(--danger)';
+                // custom_theme.js sets --meter-high/--meter-mid only for custom status roles.
+                if (pct >= 80) return 'var(--meter-high, rgb(var(--palette-orange-500)))';
+                if (pct >= 70) return 'var(--warning)';
+                if (pct >= 60) return 'var(--meter-mid, rgb(var(--palette-yellow-400)))';
+                return 'var(--success)';
             },
 
             get activeModelsPressureBarStyle() {
@@ -4868,8 +5410,8 @@
 
             // Optional accuracy-only floor for per-question max_tokens.
             // Returns null when unset; throws on invalid input.
-            parseAccuracyMaxTokens() {
-                const raw = this.accExternalMaxTokens.trim();
+            parseAccuracyMaxTokens(input) {
+                const raw = input.trim();
                 if (!raw) return null;
                 const value = Number(raw);
                 if (!Number.isInteger(value) || value < 1 || value > 1000000) {
@@ -4882,7 +5424,7 @@
                 const body = this.externalRequestBody();
                 const extraBody = this.parseAccuracyExtraBody();
                 if (Object.keys(extraBody).length > 0) body.extra_body = extraBody;
-                const maxTokens = this.parseAccuracyMaxTokens();
+                const maxTokens = this.parseAccuracyMaxTokens(this.accExternalMaxTokens);
                 if (maxTokens !== null) body.max_tokens_override = maxTokens;
                 return body;
             },
@@ -5214,6 +5756,12 @@
                 if (capped === 'target') return window.t('ctx_bench.capped.target');
                 if (capped === 'native') return window.t('ctx_bench.capped.native');
                 return window.t('ctx_bench.capped.memory');
+            },
+
+            // A model's GPU power limit; benchmarks always run without it.
+            benchGpuPowerLimit(modelId) {
+                const m = this.models.find(m => m.id === modelId);
+                return m?.settings?.gpu_power_limit_w || 0;
             },
 
             // Native context length of the selected bench model (0 = unknown).
@@ -5552,6 +6100,17 @@
                 return window.t(keys[profile] || keys.code_python);
             },
 
+            benchUploadSkippedLabel(reason) {
+                const keys = {
+                    external_endpoint: 'bench.upload_skipped.reason_external',
+                    splash: 'bench.upload_skipped.reason_splash',
+                    ane_aligned_prompt: 'bench.upload_skipped.reason_ane_aligned_prompt',
+                    custom_generation_length: 'bench.upload_skipped.reason_custom_generation_length',
+                    lora_adapter: 'bench.upload_skipped.reason_lora_adapter',
+                };
+                return window.t(keys[reason] || 'bench.upload_skipped.reason_default');
+            },
+
             // User clicked "View live" on the banner — clear the stale
             // result display, attach to the active run. The replay-on-
             // subscribe stream re-delivers every event so the new bench
@@ -5723,6 +6282,7 @@
 
             async addToAccQueue() {
                 let externalRequest = null;
+                let maxTokensOverride = null;
                 if (this.accExternalEnabled) {
                     if (!this.externalConfigValid()) {
                         this.accError = window.t('js.error.external_endpoint_required');
@@ -5736,6 +6296,14 @@
                     }
                 } else if (!this.accModelId) {
                     return;
+                } else {
+                    try {
+                        maxTokensOverride = this.parseAccuracyMaxTokens(this.accMaxTokens);
+                    } catch (err) {
+                        this.accAdvancedOptionsOpen = true;
+                        this.accError = err.message;
+                        return;
+                    }
                 }
                 const selected = Object.entries(this.accBenchmarks)
                     .filter(([_, v]) => v)
@@ -5756,6 +6324,7 @@
                             batch_size: this.accBatchSize,
                             enable_thinking: this.accExternalEnabled ? false : this.accEnableThinking,
                             sampling_profile: this.accSamplingProfile,
+                            max_tokens_override: maxTokensOverride,
                             external: externalRequest,
                         }),
                     });
@@ -6010,8 +6579,8 @@
                         window.t('acc_bench.results.text_export.model')
                             .replace('{model}', () => m)
                     );
-                    lines.push(rpad(window.t('acc_bench.results.text_export.benchmark'), 16) + pad(window.t('acc_bench.results.text_export.accuracy'), 10) + pad(window.t('acc_bench.results.text_export.correct'), 10) + pad(window.t('acc_bench.results.text_export.total'), 8) + pad('Time(s)', 10) + pad(window.t('acc_bench.results.text_export.think'), 8));
-                    lines.push('-'.repeat(62));
+                    lines.push(rpad(window.t('acc_bench.results.text_export.benchmark'), 16) + pad(window.t('acc_bench.results.text_export.accuracy'), 10) + pad(window.t('acc_bench.results.text_export.correct'), 10) + pad(window.t('acc_bench.results.text_export.total'), 8) + pad('Time(s)', 10) + pad(window.t('acc_bench.results.text_export.think'), 8) + pad('MaxTok', 9));
+                    lines.push('-'.repeat(71));
                     for (const r of this.accAllResults.filter(r => r.model_id === m)) {
                         lines.push(
                             rpad(r.benchmark.toUpperCase(), 16) +
@@ -6021,7 +6590,8 @@
                             pad(r.time_s, 10) +
                             pad(r.thinking_used
                                 ? window.t('acc_bench.results.text_export.yes')
-                                : window.t('acc_bench.results.text_export.no'), 8)
+                                : window.t('acc_bench.results.text_export.no'), 8) +
+                            pad(r.external ? '-' : (r.max_tokens || '-'), 9)
                         );
                         if (r.external) {
                             lines.push(
@@ -6078,6 +6648,7 @@
                         total: r.total,
                         time_s: r.time_s,
                         thinking_used: r.thinking_used || false,
+                        max_tokens: r.max_tokens,
                         category_scores: r.category_scores || null,
                         questions: qr,
                     };
@@ -6929,6 +7500,371 @@
                 }
             },
 
+            // =================================================================
+            // Custom theme
+            // =================================================================
+            initCustomThemeEditor() {
+                if (this._customThemeReady) return;
+                this._customThemeReady = true;
+                this.customThemeDefaults = window.OmlxCustomTheme.defaults();
+                this.fillCustomThemeDraft();
+            },
+
+            fillCustomThemeDraft(theme = this.customThemeStored) {
+                const draft = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        draft[mode][token] = theme[mode]?.[token]
+                            || this.customThemeDefaults[mode][token] || '';
+                    }
+                }
+                this.customThemeDraft = draft;
+            },
+
+            get customThemeActive() {
+                return ['light', 'dark'].some(mode => Object.keys(this.customThemeStored[mode]).length > 0);
+            },
+
+            themeTokenValid(mode, token) {
+                return window.OmlxCustomTheme.normalizeHex(this.customThemeDraft[mode]?.[token]) !== null;
+            },
+
+            themeTokenColor(mode, token) {
+                return window.OmlxCustomTheme.normalizeHex(this.customThemeDraft[mode]?.[token])
+                    || this.customThemeDefaults[mode][token] || '#000000';
+            },
+
+            themeTokenChanged(mode, token) {
+                return this.themeTokenColor(mode, token) !== this.customThemeDefaults[mode][token];
+            },
+
+            customThemeOverrides() {
+                const overrides = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        const color = this.themeTokenColor(mode, token);
+                        if (color !== this.customThemeDefaults[mode][token]) overrides[mode][token] = color;
+                    }
+                }
+                return overrides;
+            },
+
+            get customThemeDirty() {
+                return JSON.stringify(this.customThemeOverrides()) !== JSON.stringify(this.customThemeStored);
+            },
+
+            get customThemeInputsValid() {
+                return ['light', 'dark'].every(mode =>
+                    window.OmlxCustomTheme.TOKENS.every(token => this.themeTokenValid(mode, token)))
+                    && this.themeContrastFailures.length === 0;
+            },
+
+            // Column chrome uses stock colors so editing a surface never flips a column.
+            themeModeColor(mode, token) {
+                const stock = this.customThemeDefaults[mode] && this.customThemeDefaults[mode][token];
+                return stock || this.themeTokenColor(mode, token);
+            },
+
+            themeModeHeadStyle(mode) {
+                const color = token => this.themeModeColor(mode, token);
+                return `background:${color('bg-primary')}; border-color:${color('border-normal')}; color:${color('text-secondary')};`;
+            },
+
+            themeModeCellStyle(mode, surface = 'bg-primary') {
+                const color = token => this.themeModeColor(mode, token);
+                return `--theme-cell-bg:${color('bg-primary')}; --theme-cell-fg:${color('text-primary')};`
+                    + ` --theme-cell-border:${color('border-normal')}; --theme-cell-placeholder:${color('text-muted')};`
+                    + ` --theme-cell-surface:${color(surface)}; --theme-cell-line:${color('border-faint')};`
+                    + ` --theme-cell-icon:${color('text-tertiary')}; --theme-cell-icon-hover:${color('text-primary')};`
+                    + ` --theme-cell-hover:${color('bg-tertiary')}; --theme-cell-ring:${color('focus-ring-color')};`;
+            },
+
+            // Tokens plus badge parts as opaque hex; read by the preview and the contrast checks.
+            themeDrawColors(mode) {
+                const api = window.OmlxCustomTheme;
+                const stock = this.customThemeDefaults[mode];
+                const colors = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor(mode, token)]));
+                const page = colors['bg-primary'];
+                for (const status of api.STATUS) {
+                    const badge = colors[status] === stock[status]
+                        ? Object.fromEntries(['soft', 'line', 'text'].map(part => [part, api.flatten(stock[`${status}-${part}`], page)]))
+                        : api.badgeColors(mode, colors[status], page);
+                    for (const [part, color] of Object.entries(badge)) colors[`${status}-${part}`] = color;
+                }
+                return colors;
+            },
+
+            // The only contrast check: the server stores any #rrggbb it gets.
+            themeContrastChecks(mode) {
+                return window.OmlxCustomTheme.contrastChecks(this.themeDrawColors(mode));
+            },
+
+            // The lowest failing pair per foreground, in both modes, with the token to fix.
+            get themeContrastFailures() {
+                return ['light', 'dark'].flatMap(mode => {
+                    const lowest = {};
+                    for (const check of this.themeContrastChecks(mode)) {
+                        if (!check.ok && !(lowest[check.foreground]?.ratio <= check.ratio)) lowest[check.foreground] = check;
+                    }
+                    // A status badge's text is derived; its status color is the field to change.
+                    const field = token => window.OmlxCustomTheme.STATUS.find(status => token === `${status}-text`) || token;
+                    return Object.values(lowest).map(check => ({ ...check, mode, token: field(check.foreground) }));
+                });
+            },
+
+            themeContrastLabel(token) {
+                const status = token.match(/^(\w+)-(soft|text)$/);
+                if (status && window.OmlxCustomTheme.STATUS.includes(status[1])) {
+                    return window.t(`settings.theme.contrast.badge_${status[2]}`)
+                        .replace('{status}', window.t(`settings.theme.token.${status[1]}`));
+                }
+                return window.t(`settings.theme.token.${token}`);
+            },
+
+            themeContrastMessage(failure) {
+                return window.t('settings.theme.contrast.pair')
+                    .replace('{mode}', window.t(`settings.theme.${failure.mode}`))
+                    .replace('{foreground}', this.themeContrastLabel(failure.foreground))
+                    .replace('{background}', this.themeContrastLabel(failure.background))
+                    .replace('{ratio}', failure.ratio.toFixed(2))
+                    .replace('{floor}', String(failure.floor));
+            },
+
+            themeTokenFlagged(mode, token) {
+                return !this.themeTokenValid(mode, token) || this.themeContrastFailures
+                    .some(failure => failure.mode === mode && failure.token === token);
+            },
+
+            normalizeThemeInput(mode, token) {
+                const text = String(this.customThemeDraft[mode][token] ?? '').trim();
+                if (!text) {
+                    this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
+                    return;
+                }
+                const hex = window.OmlxCustomTheme.normalizeHex(text);
+                if (hex) this.customThemeDraft[mode][token] = hex;
+            },
+
+            resetThemeToken(mode, token) {
+                this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
+            },
+
+            // Redrawn by x-effect whenever a color it reads changes, and on resize.
+            drawThemePreview(canvas, mode) {
+                const preview = window.OmlxThemePreview;
+                if (!canvas._resize) {
+                    canvas._resize = new ResizeObserver(() => this.drawThemePreview(canvas, mode));
+                    canvas._resize.observe(canvas);
+                }
+                const status = Object.fromEntries(window.OmlxCustomTheme.STATUS.map(name => [name, window.t(`settings.theme.token.${name}`)]));
+                canvas._regions = preview.drawPreview(canvas, this.themeDrawColors(mode), {
+                    mode,
+                    sans: getComputedStyle(document.body).fontFamily,
+                    hover: canvas._hover,
+                    labels: {
+                        ...preview.LABELS,
+                        version: canvas.dataset.version,
+                        heading: window.t('settings.theme.heading'),
+                        subtitle: window.t('settings.theme.preview_subtitle'),
+                        port: window.t('settings.theme.preview_port'),
+                        link: window.t('settings.theme.preview_link'),
+                        danger: window.t('settings.theme.preview_danger'),
+                        hover: window.t('settings.theme.preview_hover'),
+                        save: window.t('settings.save.button'),
+                        tabStatus: window.t('navbar.tab.status'),
+                        tabSettings: window.t('navbar.tab.settings'),
+                        status,
+                    },
+                });
+            },
+
+            themePreviewRegion(canvas, event) {
+                const scale = window.OmlxThemePreview.CARD_W / canvas.clientWidth;
+                return window.OmlxThemePreview.regionAt(canvas._regions || [], event.offsetX * scale, event.offsetY * scale);
+            },
+
+            hoverThemePreview(canvas, mode, event) {
+                const region = event && this.themePreviewRegion(canvas, event);
+                if (region === canvas._hover) return;
+                canvas._hover = region;
+                canvas.style.cursor = region ? 'pointer' : '';
+                this.drawThemePreview(canvas, mode);
+            },
+
+            focusThemeToken(mode, event) {
+                const token = this.themePreviewRegion(event.currentTarget, event)?.[4];
+                const field = token && document.getElementById(`theme-token-${mode}-${token}`);
+                if (!field) return;
+                field.focus();
+                field.select();
+            },
+
+            async saveCustomTheme(overrides) {
+                const api = window.OmlxCustomTheme;
+                const theme = api.sanitize(overrides);
+                this.customThemeSaving = true;
+                this.customThemeError = '';
+                this.customThemeSaved = false;
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ui_custom_theme: api.isEmpty(theme) ? null : theme }),
+                    });
+                    if (!response.ok) throw new Error(await response.text() || response.statusText);
+                    const clean = api.apply(theme);
+                    this.customThemeStored = clean;
+                    window._customTheme = api.isEmpty(clean) ? null : clean;
+                    this.fillCustomThemeDraft();
+                    return true;
+                } catch (error) {
+                    this.customThemeError = window.t('settings.theme.save_failed');
+                    console.error('Failed to save custom theme:', error);
+                    return false;
+                } finally {
+                    this.customThemeSaving = false;
+                }
+            },
+
+            async applyCustomTheme() {
+                if (!this.customThemeInputsValid) return;
+                if (!(await this.saveCustomTheme(this.customThemeOverrides()))) return;
+                this.customThemeSaved = true;
+                clearTimeout(this._customThemeSavedTimer);
+                this._customThemeSavedTimer = setTimeout(() => { this.customThemeSaved = false; }, 2500);
+            },
+
+            discardCustomThemeDraft() {
+                this.customThemeError = '';
+                this.fillCustomThemeDraft();
+            },
+
+            // Fills the dark fields only; Apply still runs the contrast check.
+            generateDarkCustomTheme() {
+                const api = window.OmlxCustomTheme;
+                const light = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor('light', token)]));
+                this.customThemeDraft.dark = api.darkFromLight(light);
+            },
+
+            // The full palette, so an agent sees every token, not only the overrides.
+            async copyCustomThemeJson() {
+                const theme = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        theme[mode][token] = this.themeTokenColor(mode, token);
+                    }
+                }
+                this.customThemeJson = JSON.stringify(theme, null, 2);
+                this.customThemeJsonError = '';
+                this.customThemeJsonCopied = false;
+                this.customThemeJsonCopyBlocked = false;
+                try {
+                    await navigator.clipboard.writeText(this.customThemeJson);
+                    this.customThemeJsonCopied = true;
+                    clearTimeout(this._customThemeJsonCopiedTimer);
+                    this._customThemeJsonCopiedTimer = setTimeout(() => { this.customThemeJsonCopied = false; }, 2000);
+                } catch (error) {
+                    // Plain-http LAN access has no clipboard; leave the JSON selected instead.
+                    console.debug('Clipboard unavailable:', error);
+                    this.customThemeJsonCopyBlocked = true;
+                    this.$nextTick(() => {
+                        this.$refs.customThemeJsonField.focus();
+                        this.$refs.customThemeJsonField.select();
+                    });
+                }
+            },
+
+            // Fills the fields only; Apply still runs the contrast check.
+            async loadThemeImage(event) {
+                const file = event.target.files?.[0];
+                event.target.value = '';
+                if (!file) return;
+                const preview = window.OmlxThemePreview;
+                const api = window.OmlxCustomTheme;
+                this.themeImageError = '';
+                let theme = null;
+                try {
+                    theme = api.sanitize(JSON.parse(preview.readTextChunk(new Uint8Array(await file.arrayBuffer()), preview.KEYWORD)));
+                } catch (error) {
+                    console.debug('No theme in the image:', error);
+                }
+                if (!theme || api.isEmpty(theme)) {
+                    this.themeImageError = window.t('settings.theme.image_no_theme');
+                    return;
+                }
+                this.fillCustomThemeDraft(theme);
+            },
+
+            async saveThemePreviewImage(version) {
+                if (this.themeImageBusy) return;
+                this.themeImageError = '';
+                this.themeImageBusy = true;
+                try {
+                    // The image uses Inter in every UI language, so load it before drawing.
+                    if (document.fonts?.load) {
+                        await Promise.all([300, 400, 500, 600, 700, 800].map(weight =>
+                            document.fonts.load(`${weight} 11px Inter`).catch(() => {})));
+                    }
+                    if (document.fonts?.ready) await document.fonts.ready;
+                    const blob = await window.OmlxThemePreview.png({
+                        theme: { light: this.themeDrawColors('light'), dark: this.themeDrawColors('dark') },
+                        groups: window.OmlxCustomTheme.GROUPS,
+                        version,
+                    });
+                    const link = document.createElement('a');
+                    const now = new Date();
+                    const pad = value => String(value).padStart(2, '0');
+                    const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}`;
+                    link.href = URL.createObjectURL(blob);
+                    link.download = `omlx-theme-${stamp}.png`;
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+                } catch (error) {
+                    console.error('Failed to save the theme image:', error);
+                    this.themeImageError = window.t('settings.theme.image_failed');
+                } finally {
+                    this.themeImageBusy = false;
+                }
+            },
+
+            // Overwrites only the tokens in the JSON; Apply still runs the contrast check.
+            importCustomThemeJson() {
+                const api = window.OmlxCustomTheme;
+                let clean;
+                try {
+                    clean = api.sanitize(JSON.parse(this.customThemeJson));
+                } catch (error) {
+                    clean = { light: {}, dark: {} };
+                }
+                if (api.isEmpty(clean)) {
+                    this.customThemeJsonError = window.t('settings.theme.json.invalid');
+                    return;
+                }
+                this.customThemeJsonError = '';
+                this.customThemeJsonCopyBlocked = false;
+                for (const mode of ['light', 'dark']) Object.assign(this.customThemeDraft[mode], clean[mode]);
+            },
+
+            resetCustomTheme() {
+                this.showCustomThemeRestoreConfirm = true;
+            },
+
+            cancelCustomThemeRestore() {
+                this.showCustomThemeRestoreConfirm = false;
+            },
+
+            async confirmCustomThemeRestore() {
+                this.showCustomThemeRestoreConfirm = false;
+                await this.saveCustomTheme(null);
+            },
+
+            openCustomThemeSettings() {
+                this.setSettingsTab('theme');
+                window.scrollTo({ top: 0 });
+            },
+
             applyTheme() {
                 // Clean up existing listener
                 if (this.systemThemeListener) {
@@ -6979,7 +7915,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_failed')));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.save_failed'));
                     }
                 } catch (err) {
                     console.error('Failed to save HF mirror endpoint:', err);
@@ -6992,8 +7928,44 @@
             // HuggingFace Downloader Functions
             // =================================================================
 
-            async startHFDownload() {
-                const repoId = this.hfRepoId.trim();
+            // Convert Hugging Face and configured mirror model URLs to owner/repo ids.
+            // Leave plain repository IDs and other input unchanged for model lookup.
+            hfRepoIdFromInput(value) {
+                const raw = String(value ?? '').trim();
+                const officialLink = /^(?:(?:https?:)?\/\/)?(?:www\.)?(?:huggingface\.co|hf\.co)\/([^/?#\s]+\/[^/?#\s]+)/i;
+                const officialMatch = raw.match(officialLink);
+                if (officialMatch) return officialMatch[1];
+
+                const endpoint = String(this.globalSettings?.huggingface?.endpoint ?? '').trim();
+                if (endpoint) {
+                    try {
+                        const mirror = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(endpoint)
+                            ? endpoint : `https://${endpoint}`);
+                        const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                        const prefix = mirror.pathname.split('/').filter(Boolean).map(escape).join('/');
+                        const pathPrefix = prefix ? `(?:${prefix}/)?` : '';
+                        const mirrorLink = new RegExp(
+                            `^(?:(?:https?:)?//)?(?:www\\.)?${escape(mirror.host)}/${pathPrefix}([^/?#\\s]+/[^/?#\\s]+)`,
+                            'i',
+                        );
+                        const mirrorMatch = raw.match(mirrorLink);
+                        if (mirrorMatch) return mirrorMatch[1];
+                    } catch {
+                        // Ignore invalid mirror settings and keep the official hosts.
+                    }
+                }
+                return raw;
+            },
+
+            startHFDownload() {
+                const repoId = this.hfRepoIdFromInput(this.hfRepoId);
+                if (!repoId) return;
+                this.hfRepoId = repoId;
+                this.openModelDetail(repoId, 'files');
+            },
+
+            async submitHFDownload(files) {
+                const repoId = this.hfModelDetail?.repo_id;
                 if (!repoId) return;
 
                 this.hfError = '';
@@ -7009,13 +7981,17 @@
                         body: JSON.stringify({
                             repo_id: repoId,
                             hf_token: this.hfToken,
+                            files,
                         }),
                         signal: controller.signal,
                     });
 
                     if (response.ok) {
+                        const { [repoId.toLowerCase()]: _done, ...updates } = this.hfUpdates;
+                        this.hfUpdates = updates;
                         this.hfSuccess = window.t('js.success.download_started').replace('{repo_id}', repoId);
-                        this.hfRepoId = '';
+                        if (this.hfRepoId.trim().toLowerCase() === repoId.toLowerCase()) this.hfRepoId = '';
+                        this.closeModelDetail();
                         await this.loadHFTasks();
                         this.startHFRefresh();
                         setTimeout(() => { this.hfSuccess = ''; }, 5000);
@@ -7077,6 +8053,61 @@
                     }
                 } catch (err) {
                     console.error('Failed to load HF models:', err);
+                }
+            },
+
+            // Folders the downloader writes, which an update check can compare.
+            get hfUpdateRepoIds() {
+                return this.hfModels
+                    .filter(m => m.repo_id && m.source_type === 'local')
+                    .map(m => m.repo_id);
+            },
+
+            hfUpdateFor(model) {
+                if (!model.repo_id || !this.isModelDownloaded(model.repo_id)) return null;
+                return this.hfUpdates[model.repo_id.toLowerCase()];
+            },
+
+            async checkHFUpdates() {
+                this.hfUpdatesChecking = true;
+                this.hfUpdatesStatus = '';
+                try {
+                    const response = await fetch('/admin/api/hf/updates', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ repo_ids: this.hfUpdateRepoIds, hf_token: this.hfToken }),
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    const data = response.ok ? await response.json() : null;
+                    if (!data || (data.checked && data.failed.length === data.checked)) {
+                        this.hfUpdatesStatus = window.t('models.manager.update_check_failed');
+                        return;
+                    }
+                    if (!data.checked) {
+                        this.hfUpdatesStatus = window.t('models.manager.nothing_to_check');
+                        return;
+                    }
+                    const updates = {};
+                    for (const [repoId, info] of Object.entries(data.updates)) {
+                        updates[repoId.toLowerCase()] = info;
+                    }
+                    this.hfUpdates = updates;
+                    const count = Object.keys(updates).length;
+                    const status = [count
+                        ? window.t('models.manager.updates_found').replace('{count}', count)
+                        : window.t('models.manager.no_updates')];
+                    if (data.failed.length) {
+                        status.push(window.t('models.manager.update_check_partial').replace('{count}', data.failed.length));
+                    }
+                    this.hfUpdatesStatus = status.join(' · ');
+                } catch (err) {
+                    this.hfUpdatesStatus = window.t('models.manager.update_check_failed');
+                    console.error('Failed to check for model updates:', err);
+                } finally {
+                    this.hfUpdatesChecking = false;
                 }
             },
 
@@ -7226,9 +8257,11 @@
                         preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
                         mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
                             ? this.oqMtpAssistantPath : '',
+                        preserve_ngram_table: this.oqPreservesNgram(),
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
+                        payload.hadamard = this.oqHadamardActive();
                         payload.imatrix_reuse_cache = this.oqeReuseImatrixCache;
                         payload.imatrix_cache_path = this.oqeImatrixCachePath.trim();
                         payload.imatrix_strict = this.oqeStrictImatrix;
@@ -7242,7 +8275,7 @@
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', 'oQ' + this.oqLevel + (this.oqEnhanced ? 'e' : ''));
+                        this.oqSuccess = window.t('models.oq.quantization_started').replace('{name}', name).replace('{model}', this.oqLevelLabel(this.oqLevel));
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
@@ -7373,6 +8406,10 @@
                 return model?.model_type || '';
             },
 
+            oqPreservesNgram() {
+                return this.oqSelectedModelType() === 'deepseek_v41' && this.oqPreserveNgram;
+            },
+
             oqAvailableLevels() {
                 return this.oqSelectedModelType() === 'deepseek_v41'
                     ? [2, 2.5, 2.7, 3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
@@ -7387,7 +8424,18 @@
             },
 
             oqLevelLabel(level) {
-                return `oQ${level}${this.oqEnhanced ? 'e' : ''}`;
+                return `oQ${level}${this.oqHadamardActive() ? 'h' : (this.oqEnhanced ? 'e' : '')}`;
+            },
+
+            oqSelectedModelSupportsOqh() {
+                const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
+                if (!model?.oqh_supported) return false;
+                // DeepSeek V4.1 takes oQh below oQ4 only.
+                return model.oqh_max_level == null || this.oqLevel < model.oqh_max_level;
+            },
+
+            oqHadamardActive() {
+                return this.oqEnhanced && this.oqHadamard && this.oqSelectedModelSupportsOqh();
             },
 
             oqSelectedModelIsVLM() {
@@ -7444,6 +8492,7 @@
                             model_path: this.oqSelectedModelPath,
                             oq_level: this.oqLevel,
                             preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp ? 'true' : 'false',
+                            preserve_ngram_table: this.oqPreservesNgram() ? 'true' : 'false',
                         });
                         const resp = await fetch(`/admin/api/oq/estimate?${params}`);
                         if (resp.ok) {
@@ -7616,7 +8665,7 @@
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
-                    const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
+                    const response = await fetch(`/admin/api/hf/recommended?model_format=${this.hfModelFormat}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
                         this.hfTokenInvalid = !!data.hf_token_invalid;
@@ -7652,9 +8701,19 @@
                 }
             },
 
+            // The GGUF model files a task fetches, shown beside its repo.
+            taskGgufFiles(task) {
+                return (task.gguf_files || []).join(', ');
+            },
+
+            // The model ID a finished download serves under.
+            taskModelId(task) {
+                return task.gguf_model_id || task.repo_id.split('/').pop();
+            },
+
+            // Every download picks its files in the detail modal first.
             downloadRecommended(repoId) {
-                this.hfRepoId = repoId;
-                this.startHFDownload();
+                this.openModelDetail(repoId, 'files');
             },
 
             isModelDownloaded(repoId) {
@@ -8028,7 +9087,7 @@
                         q: this.hfSearchQuery,
                         sort: this.hfSearchSort,
                         limit: '100',
-                        mlx_only: this.hfMlxOnly,
+                        model_format: this.hfModelFormat,
                     });
                     // Add filter parameters if set. Sizes use binary GiB to match
                     // _format_model_size on the backend.
@@ -8123,30 +9182,40 @@
             },
 
             // Model detail modal
-            async openModelDetail(repoId) {
+            async openModelDetail(repoId, tab = 'card') {
                 this.hfModelDetailLoading = true;
                 this.hfModelDetail = null;
+                this.hfDetailTab = tab;
+                this.hfSelectedFiles = {};
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
+                // A download still starts when the file list does not load.
+                const unavailable = (message) => {
+                    if (tab !== 'files') {
+                        this.hfError = message;
+                        setTimeout(() => { this.hfError = ''; }, 5000);
+                        return;
+                    }
+                    this.hfModelDetail = { repo_id: repoId, files: [], tags: [], layout: 'other',
+                                           downloads: 0, likes: 0, download_all_size: 0,
+                                           unavailable: message };
+                };
                 try {
                     const params = new URLSearchParams({ repo_id: repoId });
-                    const response = await fetch(`/admin/api/hf/model-info?${params}`, { signal: controller.signal });
+                    const headers = this.hfToken ? { 'X-HF-Token': this.hfToken } : {};
+                    const response = await fetch(`/admin/api/hf/model-info?${params}`, { headers, signal: controller.signal });
                     if (response.ok) {
                         this.hfModelDetail = await response.json();
+                        this.resetHfSelection();
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || window.t('js.error.fetch_model_info_failed');
-                        setTimeout(() => { this.hfError = ''; }, 5000);
+                        unavailable(data.detail || window.t('js.error.fetch_model_info_failed'));
                     }
                 } catch (err) {
-                    if (err.name === 'AbortError') {
-                        this.hfError = window.t('js.error.hf_timeout');
-                    } else {
-                        this.hfError = window.t('js.error.hf_connect_failed');
-                    }
-                    setTimeout(() => { this.hfError = ''; }, 5000);
+                    unavailable(err.name === 'AbortError'
+                        ? window.t('js.error.hf_timeout') : window.t('js.error.hf_connect_failed'));
                     console.error('Failed to fetch model info:', err);
                 } finally {
                     clearTimeout(timeoutId);
@@ -8159,6 +9228,82 @@
                 this.hfModelDetailLoading = false;
                 this.msModelDetail = null;
                 this.msModelDetailLoading = false;
+            },
+
+            // A selection starts from what "download all" fetches (nothing for GGUF repos) and changed local files.
+            resetHfSelection() {
+                const picked = {};
+                for (const file of this.hfModelDetail?.files || []) {
+                    if ((file.preselected || file.outdated) && !file.local) picked[file.name] = true;
+                }
+                this.hfSelectedFiles = picked;
+            },
+
+            isHfFileLocked(file) {
+                return file.required || file.local;
+            },
+
+            isHfFileSelected(file) {
+                return !file.local && (file.required || !!this.hfSelectedFiles[file.name]);
+            },
+
+            // A split GGUF's parts toggle together; a GGUF brings its vision projector.
+            toggleHfFile(file) {
+                if (this.isHfFileLocked(file)) return;
+                const files = this.hfModelDetail.files;
+                const on = !this.hfSelectedFiles[file.name];
+                const picked = { ...this.hfSelectedFiles };
+                const members = file.group ? files.filter(f => f.group === file.group) : [file];
+                for (const member of members) {
+                    if (!member.local) picked[member.name] = on;
+                }
+                const projector = on && file.mmproj && files.find(f => f.name === file.mmproj);
+                if (projector && !projector.local) picked[projector.name] = true;
+                this.hfSelectedFiles = picked;
+            },
+
+            hfSelectedNames() {
+                return (this.hfModelDetail?.files || [])
+                    .filter(file => this.isHfFileSelected(file))
+                    .map(file => file.name);
+            },
+
+            // A downloaded checkpoint with Hub changes offers Update instead of the download buttons.
+            hfShowsUpdate() {
+                const detail = this.hfModelDetail;
+                return !!(detail && !detail.unsupported_reason && detail.layout !== 'gguf'
+                    && detail.update_files?.length && this.isModelDownloaded(detail.repo_id));
+            },
+
+            hfUpdateSize() {
+                const names = new Set(this.hfModelDetail?.update_files || []);
+                return (this.hfModelDetail?.files || [])
+                    .filter(file => names.has(file.name))
+                    .reduce((total, file) => total + (file.size || 0), 0);
+            },
+
+            hfSelectionSize() {
+                return (this.hfModelDetail?.files || [])
+                    .filter(file => this.isHfFileSelected(file))
+                    .reduce((total, file) => total + (file.size || 0), 0);
+            },
+
+            // A split GGUF loads as one model: size the whole set.
+            hfFileSize(file) {
+                if (!file.group) return file.size || 0;
+                return this.hfModelDetail.files
+                    .filter(f => f.group === file.group)
+                    .reduce((total, f) => total + (f.size || 0), 0);
+            },
+
+            // What "download all" still has to fetch: its files not downloaded yet.
+            hfDownloadAllSize() {
+                return this.hfModelDetail?.download_all_size || 0;
+            },
+
+            hfFitsDisk(bytes) {
+                const free = this.hfModelDetail?.disk_free;
+                return !free || bytes <= free;
             },
 
             formatFileSize(bytes) {

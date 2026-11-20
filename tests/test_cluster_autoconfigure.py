@@ -674,6 +674,10 @@ def test_head_count_is_read_from_the_model_config(tmp_path):
             "model_type": "llama",  # a real mlx-lm module that implements shard()
             "hidden_size": 4096,
             "num_attention_heads": 32,
+            "num_hidden_layers": 2,
+            "intermediate_size": 11008,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 32000,
         })
     )
     header = {
@@ -762,7 +766,7 @@ def test_automatic_never_falls_back_to_an_unsupported_pipeline():
         supports_pipeline=False,
     )
 
-    with pytest.raises(PlanningError, match="no tensor-parallel degree"):
+    with pytest.raises(PlanningError, match="Detected link: ethernet at 10 Gb/s"):
         choose_parallelism(
             unsupported,
             _nodes(2),
@@ -1446,7 +1450,7 @@ def test_a_mac_without_rdma_is_named_so_the_fallback_to_ring_is_explainable():
     assert not matrix.ok
     assert matrix.rows == ()
     assert "studio.local" in matrix.reason
-    assert "Recovery" in matrix.reason
+    assert "rdma_ctl status" in matrix.reason
 
 
 def test_hosts_that_only_share_the_lan_do_not_get_a_silent_rdma_matrix():

@@ -39,9 +39,11 @@ final class ModelSettingsScreenVM {
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
         case enableThinking, ssdNgramOffload
-        case deepseekV41CedPrefill, qwen4GdnDecodeWideProj
+        case deepseekV41CedPrefill, qwen4GdnDecodeWideProj, activationFp16
+        case prefillHelper
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
+        case limitGpuPower, gpuPowerLimitWatts
         case forceSampling, isPinned, isFavorite
         case trustRemoteCode, externalEngine
         case embeddingAudioEnabled, embeddingAudioMaxSeconds
@@ -49,7 +51,7 @@ final class ModelSettingsScreenVM {
         case chatTemplateKwargs
         case turboquantKvEnabled, turboquantKvScheme, turboquantKvBits
         case qwen35AnePrefillSharedFraction
-        case qwen35OqA8Enabled, qwen35OqA8MinTokens
+        case a8PrefillEnabled, a8PrefillMinTokens
         case qwen35AnePrefillEnabled, qwen35AnePrefillSequenceLength
         case qwen35AnePrefillTailPaddingMinTokens
         case qwen35AnePrefillFraction, qwen35AnePrefillMaxLayers
@@ -66,6 +68,7 @@ final class ModelSettingsScreenVM {
         case dflashVerifyMode, dflashDraftWindowSize, dflashBlockSize
         case mtpEnabled, mtpAdaptiveMaxDepth
         case vlmMtpEnabled, vlmMtpDraftModel, vlmMtpDraftBlockSize
+        case loraAdapter
     }
 
     static var modelTypeOptions: [(String, String)] {
@@ -263,7 +266,20 @@ final class ModelSettingsScreenVM {
     var deepseekV41EngramSsdOffloadSupported: Bool = false
     var deepseekV41EngramSsdOffloadForced: Bool = false
     var deepseekV41CedPrefillEnabled: Bool = false
+    // Prefill Accelerator: per model, outside profiles, saved on change.
+    var prefillHelperSupported: Bool = false
+    /// Node id of the helper Mac; empty is off.
+    var prefillHelperNodeID: String = ""
+    /// Layers on the helper; nil splits by measured speed.
+    var prefillHelperLayers: Int? = nil
+    var prefillHelperCandidates: [PrefillHelperCandidatesDTO.Device] = []
+    var prefillHelperCandidatesLoading: Bool = false
+    /// False while the server's cluster setting is off (no pairing to use).
+    var prefillHelperAvailable: Bool = true
+    var prefillHelperStatus: PrefillHelperStatusDTO? = nil
+    var prefillHelperBusy: Bool = false
     var qwen4GdnDecodeWideProj: Bool = false
+    var activationFp16Enabled: Bool = false
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -272,6 +288,8 @@ final class ModelSettingsScreenVM {
     /// sensible number instead of zero (which the server interprets as
     /// "disabled").
     var toolResultLimitTokens: String = "4096"
+    var limitGpuPower: Bool = false
+    var gpuPowerLimitWatts: String = "10"
     var forceSampling: Bool = false
     var isPinned: Bool = false
     var isFavorite: Bool = false
@@ -281,6 +299,14 @@ final class ModelSettingsScreenVM {
 
     /// External engine serving the model; empty runs it in-process.
     var externalEngine: String = ""
+
+    /// The engine that serves the model: the setting, or for a GGUF, which
+    /// only an external engine runs, the first engine that can serve it.
+    var effectiveExternalEngine: String {
+        guard externalEngine.isEmpty, model?.isGGUF == true else { return externalEngine }
+        let engines = model?.externalEngines ?? []
+        return engines.first(where: { $0.compatible })?.id ?? engines.first?.id ?? ""
+    }
 
     // Embedding audio tower. Empty seconds keeps the 30 s processor default.
     var embeddingAudioEnabled: Bool = false
@@ -312,8 +338,8 @@ final class ModelSettingsScreenVM {
     // layout to choose: the kernel reads the checkpoint's own packed weight
     // stream, so it is both the fastest option and the one that costs no extra
     // memory. The tile is picked per bit width by the dispatcher.
-    var qwen35OqA8Enabled: Bool = false
-    var qwen35OqA8MinTokens: String = "128"
+    var a8PrefillEnabled: Bool = false
+    var a8PrefillMinTokens: String = "128"
 
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill.
     // These defaults are the measured M3 Ultra optimum for the 2,048-token
@@ -383,6 +409,10 @@ final class ModelSettingsScreenVM {
     var vlmMtpEnabled: Bool = false
     var vlmMtpDraftModel: String = ""
     var vlmMtpDraftBlockSize: String = ""
+
+    // LoRA adapter folder (empty = none) and the adapters the server found.
+    var loraAdapter: String = ""
+    var loraAdapters: [LoRAAdapterDTO] = []
 
     // Profiles
     var profiles: [ProfileDTO] = []
@@ -469,6 +499,9 @@ final class ModelSettingsScreenVM {
     /// Embedding requests without max_length truncate input to the context window.
     var showsEmbeddingContextWindow: Bool { model?.modelType == "embedding" }
 
+    /// Rerank requests without max_length use the context window as their limit.
+    var showsRerankerContextWindow: Bool { model?.modelType == "reranker" }
+
     /// Acceleration, Memory Saving and Experimental only apply to the MLX
     /// LLM engines.
     var showsEnginePages: Bool { isLLMLike && !isDiffusionModel }
@@ -536,23 +569,31 @@ final class ModelSettingsScreenVM {
     }
 
     var embeddingAudioSupported: Bool { model?.embeddingAudioSupported == true }
+    var gpuPowerLimitSupported: Bool { model?.gpuPowerLimitSupported == true }
+    /// The watt value when it is in the range the server accepts.
+    private var validGpuPowerLimitWatts: Int? {
+        Int(gpuPowerLimitWatts).flatMap { (2...1000).contains($0) ? $0 : nil }
+    }
 
     private func isDiffusionUnsupportedField(_ field: Field) -> Bool {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
         case .enableThinking, .ssdNgramOffload,
-             .deepseekV41CedPrefill, .qwen4GdnDecodeWideProj,
+             .deepseekV41CedPrefill, .qwen4GdnDecodeWideProj, .activationFp16,
+             .prefillHelper,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
             return true
+        case .limitGpuPower, .gpuPowerLimitWatts:
+            return false
         case .forceSampling, .reasoningParser:
             return true
         case .turboquantKvEnabled, .turboquantKvScheme, .turboquantKvBits:
             return true
         case .qwen35AnePrefillSharedFraction,
-             .qwen35OqA8Enabled, .qwen35OqA8MinTokens:
+             .a8PrefillEnabled, .a8PrefillMinTokens:
             return true
         case .qwen35AnePrefillEnabled, .qwen35AnePrefillSequenceLength,
              .qwen35AnePrefillTailPaddingMinTokens:
@@ -582,7 +623,7 @@ final class ModelSettingsScreenVM {
             return true
         case .mtpEnabled, .mtpAdaptiveMaxDepth, .vlmMtpEnabled, .vlmMtpDraftModel:
             return true
-        case .vlmMtpDraftBlockSize:
+        case .vlmMtpDraftBlockSize, .loraAdapter:
             return true
         case .alias, .modelType, .contextLength, .maxTokens:
             return false
@@ -681,6 +722,8 @@ final class ModelSettingsScreenVM {
             let profiles = try await client.listModelProfiles(id: modelID).profiles
             let templates = try await client.listProfileTemplates().templates
             let defaults = try await client.getGlobalSettings().sampling
+            // Optional: a server without the endpoint lists no adapters.
+            let adapters = (try? await client.listLoRAAdapters(id: modelID))?.adapters ?? []
             guard sequence == loadSequence else { return }
             if preservingEdits && profileDirty { return }
             self.allModels = models
@@ -715,8 +758,14 @@ final class ModelSettingsScreenVM {
                     m.deepseekV41EngramSsdOffloadSupported ?? false
                 self.deepseekV41EngramSsdOffload = self.deepseekV41EngramSsdOffloadForced
                     || (s?.deepseekV41EngramSsdOffload ?? false)
-                self.deepseekV41CedPrefillEnabled = s?.deepseekV41CedPrefillEnabled ?? false
+                // Unset means on; only a saved false is off.
+                self.deepseekV41CedPrefillEnabled = s?.deepseekV41CedPrefillEnabled ?? true
+                self.prefillHelperSupported = m.prefillHelperSupported ?? false
+                self.prefillHelperNodeID = s?.prefillHelperNodeId ?? ""
+                self.prefillHelperLayers = s?.prefillHelperLayers
+                self.prefillHelperStatus = m.prefillHelper
                 self.qwen4GdnDecodeWideProj = s?.qwen4GdnDecodeWideProj ?? false
+                self.activationFp16Enabled = s?.activationFp16Enabled ?? false
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -724,6 +773,13 @@ final class ModelSettingsScreenVM {
                     self.toolResultLimitTokens = String(n)
                 } else {
                     self.toolResultLimitTokens = "4096"
+                }
+                if let watts = s?.gpuPowerLimitW, watts > 0 {
+                    self.limitGpuPower = true
+                    self.gpuPowerLimitWatts = String(watts)
+                } else {
+                    self.limitGpuPower = false
+                    self.gpuPowerLimitWatts = "10"
                 }
                 self.forceSampling = s?.forceSampling ?? false
                 self.isPinned = s?.isPinned ?? false
@@ -749,8 +805,8 @@ final class ModelSettingsScreenVM {
                 self.turboquantKvScheme = s?.turboquantKvScheme ?? "turboquant"
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
                 self.qwen35AnePrefillSharedFraction = s?.qwen35AnePrefillSharedFraction.map { String($0) } ?? "1"
-                self.qwen35OqA8Enabled = s?.qwen35OqA8Enabled ?? false
-                self.qwen35OqA8MinTokens = s?.qwen35OqA8MinTokens.map(String.init) ?? "128"
+                self.a8PrefillEnabled = s?.a8PrefillEnabled ?? false
+                self.a8PrefillMinTokens = s?.a8PrefillMinTokens.map(String.init) ?? "128"
                 self.qwen35AnePrefillEnabled = s?.qwen35AnePrefillEnabled ?? false
                 self.qwen35AnePrefillSequenceLength = s?.qwen35AnePrefillSequenceLength.map(String.init) ?? "2048"
                 self.qwen35AnePrefillTailPaddingMinTokens = s?.qwen35AnePrefillTailPaddingMinTokens.map(String.init) ?? "0"
@@ -786,11 +842,13 @@ final class ModelSettingsScreenVM {
                 self.vlmMtpEnabled = s?.vlmMtpEnabled ?? false
                 self.vlmMtpDraftModel = s?.vlmMtpDraftModel ?? ""
                 self.vlmMtpDraftBlockSize = s?.vlmMtpDraftBlockSize.map(String.init) ?? ""
+                self.loraAdapter = s?.loraAdapter ?? ""
                 self.activeProfileName = s?.activeProfileName
             }
             self.profiles = profiles
             self.templates = templates
             self.serverDefaultSampling = defaults
+            self.loraAdapters = adapters
             // Resolve display scope from the source_template of the active
             // model profile (if any) — so applying the "Balanced" preset
             // lights up the Preset chip, not the local model copy.
@@ -819,8 +877,8 @@ final class ModelSettingsScreenVM {
         }
         var patch = ModelSettingsPatch()
         switch field {
-        case .alias:                   patch.modelAlias = alias.isEmpty ? nil : alias
-        case .modelType:               patch.modelTypeOverride = modelTypeOverride.isEmpty ? nil : modelTypeOverride
+        case .alias:                   patch.modelAlias = .some(alias.isEmpty ? nil : alias)
+        case .modelType:               patch.modelTypeOverride = .some(modelTypeOverride.isEmpty ? nil : modelTypeOverride)
         case .contextLength:           patch.maxContextWindow = Int(contextLength)
         case .maxTokens:               patch.maxTokens = Int(maxTokens)
         case .temperature:
@@ -876,6 +934,12 @@ final class ModelSettingsScreenVM {
         case .qwen4GdnDecodeWideProj:
             guard isQwen4Exp else { return }
             patch.qwen4GdnDecodeWideProj = qwen4GdnDecodeWideProj
+        case .prefillHelper:
+            guard prefillHelperSupported else { return }
+            let off = prefillHelperNodeID.isEmpty
+            patch.prefillHelperNodeId = .some(off ? nil : prefillHelperNodeID)
+            patch.prefillHelperLayers = .some(off ? nil : prefillHelperLayers)
+        case .activationFp16:          patch.activationFp16Enabled = activationFp16Enabled
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
         case .limitToolResults:
@@ -892,6 +956,11 @@ final class ModelSettingsScreenVM {
             guard limitToolResults else { return }
             guard let n = Int(toolResultLimitTokens), n > 0 else { return }
             patch.maxToolResultTokens = n
+        case .limitGpuPower:
+            patch.gpuPowerLimitW = limitGpuPower ? (validGpuPowerLimitWatts ?? 10) : 0
+        case .gpuPowerLimitWatts:
+            guard limitGpuPower, let n = validGpuPowerLimitWatts else { return }
+            patch.gpuPowerLimitW = n
         case .forceSampling:           patch.forceSampling = forceSampling
         case .isPinned:                patch.isPinned = isPinned
         case .isFavorite:              patch.isFavorite = isFavorite
@@ -931,13 +1000,13 @@ final class ModelSettingsScreenVM {
         case .qwen35AnePrefillSharedFraction:
             guard validateAneWorkingSettings() else { return }
             patch.qwen35AnePrefillSharedFraction = Double(qwen35AnePrefillSharedFraction)
-        case .qwen35OqA8Enabled:  patch.qwen35OqA8Enabled = qwen35OqA8Enabled
-        case .qwen35OqA8MinTokens:
-            guard let value = Int(qwen35OqA8MinTokens), value >= 1 else {
-                lastError = "oQ A8 minimum prompt tokens must be a positive integer."
+        case .a8PrefillEnabled:  patch.a8PrefillEnabled = a8PrefillEnabled
+        case .a8PrefillMinTokens:
+            guard let value = Int(a8PrefillMinTokens), value >= 1 else {
+                lastError = "A8 minimum prompt tokens must be a positive integer."
                 return
             }
-            patch.qwen35OqA8MinTokens = value
+            patch.a8PrefillMinTokens = value
         case .qwen35AnePrefillEnabled: patch.qwen35AnePrefillEnabled = qwen35AnePrefillEnabled
         case .qwen35AnePrefillSequenceLength:
             guard validateAneWorkingSettings() else { return }
@@ -1034,6 +1103,7 @@ final class ModelSettingsScreenVM {
         case .vlmMtpEnabled:           patch.vlmMtpEnabled = vlmMtpEnabled
         case .vlmMtpDraftModel:        patch.vlmMtpDraftModel = vlmMtpDraftModel.isEmpty ? nil : vlmMtpDraftModel
         case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
+        case .loraAdapter:             patch.loraAdapter = loraAdapter
         }
         if thinkingForced { patch.enableThinking = .some(nil) }
         let targetModelID = modelID
@@ -1045,6 +1115,53 @@ final class ModelSettingsScreenVM {
             await reportFailedSave(error, modelID: targetModelID, client: client,
                                    preservingEdits: true)
         }
+    }
+
+    // MARK: - Prefill Accelerator
+
+    func loadPrefillHelperCandidates(client: OMLXClient) async {
+        guard prefillHelperSupported else { return }
+        let target = modelID
+        prefillHelperCandidatesLoading = true
+        defer { if modelID == target { prefillHelperCandidatesLoading = false } }
+        do {
+            let result = try await client.prefillHelperCandidates(id: target)
+            guard modelID == target else { return }
+            prefillHelperCandidates = result.devices
+            prefillHelperAvailable = true
+        } catch OMLXClientError.http(let status, _) where status == 403 || status == 404 {
+            // The endpoints exist only while the cluster setting is on.
+            if modelID == target { prefillHelperAvailable = false }
+        } catch {
+            if modelID == target { lastError = String(describing: error) }
+        }
+    }
+
+    func refreshPrefillHelperStatus(client: OMLXClient) async {
+        guard prefillHelperSupported, prefillHelperAvailable else { return }
+        let target = modelID
+        if let status = try? await client.prefillHelperStatus(id: target), modelID == target {
+            prefillHelperStatus = status
+        }
+    }
+
+    /// `action` is copy, retry or stop.
+    func prefillHelperAction(_ action: String, client: OMLXClient) async {
+        let target = modelID
+        prefillHelperBusy = true
+        defer { prefillHelperBusy = false }
+        do {
+            let status = try await client.prefillHelperAction(id: target, action: action)
+            if modelID == target { prefillHelperStatus = status }
+        } catch {
+            lastError = String(describing: error)
+        }
+    }
+
+    /// Layer counts the chosen Mac can hold, plus the saved count.
+    var prefillHelperLayerChoices: [Int] {
+        let fit = prefillHelperCandidates.first { $0.nodeId == prefillHelperNodeID }?.layersFit ?? 0
+        return Array(1...max(1, max(fit, prefillHelperLayers ?? 0)))
     }
 
     func startANETuning(client: OMLXClient) async {
@@ -1114,7 +1231,7 @@ final class ModelSettingsScreenVM {
             // The two prefill accelerators are mutually exclusive, and the
             // tuner's recommendation is the more specific answer here: it was
             // measured on this model's own layers.
-            qwen35OqA8Enabled = false
+            a8PrefillEnabled = false
         }
         qwen35AnePrefillSequenceLength = String(recommendation.sequenceLength)
         if let fraction = recommendation.mlpFraction { qwen35AnePrefillFraction = String(fraction) }
@@ -1220,6 +1337,43 @@ final class ModelSettingsScreenVM {
         return out
     }
 
+    /// Adapters that fit this model, plus the saved one even when it does not
+    /// or lives outside the model folders. The value is the adapter path.
+    func loraAdapterOptions() -> [(String, String)] {
+        var out: [(String, String)] = [
+            ("", String(localized: "settings.advanced.lora_adapter.none",
+                        defaultValue: "None",
+                        comment: "LoRA adapter picker option that applies no adapter")),
+        ]
+        if !loraAdapter.isEmpty, !loraAdapters.contains(where: { $0.path == loraAdapter }) {
+            out.append((loraAdapter, URL(fileURLWithPath: loraAdapter).lastPathComponent))
+        }
+        for adapter in loraAdapters where adapter.problem == nil || adapter.path == loraAdapter {
+            out.append((adapter.path, "\(adapter.id) · r\(adapter.rank)"))
+        }
+        return out
+    }
+
+    /// The selected adapter's training base and targets, its problem, or a hint.
+    var loraAdapterDetail: String {
+        if let adapter = loraAdapters.first(where: { $0.path == loraAdapter }) {
+            if let problem = adapter.problem { return problem }
+            let base = adapter.baseModel ?? "?"
+            let targets = adapter.targets.joined(separator: ", ")
+            return String(localized: "settings.advanced.lora_adapter.info",
+                          defaultValue: "Trained on \(base) · \(targets)",
+                          comment: "LoRA adapter details: training base model and adapted projections")
+        }
+        if loraAdapters.isEmpty && loraAdapter.isEmpty {
+            return String(localized: "settings.advanced.lora_adapter.empty",
+                          defaultValue: "No LoRA adapters found. Put an adapter folder (with adapter_config.json) in a model folder.",
+                          comment: "Shown when the model folders hold no LoRA adapter")
+        }
+        return String(localized: "settings.advanced.lora_adapter.sub",
+                      defaultValue: "Adapters that do not fit this model are not listed. Applies after the model reloads.",
+                      comment: "Sublabel for the LoRA adapter picker")
+    }
+
     static func isVlmMtpDraftModelCandidate(_ model: ModelDTO, currentModelID: String) -> Bool {
         guard model.id != currentModelID else { return false }
 
@@ -1245,22 +1399,24 @@ final class ModelSettingsScreenVM {
         return Self.dsaConfigModelTypes.contains(type)
     }
 
-    var isQwenOqA8Model: Bool {
-        // qwen4_exp (Qwen3.8-Flash-Next) matches exactly: only that validated
-        // family has routed-expert A8, not every qwen4*.
-        if isQwen4Exp { return true }
+    var isA8PrefillModel: Bool {
+        // Exact matches: only these validated families have routed-expert A8.
+        if isQwen4Exp || isDeepseekV41 { return true }
         let type = (model?.configModelType ?? "").lowercased().replacingOccurrences(of: "-", with: "_")
+        if type == "minimax_m3" || type == "minimax_m3_vl" { return true }
         return ["qwen3_5", "qwen3_6", "qwen3_8"].contains { type.hasPrefix($0) }
     }
 
     var isQwen35AnePrefillModel: Bool { model?.anePrefillBackend == "qwen" }
 
+    /// A8 here reaches only the layers on the Prefill Accelerator Mac.
     /// The INT8 kernels run only on GPUs with native INT8 tensor ops
-    /// (M5-series or newer). A saved "on" keeps the row so it can be
-    /// turned off.
-    var showsQwenOqA8: Bool {
-        isQwenOqA8Model
-            && (model?.qwen35OqA8Supported == true || model?.settings?.qwen35OqA8Enabled == true)
+    /// (M5-series or newer), here or on the Prefill Accelerator Mac. A saved
+    /// "on" keeps the row so it can be turned off.
+    var showsA8Prefill: Bool {
+        isA8PrefillModel
+            && (model?.a8PrefillSupported == true || model?.settings?.a8PrefillEnabled == true
+                || !prefillHelperNodeID.isEmpty)
     }
 
     /// Native Lightning MTP can't co-exist with the other speculative
@@ -1311,7 +1467,20 @@ final class ModelSettingsScreenVM {
     /// Streamed experts cannot back a speculative decoder, except the
     /// Lightning MTP head of families that keep it resident. Mirrors
     /// `validate_moe_expert_offload` on the server.
+    /// The server rejects the recast together with MoE expert offload.
+    var activationFp16ConflictReason: String? {
+        guard moeExpertOffloadEnabled else { return nil }
+        return String(localized: "settings.advanced.activation_fp16.conflict.moe_offload",
+                      defaultValue: "Disable MoE Expert Offload before enabling Float16 Activations.",
+                      comment: "Sublabel shown when the float16 activation recast can't be enabled because MoE expert offload is on")
+    }
+
     var moeExpertOffloadConflictReason: String? {
+        if activationFp16Enabled {
+            return String(localized: "settings.moe_offload.conflict.activation_fp16",
+                          defaultValue: "Disable Float16 Activations before enabling MoE Expert Offload.",
+                          comment: "Tooltip / sublabel shown when MoE expert offload can't be enabled because the float16 activation recast is on")
+        }
         if mtpEnabled && model?.moeOffloadAllowsMtp != true {
             return String(localized: "settings.moe_offload.conflict.mtp",
                           defaultValue: "Disable Lightning MTP before enabling MoE Expert Offload.",
@@ -1335,7 +1504,7 @@ final class ModelSettingsScreenVM {
     /// charge and the other silently inert. The server rejects the pair; these
     /// mirror that so the losing toggle disables itself and says why instead
     /// of the save returning a 400 with the switch already flipped.
-    var qwen35OqA8ConflictReason: String? {
+    var a8PrefillConflictReason: String? {
         guard qwen35AnePrefillEnabled else { return nil }
         return String(localized: "settings.qwen_oq_a8.conflict.ane",
                       defaultValue: "Disable Qwen ANE Prefill before enabling INT8 activation prefill.",
@@ -1343,7 +1512,7 @@ final class ModelSettingsScreenVM {
     }
 
     var qwen35AnePrefillConflictReason: String? {
-        guard qwen35OqA8Enabled else { return nil }
+        guard a8PrefillEnabled else { return nil }
         return String(localized: "settings.qwen_ane.conflict.oq_a8",
                       defaultValue: "Disable Qwen INT8 Activation Prefill before enabling ANE prefill.",
                       comment: "Tooltip / sublabel shown when ANE prefill can't be enabled because INT8 activation prefill is on")
@@ -1464,7 +1633,7 @@ final class ModelSettingsScreenVM {
             }
             return profileDisplayName(scope: activeProfileScope, name: name)
         case .acceleration, .memory, .experimental:
-            if !externalEngine.isEmpty { return Self.summaryExternalEngine }
+            if !effectiveExternalEngine.isEmpty { return Self.summaryExternalEngine }
             return Self.summary(enabledFeatures(on: page), empty: Self.summaryOff)
         case .advanced:
             return Self.summary(enabledFeatures(on: .advanced), empty: Self.summaryOff)
@@ -1503,7 +1672,7 @@ final class ModelSettingsScreenVM {
                                     defaultValue: "Extended Fused Decode",
                                     comment: "Short name of Qwen4 extended fused decode in the Acceleration row value"))
             }
-            if showsQwenOqA8 && qwen35OqA8Enabled {
+            if showsA8Prefill && a8PrefillEnabled {
                 items.append(String(localized: "settings.summary.qwen_oq_a8",
                                     defaultValue: "INT8 Prefill",
                                     comment: "Short name of Qwen INT8 activation prefill in the Acceleration row value"))
@@ -1526,21 +1695,27 @@ final class ModelSettingsScreenVM {
                                     comment: "TurboQuant KV in the Memory Saving row value; placeholder is the bit width"))
             }
         case .advanced:
-            if !isDiffusionModel, !externalEngine.isEmpty {
-                let label = model?.externalEngines?.first(where: { $0.id == externalEngine })?.label
-                items.append(label ?? externalEngine)
+            if !isDiffusionModel, !effectiveExternalEngine.isEmpty {
+                let engine = effectiveExternalEngine
+                let label = model?.externalEngines?.first(where: { $0.id == engine })?.label
+                items.append(label ?? engine)
             }
             if trustRemoteCode {
                 items.append(String(localized: "settings.advanced.trust_remote_code.label",
                                     defaultValue: "Trust Remote Code",
                                     comment: "Row label for the security-sensitive trust-remote-code toggle"))
             }
+            if isLLMLike && !isDiffusionModel && thinkingBudgetEnabled {
+                items.append(String(localized: "settings.advanced.thinking_budget.label",
+                                    defaultValue: "Thinking Budget",
+                                    comment: "Row label for the thinking budget field"))
+            }
+            if isLLMLike && limitGpuPower {
+                items.append(String(localized: "settings.summary.gpu_power_limit",
+                                    defaultValue: "GPU \(gpuPowerLimitWatts) W",
+                                    comment: "GPU power limit in the Advanced row value; placeholder is the watt value"))
+            }
             if isLLMLike && !isDiffusionModel {
-                if thinkingBudgetEnabled {
-                    items.append(String(localized: "settings.advanced.thinking_budget.label",
-                                        defaultValue: "Thinking Budget",
-                                        comment: "Row label for the thinking budget field"))
-                }
                 if limitToolResults {
                     items.append(String(localized: "settings.summary.tool_result_limit",
                                         defaultValue: "Tool Result Limit",
@@ -1675,6 +1850,9 @@ final class ModelSettingsScreenVM {
                 limitToolResults ? (Int(toolResultLimitTokens) ?? 4096) : 0
             )
         }
+        out[ProfileSettingsKey.gpuPowerLimitW] = AnyCodable(
+            limitGpuPower ? (Int(gpuPowerLimitWatts) ?? 10) : 0
+        )
 
         // Universal — chat template kwargs. AnyCodable's encode walks a
         // [String: AnyCodable] / [AnyCodable] explicitly, so nest those
@@ -1708,9 +1886,12 @@ final class ModelSettingsScreenVM {
                     out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
                 }
             }
-            putBool(ProfileSettingsKey.qwen35OqA8Enabled, qwen35OqA8Enabled)
-            if qwen35OqA8Enabled {
-                putInt(ProfileSettingsKey.qwen35OqA8MinTokens, qwen35OqA8MinTokens)
+            // A hidden A8 row stays unset rather than saved.
+            if showsA8Prefill {
+                putBool(ProfileSettingsKey.a8PrefillEnabled, a8PrefillEnabled)
+                if a8PrefillEnabled {
+                    putInt(ProfileSettingsKey.a8PrefillMinTokens, a8PrefillMinTokens)
+                }
             }
             putBool(ProfileSettingsKey.qwen35AnePrefillEnabled, qwen35AnePrefillEnabled)
             if qwen35AnePrefillEnabled {
@@ -1771,6 +1952,7 @@ final class ModelSettingsScreenVM {
                 putString(ProfileSettingsKey.vlmMtpDraftModel, vlmMtpDraftModel)
                 putInt(ProfileSettingsKey.vlmMtpDraftBlockSize, vlmMtpDraftBlockSize)
             }
+            putString(ProfileSettingsKey.loraAdapter, loraAdapter)
         }
 
         return out
@@ -2008,6 +2190,7 @@ final class ModelSettingsScreenVM {
             ProfileSettingsKey.repetitionPenalty, ProfileSettingsKey.presencePenalty,
             ProfileSettingsKey.reasoningParser, ProfileSettingsKey.guidedGrammar,
             ProfileSettingsKey.chatTemplateKwargs, ProfileSettingsKey.forcedCtKwargs,
+            ProfileSettingsKey.loraAdapter,
         ]
         for key in clearable where body[key] == nil {
             body[key] = AnyCodable(NSNull())
@@ -2141,6 +2324,12 @@ final class ModelSettingsScreenVM {
     }
 
     private func validateWorkingSettings() -> Bool {
+        if limitGpuPower, validGpuPowerLimitWatts == nil {
+            lastError = String(localized: "settings.advanced.gpu_power_limit.range",
+                               defaultValue: "GPU power limit must be between 2 and 1000 W.",
+                               comment: "Error when the GPU power limit is outside the accepted range")
+            return false
+        }
         if moeExpertOffloadSupported, moeExpertOffloadEnabled,
            moeExpertOffloadResidentFraction == nil {
             lastError = moeResidentRangeError

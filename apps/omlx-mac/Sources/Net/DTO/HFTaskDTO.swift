@@ -2,6 +2,32 @@
 
 import Foundation
 
+struct HFLocalModelsResponse: Decodable, Sendable {
+    let models: [HFLocalModelDTO]
+}
+
+struct HFLocalModelDTO: Decodable, Sendable {
+    let name: String
+    let repoId: String?
+    let sourceType: String?
+}
+
+struct HFUpdateCheckRequest: Encodable, Sendable {
+    let repoIds: [String]
+    var hfToken: String = ""
+}
+
+struct HFUpdateCheckResponse: Decodable, Equatable, Sendable {
+    let updates: [String: HFModelUpdateDTO]
+    let checked: Int
+    let failed: [String]
+}
+
+struct HFModelUpdateDTO: Decodable, Equatable, Sendable {
+    let files: Int
+    let size: Int64
+}
+
 struct HFTaskListResponse: Codable, Sendable {
     let tasks: [HFTaskDTO]
 }
@@ -22,6 +48,10 @@ struct HFTaskDTO: Codable, Equatable, Sendable, Identifiable {
     let startedAt: Double
     let completedAt: Double
     let retryCount: Int
+    /// Repo paths the task fetches; nil for the whole repo.
+    let files: [String]?
+    /// The GGUF model files among `files`, as the server groups them.
+    let ggufFiles: [String]?
 
     var id: String { taskId }
 
@@ -50,6 +80,12 @@ struct HFTaskDTO: Codable, Equatable, Sendable, Identifiable {
         return "\(s)s"
     }
 
+    /// The GGUF model files a selection fetches, shown beside the repo.
+    var ggufFilesText: String? {
+        guard let names = ggufFiles, !names.isEmpty else { return nil }
+        return names.joined(separator: ", ")
+    }
+
     enum Status: String {
         case pending, downloading, completed, failed, cancelled, paused
     }
@@ -60,9 +96,15 @@ struct HFTaskDTO: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// The Hugging Face downloader's repo filter for search and suggestions.
+enum HFModelFormat: String, CaseIterable, Hashable, Sendable {
+    case mlx, gguf, all
+}
+
 struct StartHFDownloadRequest: Encodable, Sendable {
     let repoId: String
     let hfToken: String
+    let files: [String]?
 }
 
 struct StartHFDownloadResponse: Decodable, Sendable {
@@ -97,6 +139,8 @@ struct HFModelInfo: Codable, Equatable, Sendable, Identifiable {
     let sizeFormatted: String?
     let params: Int64?
     let paramsFormatted: String?
+    /// GGUF architecture from the Hub metadata, e.g. "qwen35".
+    let architecture: String?
 
     var id: String { repoId }
 }

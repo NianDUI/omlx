@@ -24,7 +24,13 @@ def gated_mlp(mlp, x: mx.array) -> mx.array:
     """Gated MLP; eight-row verify shapes fuse gate, up and swiglu."""
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
-    if gate is not None and qwen35_verify_qmm.sg8_swiglu_eligible(gate, up, x):
+    # The fused kernel computes SiLU gating; MLPs with their own activation
+    # (MiniMax SwiGLU-OAI) run their module.
+    if (
+        gate is not None
+        and not hasattr(mlp, "act_fn")
+        and qwen35_verify_qmm.sg8_swiglu_eligible(gate, up, x)
+    ):
         batch, length, width = x.shape
         hidden = qwen35_verify_qmm.vk_swiglu_sg8(
             x.reshape(batch * length, width), gate, up
@@ -35,6 +41,9 @@ def gated_mlp(mlp, x: mx.array) -> mx.array:
 
 def project_context(model, hidden: mx.array) -> mx.array:
     """Turn concatenated layer captures into the drafter's context rows."""
+    if getattr(model, "raw_context", False):
+        # Inkling 2 mixes the raw captures per layer in project_qkv.
+        return hidden
     encoder = getattr(model, "encoder", None)
     if encoder is not None:
         # Muse Glimmer's assistant keeps fc and its norm in an encoder.
@@ -51,6 +60,10 @@ def project_context(model, hidden: mx.array) -> mx.array:
 
 def project_qkv(attn, x: mx.array, context: mx.array) -> tuple:
     """Block queries plus keys and values for ``context`` and the block."""
+    context_kv = getattr(attn, "project_context_kv", None)
+    if context_kv is not None:
+        # Context rows have their own K/V projections (Inkling 2).
+        return (attn.q_proj(x), *context_kv(context), attn.k_proj(x), attn.v_proj(x))
     fused = getattr(attn, "qkv_proj", None)
     if fused is None:
         project_kv = getattr(attn, "_project_kv", None)

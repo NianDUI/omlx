@@ -2,12 +2,14 @@
 """Budget-checked oQ2-oQ4 export of the mixed-precision V4.1 release.
 
 Engram follows Qwen4-Exp's uniform affine group-32 embedding policy, stays at
-4 bits and is excluded from the remaining weights' bit budget. If all other
+4 bits and is excluded from the remaining weights' bit budget;
+``preserve_ngram_table`` copies the official FP8 tables unchanged. If all other
 source weights fit their independent budget at original precision, that
 allocation dominates every lossy alternative: neither sensitivity ranking nor
 an imatrix can improve it. Levels below oQ4 measure layer sensitivity and
 projection input statistics, then use the official mixed-bit allocator and
-weighted affine arithmetic for the e variants.
+weighted affine arithmetic for the e variants, whose re-rounded routed experts
+then get the oQe code refinement (refine_experts).
 """
 
 import json
@@ -21,7 +23,26 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
+from ...oq import (
+    _OQE_REFINE_SAMPLES,
+    _OQE_REFINE_SEQ_LENGTH,
+    _OQRefineWriter,
+    _refine_affine_codes,
+    _shrunk_gram,
+)
+from ...oqh import format as oqh_format
+from ...oqh import targets as oqh_targets
 from .convert import iter_source_weights, source_engram_tables, strip_draft_config
+from .oq_inventory import projection_inventory
+from .oqh import (
+    expert_layer,
+    expert_owner,
+    float_experts,
+    iter_expert_grams,
+    plan_widths,
+    planned_bytes,
+    write_experts,
+)
 from .sharding import ShardWriter
 from .storage import TensorFile, decode_array
 
@@ -108,7 +129,10 @@ def requantize_projection(
 def source_budget(
     source, config, mapping, *, preserve_mtp, text_only=False, engram_bits=4
 ):
-    """Count actual exported bytes, including scales, norms and draft heads."""
+    """Count actual exported bytes, including scales, norms and draft heads.
+
+    ``engram_bits=None`` prices Engram at its stored source bytes.
+    """
     headers = {}
     for filename in dict.fromkeys(mapping.values()):
         with (source / filename).open("rb") as f:
@@ -123,9 +147,14 @@ def source_budget(
             draft_tensors += 1
         if text_only and name.startswith(("vision.", "aligner.", "image_")):
             continue
+        info = headers[filename][name]
+        if ".engram.embed." in name and engram_bits is None:
+            engram_bytes += info["data_offsets"][1] - info["data_offsets"][0]
+            if name.endswith(".weight"):
+                engram_params += math.prod(info["shape"])
+            continue
         if name.endswith(".scale"):
             continue
-        info = headers[filename][name]
         shape, dtype = info["shape"], info["dtype"]
         count = math.prod(shape) * (2 if dtype in ("I8", "U8") else 1)
         if ".engram.embed." in name:
@@ -148,20 +177,22 @@ def source_budget(
             output_bytes += info["data_offsets"][1] - info["data_offsets"][0]
     if preserve_mtp and draft_tensors == 0:
         raise ValueError("Requested MTP preservation but source has no draft weights")
+    engram = {
+        "logical_parameters": engram_params,
+        "tensor_bytes": engram_bytes,
+        "effective_bpw": engram_bytes * 8 / max(engram_params, 1),
+    }
+    if engram_bits is None:
+        engram["precision"] = "source"
+    else:
+        engram.update(bits=engram_bits, group_size=32, mode="affine")
     return {
         "remaining_weights": {
             "logical_parameters": params,
             "tensor_bytes": output_bytes,
             "effective_bpw": output_bytes * 8 / max(params, 1),
         },
-        "engram": {
-            "logical_parameters": engram_params,
-            "tensor_bytes": engram_bytes,
-            "effective_bpw": engram_bytes * 8 / max(engram_params, 1),
-            "bits": engram_bits,
-            "group_size": 32,
-            "mode": "affine",
-        },
+        "engram": engram,
         "tensor_bytes": output_bytes + engram_bytes,
         "preserved_source_draft_tensors": draft_tensors,
     }
@@ -274,6 +305,169 @@ def quantize_engram(
     }
 
 
+def _tensor_location(path, key):
+    with path.open("rb") as f:
+        size = struct.unpack("<Q", f.read(8))[0]
+        entry = json.loads(f.read(size))[key]
+    start, end = entry["data_offsets"]
+    return entry, 8 + size + start, end - start
+
+
+def copy_engram(
+    source, destination, table, *, module_name, chunk_bytes=64 << 20, progress=None
+):
+    """Copy a table's stored bytes unchanged under the converted key names.
+
+    The official FP8 table keeps its E4M3 values and one E8M0 scale per 32
+    channels, which DiskEngramEmbedding decodes like the source checkpoint.
+    """
+    if table.get("bias_key"):
+        raise ValueError("Engram table is already quantized: copy is unsupported")
+    parts = [("weight", source / table["weight_file"], table["weight_key"])]
+    if table.get("scale_key"):
+        scale_file = table.get("scale_file") or table["weight_file"]
+        parts.append(("scales", source / scale_file, table["scale_key"]))
+    located = [(name, path, *_tensor_location(path, key)) for name, path, key in parts]
+    weight = located[0][2]
+    if len(weight["shape"]) != 2 or weight["shape"][-1] % 32:
+        raise ValueError("Engram rows must divide into 32-channel groups")
+    mode = None
+    if len(located) > 1:
+        scales = located[1][2]
+        rows, width = weight["shape"]
+        if (
+            not weight["dtype"].startswith("F8_E4M3")
+            or not scales["dtype"].startswith("F8_E8M0")
+            or scales["shape"] != [rows, width // 32]
+        ):
+            raise ValueError("Only FP8 Engram tables with E8M0 block scales copy")
+        mode = "mxfp8"
+    header, offset = {}, 0
+    for name, _, entry, _, length in located:
+        header[f"{module_name}.{name}"] = {
+            "dtype": entry["dtype"],
+            "shape": entry["shape"],
+            "data_offsets": [offset, offset + length],
+        }
+        offset += length
+    header["__metadata__"] = {"format": "mlx"}
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    partial = destination.with_suffix(destination.suffix + ".partial")
+    done = 0
+    with partial.open("xb") as out:
+        out.write(struct.pack("<Q", len(encoded)))
+        out.write(encoded)
+        for _, path, _, start, length in located:
+            with path.open("rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining:
+                    data = f.read(min(chunk_bytes, remaining))
+                    if not data:
+                        raise ValueError(f"Truncated Engram source: {path.name}")
+                    out.write(data)
+                    remaining -= len(data)
+                    done += len(data)
+                    if progress is not None:
+                        progress(done, offset)
+    partial.rename(destination)
+    spec = {
+        "weight_file": destination.name,
+        "weight_key": f"{module_name}.weight",
+        "group_size": 32,
+    }
+    if mode is not None:
+        spec.update(
+            scale_file=destination.name, scale_key=f"{module_name}.scales", mode=mode
+        )
+    return spec
+
+
+def refine_experts(source, destination, weight_map, quantized, progress=None):
+    """oQe code refinement of an export's affine routed experts, written in place.
+
+    The routed experts are the FP4 source re-rounded to affine codes, so the
+    dequantized source is the target the codes approximate. Each expert's codes
+    are re-picked against its calibration Gram, as the generic oQe refinement
+    does; scales and biases stay, so the export keeps its size and format.
+    """
+    names = {
+        name
+        for name, spec in quantized.items()
+        if name.startswith("language_model.layers.")
+        and ".ffn.experts." in name
+        and spec.get("mode") == "affine"
+    }
+    stats = {"tensors": 0, "kept": 0, "before": 0.0, "after": 0.0}
+    if not names:
+        return {"status": "skipped", "reason": "no affine routed experts"}
+    layers = {expert_layer(name) for name in names}
+    # The writer only sees these tensors: V4.1 specs have no global default for
+    # the rest, and flushing a shard keeps every tensor it does not rewrite.
+    expert_map = {k: v for k, v in weight_map.items() if k.rsplit(".", 1)[0] in names}
+    writer = _OQRefineWriter(Path(destination), expert_map, quantized)
+    grams = iter_expert_grams(
+        source,
+        layers,
+        num_samples=_OQE_REFINE_SAMPLES,
+        seq_length=_OQE_REFINE_SEQ_LENGTH,
+    )
+    for done, (i, experts, collector) in enumerate(grams, start=1):
+        for part in ("w1", "w3", "w2"):
+            name = f"language_model.layers.{i}.ffn.experts.{part}"
+            if name not in names:
+                continue
+            owner = expert_owner(collector, name)
+            module = getattr(experts, part)
+            packed, scales, biases = writer.read(name)
+            bits, group_size = writer.spec(name)
+            n_exp, out_dim, in_dim = (
+                int(packed.shape[0]),
+                int(packed.shape[1]),
+                int(packed.shape[2]) * 32 // bits,
+            )
+            parts, before, after, changed = [], 0.0, 0.0, False
+            for first, stop in collector.expert_ranges(owner, n_exp, in_dim, out_dim):
+                hessian = _shrunk_gram(collector.switch_gram(owner, first, stop))
+                result = _refine_affine_codes(
+                    float_experts(module, first, stop),
+                    packed[first:stop],
+                    scales[first:stop],
+                    biases[first:stop],
+                    hessian,
+                    bits,
+                    group_size,
+                )
+                del hessian
+                if result is None:
+                    parts.append(packed[first:stop])
+                else:
+                    parts.append(result[0])
+                    before, after, changed = before + result[1], after + result[2], True
+                mx.clear_cache()
+            if changed:
+                writer.write(name, mx.concatenate(parts))
+                stats["tensors"] += 1
+                stats["before"] += before
+                stats["after"] += after
+            else:
+                stats["kept"] += 1
+        writer.layer_done(i)
+        if progress is not None:
+            progress(done, len(layers))
+        logger.info("V4.1 oQe refine: layer %d done (%d/%d)", i, done, len(layers))
+    writer.finish()
+    gain = 1.0 - stats["after"] / stats["before"] if stats["before"] > 0 else 0.0
+    logger.info(
+        "V4.1 oQe refine: %d expert tensors refined (%d kept), Hessian error -%.1f%%",
+        stats["tensors"],
+        stats["kept"],
+        100.0 * gain,
+    )
+    return {"status": "done", **stats, "hessian_error_reduction": round(gain, 4)}
+
+
 def quantize(
     source,
     destination,
@@ -294,6 +488,8 @@ def quantize(
     imatrix_strict=False,
     imatrix_num_samples=128,
     imatrix_seq_length=512,
+    preserve_ngram_table=False,
+    hadamard=False,
 ):
     from ...oq import (
         _OQ_BPW_TARGETS,
@@ -305,7 +501,14 @@ def quantize(
     )
 
     _validate_v41_oq_settings(oq_level, dtype, group_size)
-    engram_bits = _offload_table_bits(oq_level)
+    if hadamard and oq_level >= oqh_targets.DEEPSEEK_V41.max_level:
+        raise ValueError(
+            "V4.1 oQh re-rounds the routed experts below oQ4; oQ4 keeps the "
+            "source FP4 experts"
+        )
+    # Engram sits outside the bit budget and calibration reads the source
+    # checkpoint, so keeping it at source precision changes no other tensor.
+    engram_bits = None if preserve_ngram_table else _offload_table_bits(oq_level)
     if oq_level == 4 and (sensitivity_model_path or sensitivity_map_override):
         raise ValueError(
             "V4.1 original-precision oQ4 does not use sensitivity overrides"
@@ -369,6 +572,15 @@ def quantize(
             budget["remaining_weights"]["tensor_bytes"]
             + budget["engram"]["tensor_bytes"]
         )
+    # oQh experts: the bytes their affine plan holds buy the widths.
+    widths, oqh_planned = {}, 0
+    if hadamard:
+        inventory = projection_inventory(
+            source, config, mapping, preserve_mtp=preserve_mtp
+        )
+        scores = {str(k): v for k, v in (preparation.get("sensitivity") or {}).items()}
+        widths = plan_widths(inventory, allocation, scores)
+        oqh_planned = planned_bytes(inventory, allocation, widths)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(destination.parent).free < budget["tensor_bytes"] + 1024**3:
         raise OSError("Insufficient space for V4.1 export plus 1 GiB headroom")
@@ -403,11 +615,9 @@ def quantize(
     engram_start, engram_span = (20, 20) if oq_level < 4 else (0, 30)
     projection_start = engram_start + engram_span
     for i, (name, table) in enumerate(tables.items()):
-        if _get_predicate_bits(name + ".weight", config, oq_level, 64) != (
-            engram_bits,
-            32,
-            "affine",
-        ):
+        if engram_bits is not None and _get_predicate_bits(
+            name + ".weight", config, oq_level, 64
+        ) != (engram_bits, 32, "affine"):
             raise ValueError("V4.1 Engram policy differs from Qwen4-Exp")
         filename = f".model-engram-{i:02d}.safetensors"
         last = [-1]
@@ -425,16 +635,30 @@ def quantize(
                     f"Engram {i + 1}/{len(tables)}: {percent}%",
                 )
 
-        spec = quantize_engram(
-            source,
-            destination / filename,
-            table,
-            progress=progress,
-            module_name=name,
-            bits=engram_bits,
-        )
+        if engram_bits is None:
+            spec = copy_engram(
+                source,
+                destination / filename,
+                table,
+                module_name=name,
+                progress=progress,
+            )
+        else:
+            spec = quantize_engram(
+                source,
+                destination / filename,
+                table,
+                progress=progress,
+                module_name=name,
+                bits=engram_bits,
+            )
         writer.add_file(
-            filename, [spec[key] for key in ("weight_key", "scale_key", "bias_key")]
+            filename,
+            [
+                spec[key]
+                for key in ("weight_key", "scale_key", "bias_key")
+                if spec.get(key)
+            ],
         )
         exported_tables[name] = spec
     quantized = {}
@@ -456,6 +680,12 @@ def quantize(
                 if not key.endswith(".weight"):
                     continue
                 name = key.removesuffix(".weight")
+                if name in widths:
+                    # Written by the oQh pass from the source model.
+                    for part in [k for k in values if k.startswith(name + ".")]:
+                        values.pop(part)
+                    specs.pop(name, None)
+                    continue
                 if name not in allocation:
                     continue
                 importance = None
@@ -509,12 +739,44 @@ def quantize(
                     / max(budget["remaining_weights"]["tensor_bytes"], 1),
                     f"Exported {i + 1} projection groups",
                 )
+    oqh_report = None
+    if widths:
+        oqh_report = write_experts(
+            source,
+            writer,
+            widths,
+            num_samples=imatrix_num_samples,
+            seq_length=imatrix_seq_length,
+            progress=lambda done, total: _emit_progress(
+                progress_callback,
+                "oqh",
+                99,
+                f"V4.1 oQh experts: layer {done}/{total}",
+            ),
+        )
+        if oqh_report["bytes"] > oqh_planned:
+            raise ValueError("V4.1 oQh experts exceed their affine budget")
+        report["oqh"] = {k: v for k, v in oqh_report.items() if k != "entries"}
     output_map = writer.finish()
+    if enhanced and allocation and not hadamard:
+        report["refine"] = refine_experts(
+            source,
+            destination,
+            output_map,
+            quantized,
+            progress=lambda done, total: _emit_progress(
+                progress_callback,
+                "refine",
+                99,
+                f"V4.1 oQe code refinement, layer {done}/{total}",
+            ),
+        )
     report["shard_count"] = len(set(output_map.values()))
     for spec in exported_tables.values():
         spec["weight_file"] = output_map[spec["weight_key"]]
-        spec["scale_file"] = output_map[spec["scale_key"]]
-    if written_bytes != budget["remaining_weights"]["tensor_bytes"]:
+        if spec.get("scale_key"):
+            spec["scale_file"] = output_map[spec["scale_key"]]
+    if written_bytes + oqh_planned != budget["remaining_weights"]["tensor_bytes"]:
         raise ValueError("Exported non-Engram bytes differ from the independent budget")
     config.pop("quantization_config", None)
     if not preserve_mtp:
@@ -532,6 +794,11 @@ def quantize(
         ),
         "quantization_report": report,
     }
+    if oqh_report is not None:
+        config[oqh_format.CONFIG_KEY] = {
+            "version": oqh_format.FORMAT_VERSION,
+            "tensors": oqh_report["entries"],
+        }
     for name in (
         "tokenizer.json",
         "tokenizer_config.json",

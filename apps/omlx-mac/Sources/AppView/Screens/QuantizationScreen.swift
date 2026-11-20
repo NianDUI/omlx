@@ -68,7 +68,7 @@ struct QuantizationScreen: View {
                 selectedModelPath: $vm.selectedModelPath,
                 sensitivityModelPath: $vm.sensitivityModelPath,
                 oqLevel: $vm.oqLevel,
-                enhanced: vm.enhanced,
+                variantSuffix: vm.variantSuffix,
                 isStarting: vm.isStarting,
                 modelsLoaded: vm.modelsLoaded,
                 onStart: { vm.startQuantization(client: services.client) }
@@ -84,6 +84,8 @@ struct QuantizationScreen: View {
 
             EnhancedQuantizationSection(
                 enabled: $vm.enhanced,
+                hadamard: $vm.hadamard,
+                supportsOqh: vm.selectedSupportsOqh,
                 reuseCache: $vm.imatrixReuseCache,
                 cachePath: $vm.imatrixCachePath,
                 strictCoverage: $vm.imatrixStrict
@@ -153,7 +155,7 @@ private struct SourceModelSection: View {
     @Binding var selectedModelPath: String
     @Binding var sensitivityModelPath: String
     @Binding var oqLevel: Double
-    let enhanced: Bool
+    let variantSuffix: String
     let isStarting: Bool
     let modelsLoaded: Bool
     let onStart: () -> Void
@@ -268,12 +270,12 @@ private struct SourceModelSection: View {
         return opts
     }
 
-    // Mirrors the HTML <option>s. oQe keeps the same bit levels, but makes
-    // the output variant explicit in the picker, as the web UI does.
+    // Mirrors the HTML <option>s. oQe and oQh keep the same bit levels, but
+    // make the output variant explicit in the picker, as the web UI does.
     private var levelOptions: [PopupOption<Double>] {
         Self.levelValues.map { level in
             let number = level.rounded() == level ? String(Int(level)) : String(level)
-            return PopupOption(value: level, label: "oQ\(number)\(enhanced ? "e" : "")")
+            return PopupOption(value: level, label: "oQ\(number)\(variantSuffix)")
         }
     }
 
@@ -323,7 +325,7 @@ private struct EstimateStrip: View {
                 .font(.system(size: 10.5))
                 .foregroundStyle(theme.textTertiary)
             Text(text)
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
         }
     }
@@ -353,7 +355,7 @@ private struct AdvancedSection: View {
                     Text(String(localized: "quant.advanced.title",
                                 defaultValue: "Advanced settings",
                                 comment: "Collapsible header for the Quantization advanced-settings block"))
-                        .font(.omlxText(11, weight: .semibold))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .semibold))
                         .foregroundStyle(theme.textSecondary)
                         .textCase(.uppercase)
                         .kerning(0.6)
@@ -424,6 +426,8 @@ private struct AdvancedSection: View {
 /// intentionally sent rather than replaced with a client-specific path.
 private struct EnhancedQuantizationSection: View {
     @Binding var enabled: Bool
+    @Binding var hadamard: Bool
+    let supportsOqh: Bool
     @Binding var reuseCache: Bool
     @Binding var cachePath: String
     @Binding var strictCoverage: Bool
@@ -452,6 +456,19 @@ private struct EnhancedQuantizationSection: View {
             }
 
             if enabled {
+                if supportsOqh {
+                    Row(
+                        label: String(localized: "quant.enhanced.hadamard.label",
+                                      defaultValue: "Rotated codes (oQh)",
+                                      comment: "Toggle label that builds the oQh variant of an oQe model"),
+                        sublabel: String(localized: "quant.enhanced.hadamard.sub",
+                                         defaultValue: "Same size as oQe with lower error: weights are stored in a Hadamard-rotated basis with one scale per row. Needs the oQh kernels to run.",
+                                         comment: "Toggle sublabel explaining the oQh variant")
+                    ) {
+                        RowSwitch(isOn: $hadamard)
+                    }
+                }
+
                 Row(
                     label: String(localized: "quant.enhanced.reuse.label",
                                   defaultValue: "Reuse imatrix cache",
@@ -549,14 +566,14 @@ private struct QueueRow: View {
                     .font(.system(size: 12))
                     .foregroundStyle(theme.blueDot)
                 Text(task.outputName)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 StatusChip(status: task.statusEnum)
                 Spacer(minLength: 4)
                 Text(elapsedText)
-                    .font(.omlxMono(11))
+                    .font(.omlxMono(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textTertiary)
                 if task.statusEnum == .completed {
                     Button {
@@ -593,12 +610,12 @@ private struct QueueRow: View {
                 HStack(spacing: 8) {
                     if !task.phase.isEmpty {
                         Text(task.phase)
-                            .font(.omlxText(11))
+                            .font(.omlxText(DesignTokens.FontSize.subheadline))
                             .foregroundStyle(theme.textSecondary)
                     }
                     Spacer(minLength: 0)
                     Text(progressText)
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textTertiary)
                 }
             }
@@ -667,7 +684,7 @@ private struct StatusChip: View {
             }
         }()
         Text(cfg.1)
-            .font(.omlxText(10, weight: .semibold))
+            .font(.omlxText(DesignTokens.FontSize.caption, weight: .semibold))
             .foregroundStyle(cfg.0)
             .padding(.horizontal, 6)
             .padding(.vertical, 1)
@@ -733,7 +750,7 @@ private struct UploadRow: View {
                     .font(.system(size: 12))
                     .foregroundStyle(theme.blueDot)
                 Text(task.modelName)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -772,18 +789,18 @@ private struct UploadRow: View {
                 ProgressBar(progress: max(0, min(task.progress / 100, 1)), colors: [Color(rgb24: 0xFF2D55), Color(rgb24: 0xAF52DE)])
                 HStack(spacing: 8) {
                     Text(task.repoId)
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer(minLength: 0)
                     Text("\(Int(task.progress.rounded()))%")
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textTertiary)
                 }
             } else if !task.repoId.isEmpty {
                 Text(task.repoId)
-                    .font(.omlxMono(11))
+                    .font(.omlxMono(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textTertiary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -829,7 +846,7 @@ private struct UploadStatusChip: View {
             }
         }()
         Text(cfg.1)
-            .font(.omlxText(10, weight: .semibold))
+            .font(.omlxText(DesignTokens.FontSize.caption, weight: .semibold))
             .foregroundStyle(cfg.0)
             .padding(.horizontal, 6)
             .padding(.vertical, 1)
@@ -871,7 +888,7 @@ private struct UploadModalView: View {
                 Text(String(localized: "quant.upload_modal.title",
                             defaultValue: "Upload to Hugging Face",
                             comment: "Title of the upload-to-HF sheet"))
-                    .font(.omlxText(15, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.title3, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(task.outputName)
                     .font(.omlxMono(11.5))
@@ -1010,7 +1027,7 @@ private struct UploadModalView: View {
                         isLast: true
                     ) {
                         Text(vm.uploadNamespace.isEmpty ? "—" : "@\(vm.uploadNamespace)")
-                            .font(.omlxText(13, weight: .medium))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                             .foregroundStyle(theme.textSecondary)
                     }
                 }
@@ -1110,7 +1127,7 @@ private struct UploadModalView: View {
                         Text(String(localized: "quant.upload_modal.notice.off",
                                     defaultValue: "Off",
                                     comment: "Value text displayed when the re-download notice is unavailable"))
-                            .font(.omlxText(13, weight: .medium))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                             .foregroundStyle(theme.textTertiary)
                     }
                 }
@@ -1228,7 +1245,7 @@ private struct AboutSection: View {
                         Text(String(localized: "quant.about.title",
                                     defaultValue: "About oQ Quantization",
                                     comment: "Title of the collapsible About oQ Quantization card"))
-                            .font(.omlxText(13, weight: .semibold))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .semibold))
                             .foregroundStyle(theme.text)
                         Text(String(localized: "quant.about.subtitle",
                                     defaultValue: "Compare standard oQ with oQe imatrix and how enhanced quantization works.",
@@ -1428,7 +1445,7 @@ private struct AboutSection: View {
 
     private func heading(_ value: String) -> some View {
         Text(value)
-            .font(.omlxText(13, weight: .semibold))
+            .font(.omlxText(DesignTokens.FontSize.body, weight: .semibold))
             .foregroundStyle(theme.text)
     }
 
@@ -1453,7 +1470,7 @@ private struct AboutSection: View {
     private func step(_ number: Int, title: String, body: String) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Text("\(number)")
-                .font(.omlxText(10, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.caption, weight: .semibold))
                 .foregroundStyle(theme.textSecondary)
                 .frame(width: 20, height: 20)
                 .background(theme.rowSep)
@@ -1479,16 +1496,22 @@ private struct AboutSection: View {
 
 // MARK: - Keychain helper
 
-// Thin SecItem wrapper. Single account/service pair — the upload screen is
-// the only consumer right now, so we keep the surface small. All accesses
-// happen on the main actor (called from the VM); the SecItem APIs are
+// Thin SecItem wrapper. Each secret is a service/account `Item`; the
+// functions default to the HuggingFace upload token. The SecItem APIs are
 // thread-safe so we don't need additional locking.
 enum Keychain {
-    private static let service = "app.omlx.hf-upload"
-    private static let account = "huggingface-token"
+    struct Item: Sendable {
+        let service: String
+        let account: String
+
+        static let huggingFaceToken = Item(service: "app.omlx.hf-upload", account: "huggingface-token")
+        static let askAIRemoteKey = Item(service: "app.omlx.ask-ai-remote", account: "api-key")
+    }
 
     /// Returns the stored token or `nil` if no item exists / the read fails.
-    static func read() -> String? {
+    static func read(_ item: Item = .huggingFaceToken) -> String? {
+        let service = item.service
+        let account = item.account
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -1509,8 +1532,10 @@ enum Keychain {
     /// Writes (or updates) the stored token. No-op on empty input so we
     /// don't accidentally clobber an existing entry with an empty string.
     @discardableResult
-    static func write(_ value: String) -> Bool {
+    static func write(_ value: String, to item: Item = .huggingFaceToken) -> Bool {
         guard let data = value.data(using: .utf8), !value.isEmpty else { return false }
+        let service = item.service
+        let account = item.account
         let baseQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -1530,7 +1555,9 @@ enum Keychain {
     }
 
     @discardableResult
-    static func delete() -> Bool {
+    static func delete(_ item: Item = .huggingFaceToken) -> Bool {
+        let service = item.service
+        let account = item.account
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
